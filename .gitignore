@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Node
+node_modules/
+
+# Stands and scratch output from the test/screenshot harness
+/tmp/
+docs/shot-check.json
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,14 @@
+{
+  "name": "hermes-logs-viewer",
+  "label": "Kanban Logs",
+  "description": "Kanban task list (title / status / assignee) with a live, auto-scrolling tail of the selected task's worker log.",
+  "icon": "FileText",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/hermes-logs-viewer",
+    "position": "end"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}

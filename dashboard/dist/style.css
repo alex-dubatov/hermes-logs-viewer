@@ -1,0 +1,844 @@
+/* hermes-logs-viewer — theme-aware, only dashboard CSS vars */
+.hlv-root {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  /* The shell mounts the plugin inside a `div.relative … flex-1 flex flex-col
+     min-h-0` content column (definite height = routed area), but wraps it in an
+     intermediate `display:block; min-height:auto` div. A `height:100%` on
+     `.hlv-root` resolves against that auto-height block, so it grows to the
+     content's height and the routed <main> scrolls instead of the panes.
+     `flex:1 1 auto` is a no-op here — `.hlv-root` isn't a flex item (its
+     effective parent is that block, via a `display:contents` node). Filling the
+     nearest positioned ancestor (the relative content column) with absolute
+     positioning pins `.hlv-root` to exactly that column's height, so
+     .hlv-list / .hlv-log / .hlv-comments scroll on their own, desktop + mobile. */
+  position: absolute;
+  inset: 0;
+}
+
+.hlv-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.hlv-hints {
+  font-size: 0.75rem;
+  color: var(--color-muted-foreground);
+}
+
+.hlv-header-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.hlv-select {
+  background: var(--color-popover);
+  color: var(--color-card-foreground, var(--foreground));
+  border: 1px solid var(--color-border);
+  border-radius: 0;
+  padding: 3px 8px;
+  font-size: 0.8rem;
+  cursor: pointer;
+  max-width: 180px;
+}
+
+.hlv-select:hover {
+  border-color: var(--color-ring, var(--color-success));
+}
+
+.hlv-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.75rem;
+  color: var(--color-muted-foreground);
+  cursor: pointer;
+}
+
+.hlv-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 0;
+  background: var(--color-muted-foreground);
+  opacity: 0.35;
+  display: inline-block;
+}
+
+.hlv-dot-busy {
+  background: var(--color-success);
+  opacity: 1;
+}
+
+.hlv-main {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  gap: 12px;
+}
+
+/* Left panel: search field + task list */
+.hlv-left {
+  width: 340px;
+  min-width: 260px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+}
+
+.hlv-search {
+  position: relative;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+}
+
+.hlv-search-input {
+  padding-right: 26px; /* room for the clear button */
+  /* Firefox renders its own clear affordance on type=search; ours replaces it. */
+  appearance: none;
+}
+
+.hlv-search-input::-webkit-search-cancel-button {
+  display: none;
+}
+
+.hlv-search-clear {
+  position: absolute;
+  right: 6px;
+  appearance: none;
+  background: transparent;
+  border: 0;
+  color: var(--color-muted-foreground);
+  font: inherit;
+  font-size: 0.95rem;
+  line-height: 1;
+  padding: 2px 4px;
+  cursor: pointer;
+}
+
+.hlv-search-clear:hover {
+  color: var(--color-card-foreground, var(--foreground));
+}
+
+.hlv-list {
+  width: 100%;
+  min-width: 0;
+  flex: 1;
+  min-height: 0;
+  flex-shrink: 0;
+  overflow-y: auto;
+  border: 1px solid var(--color-border);
+  border-radius: 0;
+  background: var(--color-card);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px;
+}
+
+.hlv-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 0;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--color-card-foreground, var(--foreground));
+  cursor: pointer;
+  font: inherit;
+}
+
+.hlv-row:hover {
+  background: var(--color-accent);
+}
+
+.hlv-row.active {
+  background: var(--color-accent);
+  border-color: var(--color-border);
+}
+
+.hlv-row-title {
+  font-size: 0.83rem;
+  line-height: 1.25;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.hlv-row-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.7rem;
+  color: var(--color-muted-foreground);
+}
+
+.hlv-row-board {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 90px;
+  font-size: 0.62rem;
+  border: 1px solid var(--color-border);
+  border-radius: 0;
+  padding: 0 4px;
+  background: var(--color-muted);
+}
+
+.hlv-row-assignee {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 120px;
+}
+
+.hlv-row-time {
+  margin-left: auto;
+}
+
+.hlv-status {
+  border-radius: 0;
+  padding: 1px 6px;
+  font-size: 0.65rem;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  border: 1px solid var(--color-border);
+  color: var(--color-muted-foreground);
+  background: var(--color-muted);
+}
+
+/* Status badges — one rule per status, colours taken from the bundled Kanban
+   plugin's column dots (.hermes-kanban-dot-* in
+   plugins/kanban/dashboard/dist/style.css) so both surfaces read alike.
+   Two deliberate departures from that palette: `scheduled` has no dot there
+   either, so it keeps the base muted colour; `archived`'s dot is the border
+   colour, which is too faint for badge TEXT, so the text stays muted and only
+   the background/border carry the border tint. */
+.hlv-status.triage {
+  color: #b47dd6;
+  border-color: color-mix(in srgb, #b47dd6 45%, var(--color-border));
+  background: color-mix(in srgb, #b47dd6 16%, transparent);
+}
+
+.hlv-status.todo {
+  color: var(--color-muted-foreground);
+  border-color: color-mix(in srgb, var(--color-muted-foreground) 40%, var(--color-border));
+  background: color-mix(in srgb, var(--color-muted-foreground) 12%, transparent);
+}
+
+.hlv-status.scheduled {
+  color: var(--color-muted-foreground);
+  border-color: color-mix(in srgb, var(--color-muted-foreground) 40%, var(--color-border));
+  background: color-mix(in srgb, var(--color-muted-foreground) 12%, transparent);
+}
+
+.hlv-status.ready {
+  color: #d4b348;
+  border-color: color-mix(in srgb, #d4b348 45%, var(--color-border));
+  background: color-mix(in srgb, #d4b348 16%, transparent);
+}
+
+.hlv-status.running {
+  color: #3fb97d;
+  border-color: color-mix(in srgb, #3fb97d 45%, var(--color-border));
+  background: color-mix(in srgb, #3fb97d 16%, transparent);
+}
+
+.hlv-status.blocked {
+  color: var(--color-destructive, #d14a4a);
+  border-color: color-mix(in srgb, var(--color-destructive, #d14a4a) 45%, var(--color-border));
+  background: color-mix(in srgb, var(--color-destructive, #d14a4a) 16%, transparent);
+}
+
+.hlv-status.review {
+  color: #48b0c4;
+  border-color: color-mix(in srgb, #48b0c4 45%, var(--color-border));
+  background: color-mix(in srgb, #48b0c4 16%, transparent);
+}
+
+.hlv-status.done {
+  color: #4a8cd1;
+  border-color: color-mix(in srgb, #4a8cd1 45%, var(--color-border));
+  background: color-mix(in srgb, #4a8cd1 16%, transparent);
+}
+
+.hlv-status.archived {
+  color: var(--color-muted-foreground);
+  border-color: var(--color-border);
+  background: color-mix(in srgb, var(--color-border) 35%, transparent);
+  opacity: 0.75;
+}
+
+/* Right: log viewer */
+.hlv-log {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  border: 1px solid var(--color-border);
+  border-radius: 0;
+  background: var(--background, transparent);
+  padding: 12px 14px;
+}
+
+.hlv-log-pre {
+  margin: 0;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 0.75rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--color-card-foreground, var(--foreground));
+}
+
+.hlv-log-head-note {
+  font-size: 0.72rem;
+  color: var(--color-muted-foreground);
+  text-align: center;
+  margin-bottom: 8px;
+  font-style: italic;
+}
+
+.hlv-jump {
+  position: sticky;
+  bottom: 8px;
+  display: block;
+  margin: 8px auto 0;
+  background: var(--color-popover);
+  color: var(--color-card-foreground, var(--foreground));
+  border: 1px solid var(--color-border);
+  border-radius: 0;
+  padding: 3px 14px;
+  font-size: 0.75rem;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgb(0 0 0 / 0.25);
+}
+
+.hlv-empty {
+  color: var(--color-muted-foreground);
+  font-size: 0.8rem;
+  padding: 16px 8px;
+  text-align: center;
+}
+
+/* Preloader: shown while the first chunk of a task's log is loading */
+.hlv-preloader {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 120px;
+  color: var(--color-muted-foreground);
+  font-size: 0.8rem;
+}
+
+.hlv-spinner {
+  width: 16px;
+  height: 16px;
+  border-radius: 0;
+  border: 2px solid var(--color-border);
+  border-top-color: var(--color-ring, var(--color-success));
+  animation: hlv-spin 0.8s linear infinite;
+  display: inline-block;
+}
+
+@keyframes hlv-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ------------------------------------------------------------------ */
+/* Right pane: tab bar + (log | comments)                              */
+/* ------------------------------------------------------------------ */
+.hlv-right {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  gap: 8px;
+}
+
+.hlv-tabs {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.hlv-tab {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  color: var(--color-muted-foreground);
+  font: inherit;
+  font-size: 0.8rem;
+  padding: 6px 12px;
+  cursor: pointer;
+  margin-bottom: -1px; /* sit the active underline on the tab border */
+}
+
+.hlv-tab:hover {
+  color: var(--color-card-foreground, var(--foreground));
+}
+
+.hlv-tab.active {
+  color: var(--color-card-foreground, var(--foreground));
+  border-bottom-color: var(--color-ring, var(--color-success));
+}
+
+/* Right end of the tab row: log size in bytes + "развернуть лог".
+   Same level as the лог/комментарии tabs, pushed to the right edge. */
+.hlv-tabs-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-right: 4px;
+  /* the tabs' own padding would otherwise drop the row 1px below the border */
+  margin-bottom: -1px;
+}
+
+.hlv-bytes {
+  font-size: 0.72rem;
+  color: var(--color-muted-foreground);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.hlv-expand {
+  appearance: none;
+  background: transparent;
+  border: 1px solid var(--color-border);
+  border-radius: 0;
+  color: var(--color-muted-foreground);
+  font: inherit;
+  font-size: 0.72rem;
+  padding: 3px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.hlv-expand:hover {
+  color: var(--color-card-foreground, var(--foreground));
+  border-color: var(--color-ring, var(--color-success));
+}
+
+/* Generic small button (toolbar "Новая задача", dialog actions) */
+.hlv-btn {
+  appearance: none;
+  background: var(--color-popover, var(--color-card));
+  color: var(--color-card-foreground, var(--foreground));
+  border: 1px solid var(--color-border);
+  border-radius: 0;
+  font: inherit;
+  font-size: 0.78rem;
+  padding: 4px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.hlv-btn:hover {
+  border-color: var(--color-ring, var(--color-success));
+}
+
+.hlv-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.hlv-btn-primary {
+  background: var(--color-ring, var(--color-success));
+  color: var(--background, #fff);
+  border-color: transparent;
+  font-weight: 600;
+}
+
+.hlv-create-flash.ok {
+  color: var(--color-success);
+}
+
+.hlv-create-flash.err {
+  color: var(--color-warning);
+}
+
+/* New-task dialog --------------------------------------------------- */
+.hlv-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgb(0 0 0 / 0.45);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 6vh 16px 16px;
+  overflow-y: auto;
+  z-index: 20;
+}
+
+.hlv-modal {
+  width: 100%;
+  max-width: 560px;
+  background: var(--color-card, var(--background));
+  color: var(--color-card-foreground, var(--foreground));
+  border: 1px solid var(--color-border);
+  border-radius: 0;
+  box-shadow: 0 12px 40px rgb(0 0 0 / 0.35);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.hlv-modal-title {
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.hlv-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+.hlv-field-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+}
+
+.hlv-field-narrow {
+  flex: 0 0 110px;
+}
+
+.hlv-field-label {
+  font-size: 0.72rem;
+  color: var(--color-muted-foreground);
+}
+
+.hlv-input {
+  background: var(--color-popover, var(--color-card));
+  color: var(--color-card-foreground, var(--foreground));
+  border: 1px solid var(--color-border);
+  border-radius: 0;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 0.8rem;
+  width: 100%;
+  box-sizing: border-box;
+  max-width: none; /* .hlv-select caps at 180px; the form wants the row */
+}
+
+.hlv-input:focus {
+  outline: none;
+  border-color: var(--color-ring, var(--color-success));
+}
+
+.hlv-textarea {
+  resize: vertical;
+  line-height: 1.4;
+}
+
+.hlv-warn {
+  font-size: 0.7rem;
+  color: var(--color-warning);
+}
+
+.hlv-modal-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.hlv-modal-row .hlv-btn:first-of-type {
+  margin-left: auto;
+}
+
+.hlv-modal-hint {
+  font-size: 0.68rem;
+  color: var(--color-muted-foreground);
+}
+
+/* The right content (log or comments) fills the remaining height. */
+.hlv-right .hlv-log {
+  flex: 1;
+  min-height: 0;
+}
+
+/* Comments thread ------------------------------------------------ */
+.hlv-comments-wrap {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  gap: 8px;
+}
+
+.hlv-comments {
+  /* Reuses .hlv-log's box (border/scroll) — just tighten for prose. */
+  display: flex;
+  flex-direction: column;
+}
+
+.hlv-comment-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+}
+
+.hlv-comment {
+  border: 1px solid var(--color-border);
+  border-radius: 0;
+  background: var(--color-card);
+  padding: 8px 10px;
+}
+
+.hlv-comment-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.hlv-comment-author {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--color-ring, var(--color-success));
+}
+
+.hlv-comment-time {
+  font-size: 0.68rem;
+  color: var(--color-muted-foreground);
+}
+
+.hlv-comment-body {
+  font-size: 0.8rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--color-card-foreground, var(--foreground));
+}
+
+/* Composer (textarea + send) pinned under the thread ------------- */
+.hlv-composer {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.hlv-composer-input {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  min-height: 44px;
+  background: var(--color-popover, var(--color-card));
+  color: var(--color-card-foreground, var(--foreground));
+  border: 1px solid var(--color-border);
+  border-radius: 0;
+  padding: 8px 10px;
+  font: inherit;
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
+.hlv-composer-input:focus {
+  outline: none;
+  border-color: var(--color-ring, var(--color-success));
+}
+
+.hlv-composer-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 24px;
+}
+
+.hlv-composer-note {
+  font-size: 0.72rem;
+}
+
+.hlv-composer-note.ok {
+  color: var(--color-success);
+}
+
+.hlv-composer-note.err {
+  color: var(--color-warning);
+}
+
+.hlv-composer-send {
+  margin-left: auto;
+  appearance: none;
+  background: var(--color-ring, var(--color-success));
+  color: var(--background, #fff);
+  border: 0;
+  border-radius: 0;
+  padding: 6px 16px;
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.hlv-composer-send:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Comment count badge on task rows ------------------------------ */
+.hlv-row-comments {
+  font-size: 0.65rem;
+  color: var(--color-muted-foreground);
+  border: 1px solid var(--color-border);
+  border-radius: 0;
+  padding: 0 4px;
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------------ */
+/* Header: board select with the "archived" checkbox stacked under it  */
+/* ------------------------------------------------------------------ */
+.hlv-board-block {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+/* ------------------------------------------------------------------ */
+/* Right pane: task description (read + inline edit)                    */
+/* ------------------------------------------------------------------ */
+.hlv-desc-wrap {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  gap: 8px;
+}
+
+.hlv-desc {
+  flex: 1;
+  min-height: 0;
+}
+
+.hlv-desc-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.hlv-desc-title {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--color-card-foreground, var(--foreground));
+}
+
+.hlv-desc-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 0.7rem;
+  color: var(--color-muted-foreground);
+}
+
+.hlv-desc-body {
+  font-size: 0.82rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--color-card-foreground, var(--foreground));
+}
+
+.hlv-desc-editor {
+  width: 100%;
+  box-sizing: border-box;
+  flex: 1;
+  min-height: 180px;
+  resize: vertical;
+  background: var(--color-popover, var(--color-card));
+  color: var(--color-card-foreground, var(--foreground));
+  border: 1px solid var(--color-border);
+  padding: 8px 10px;
+  font: inherit;
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
+.hlv-desc-editor:focus {
+  outline: none;
+  border-color: var(--color-ring, var(--color-success));
+}
+
+.hlv-desc-actions {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 24px;
+}
+
+.hlv-desc-note {
+  font-size: 0.72rem;
+}
+
+.hlv-desc-note.ok {
+  color: var(--color-success);
+}
+
+.hlv-desc-note.err {
+  color: var(--color-warning);
+}
+
+/* ------------------------------------------------------------------ */
+/* Mobile: stack the task list above the detail pane. The shell already
+   reserves the mobile top-bar height (an `h-14 lg:hidden` spacer in the
+   content flow), so no extra top padding is needed here.             */
+/* ------------------------------------------------------------------ */
+@media (max-width: 1023px) {
+  .hlv-main {
+    flex-direction: column;
+  }
+  /* Column becomes full-width; the list keeps its capped-height strip so the
+     detail pane keeps most space. */
+  .hlv-left {
+    width: 100%;
+    min-width: 0;
+  }
+  /* List becomes a capped-height strip so the detail pane keeps most space. */
+  .hlv-list {
+    width: 100%;
+    min-width: 0;
+    flex-shrink: 1;
+    max-height: 38vh;
+  }
+  .hlv-main > .hlv-right {
+    flex: 1;
+    min-height: 0;
+  }
+  /* Tighter log font on narrow screens. */
+  .hlv-log-pre {
+    font-size: 0.7rem;
+  }
+}
