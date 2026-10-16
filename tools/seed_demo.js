@@ -142,12 +142,23 @@ async function seed() {
 
   const created = [];
   for (const [status, age, assignee, priority, title, body] of CARDS) {
+    // Created as `blocked` on purpose: that is a create-time state the core
+    // accepts and the dispatcher never claims, so a demo card can never be
+    // spawned as a real worker while the seeding loop is still running. The
+    // status the screenshot wants is written to sqlite a few lines below.
     const r = await req("POST", K + "/tasks" + q(), {
       title, body, assignee: assignee || null, priority, max_runtime_seconds: 0,
+      triage: status === "triage",
     });
     if (r.status !== 200 || !r.body || !r.body.task) {
       console.log("create failed:", r.status, JSON.stringify(r.body).slice(0, 160), "|", title);
       continue;
+    }
+    if (status !== "triage") {
+      const b = await req("PATCH", K + "/tasks/" + r.body.task.id + q(), { status: "blocked" });
+      if (b.status !== 200) {
+        console.log("could not park card as blocked:", b.status, JSON.stringify(b.body).slice(0, 160));
+      }
     }
     created.push({ id: r.body.task.id, status, age, title });
     process.stdout.write("  " + r.body.task.id + "  " + title.slice(0, 46) + "\n");

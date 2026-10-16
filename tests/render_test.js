@@ -286,8 +286,11 @@ function fieldByLabel(labelText) {
     );
   }
 
-  // Pick a task that HAS a description, then search for a word that appears
-  // only in that description — proving the filter reaches `body`, not just title.
+  // Index every card's title + body once. Search matches on BOTH, but a row
+  // only renders the title — so "every visible row's text contains the word"
+  // is not a valid assertion (a body-only match is legitimate). This map lets
+  // the check ask the real question instead.
+  const cardText = new Map(); // taskId -> lowercased title + "\n" + body
   let bodyTask = null;
   let bodyWord = null;
   for (const b of boards0.boards) {
@@ -295,23 +298,27 @@ function fieldByLabel(labelText) {
       "/api/plugins/kanban/board?include_archived=true&board=" + encodeURIComponent(b.slug));
     for (const col of (bd.columns || [])) {
       for (const t of (col.tasks || [])) {
-        const words = ((t.body || "").toLowerCase().match(/[a-zа-яё]{7,}/gi) || [])
-          .filter((w) => (t.title || "").toLowerCase().indexOf(w) === -1);
-        if (words.length) {
-          bodyTask = t;
-          bodyWord = words[0];
-          break;
+        const title = (t.title || "").toLowerCase();
+        const body = (t.body || "").toLowerCase();
+        cardText.set(t.id, title + "\n" + body);
+        // A word that is in the body but NOT in the title — proves the filter
+        // reaches `body`. Only remembered once, for the check below.
+        if (!bodyTask) {
+          const words = (body.match(/[a-zа-яё]{7,}/gi) || [])
+            .filter((w) => title.indexOf(w) === -1);
+          if (words.length) { bodyTask = t; bodyWord = words[0]; }
         }
       }
-      if (bodyTask) break;
     }
-    if (bodyTask) break;
   }
 
   if (searchInput) {
-    // Title match: filter down to the rows that contain the word.
+    // Title match: filter down to the rows that contain the word. The last
+    // token of the first title, stripped of edge punctuation so it is a plain
+    // word rather than something like "Доработки.".
     const firstTitle = $(".hlv-row .hlv-row-title").textContent;
-    const word = firstTitle.trim().split(/\s+/).slice(-1)[0];
+    const word = (firstTitle.trim().split(/\s+/).slice(-1)[0] || "")
+      .replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
     const totalBefore = $$(".hlv-row").length;
     setInputValue(searchInput, word);
     await sleep(500);
@@ -319,11 +326,14 @@ function fieldByLabel(labelText) {
     check("поиск по названию сужает список",
       afterTitle.length >= 1 && afterTitle.length <= totalBefore,
       "строка «" + word + "» → " + afterTitle.length + " из " + totalBefore);
-    check(
-      "все оставшиеся строки содержат слово запроса",
-      afterTitle.every((r) => (r.textContent || "").toLowerCase().includes(word.toLowerCase())),
-      afterTitle.length + " строк"
-    );
+    // Every surviving row must match by title OR by body — that is what the
+    // filter actually does.
+    const stray = afterTitle
+      .map((r) => r.getAttribute("data-task-id"))
+      .filter((id) => !(cardText.get(id) || "").includes(word.toLowerCase()));
+    check("все оставшиеся строки содержат слово запроса",
+      stray.length === 0,
+      afterTitle.length + " строк" + (stray.length ? ", лишние: " + stray.join(",") : ""));
 
     // Description-only match.
     if (bodyTask && bodyWord) {
@@ -479,7 +489,28 @@ function fieldByLabel(labelText) {
   check("задача создалась на выбранной доске", !!row,
     row ? row.id + " / " + row.status : "не найдена");
   if (row) {
-    check("состояние todo применено", row.status === "todo", "status=" + row.status);
+    // The dialog POSTs the card as `ready` and then PATCHes it to the chosen
+    // state, so the status is not there the instant the card appears. Poll
+    // until it settles instead of sampling once at a fixed delay — under load
+    // the PATCH can land after that delay, which read as a real failure.
+    let settled = row;
+    for (let i = 0; i < 20 && settled.status !== "todo"; i++) {
+      await sleep(500);
+      const r = await fetchJSON(
+        "/api/plugins/kanban/tasks/" + encodeURIComponent(row.id) +
+        "?board=" + encodeURIComponent(target.slug));
+      if (r.task) settled = r.task;
+    }
+    check("состояние todo применено", settled.status === "todo", "status=" + settled.status);
+    // The dialog must never report a plain "создано" while the card sits in the
+    // wrong column — the retry covers a dropped PATCH, and the note covers the
+    // case where both attempts were refused.
+    const createNoteText = (($(".hlv-create-flash") || {}).textContent) || "";
+    check(
+      "результат создания не врёт про состояние",
+      settled.status === "todo" || /создано как/.test(createNoteText),
+      settled.status === "todo" ? "состояние верное" : "note=" + createNoteText
+    );
     const full = await fetchJSON(
       "/api/plugins/kanban/tasks/" + encodeURIComponent(row.id) +
       "?board=" + encodeURIComponent(target.slug));

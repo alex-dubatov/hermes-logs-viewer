@@ -1213,31 +1213,59 @@
         var created = r.task;
         // `todo` and `blocked` are not create-time states in the core, so the
         // card is created and then moved through the very same PATCH the
-        // built-in plugin uses for a drag into that column. `ready` (default) and
-        // `triage` (sent as a flag) need no second call.
-        var wantsMove = draftStatus === "todo" || draftStatus === "blocked";
-        var move = function (target, done) {
-          if (!wantsMove || target !== draftStatus) {
-            done(null);
-            return;
-          }
-          fetchJSON(
+        // built-in plugin uses for a drag into that column. `ready` (default)
+        // and `triage` (sent as a flag) need no second call.
+        //
+        // `wantStatus` is captured here rather than read off `draftStatus` at
+        // every step, so one render's value drives the whole sequence.
+        var wantStatus = draftStatus;
+        var wantsMove = wantStatus === "todo" || wantStatus === "blocked";
+        var patchStatus = function () {
+          return fetchJSON(
             KANBAN_API + "/tasks/" + encodeURIComponent(created.id) + "?board=" +
             encodeURIComponent(draftBoard),
             {
               method: "PATCH",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(target === "blocked" ? { status: "blocked" } : { status: "todo" }),
+              body: JSON.stringify({ status: wantStatus }),
             }
           ).then(function (m) {
-            done(m && m.task ? m.task : null);
+            return {
+              task: m && m.task ? m.task : null,
+              why: (m && (m.detail || m.error)) || "",
+            };
           }).catch(function (e) {
-            done({ __error: String((e && e.message) || e) });
+            return { task: null, why: String((e && e.message) || e) };
           });
         };
-        move(draftStatus, function (patched) {
+        var finish = function (patched, why) {
           if (patched && patched.status) created.status = patched.status;
           insertCreated(created);
+          // A card that did not reach the requested state is a real failure.
+          // Reporting "создано" alone would leave the user believing the card is
+          // in the column they picked, so the note names the state it is
+          // actually in. Set AFTER insertCreated, which writes its own success
+          // note; the header keeps showing this one because the modal is closed
+          // by then.
+          if (wantsMove && created.status !== wantStatus) {
+            setCreateNote({
+              kind: "err",
+              text: "создано как " + created.status + ", а не " + wantStatus +
+                (why ? " (" + why + ")" : "") + " — перетащите карточку вручную",
+            });
+          }
+        };
+        if (!wantsMove) {
+          finish(null, "");
+          return;
+        }
+        patchStatus().then(function (first) {
+          if (first.task && first.task.status === wantStatus) return finish(first.task, "");
+          // One retry: a single dropped or refused PATCH must not silently
+          // strand the card in `ready`.
+          return patchStatus().then(function (second) {
+            finish(second.task, first.why || second.why);
+          });
         });
       }).catch(function (e) {
         setCreateBusy(false);
