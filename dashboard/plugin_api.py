@@ -16,6 +16,9 @@ specific install and break the standalone test harness).
 Endpoints:
   GET /tasks/all                    -> {"tasks": [ ... every task on every board, each tagged
                                           with its `board` slug, sorted for display ... ]}
+        Each task carries `priority` and `completed_at` so the UI can order the
+        list without a second round-trip: finished cards (`done`/`archived`) by
+        completion time, everything else by priority.
   GET /tasks/{task_id}/comments?board=default
         -> {"task_id", "board", "comments": [{id, author, body, created_at}]}
      The task's comment thread, oldest first.
@@ -47,6 +50,11 @@ _STATUS_ORDER = {
     "running": 0, "scheduled": 1, "ready": 2, "blocked": 3,
     "review": 4, "triage": 5, "todo": 6, "done": 7, "archived": 8,
 }
+
+# Finished cards. They are ordered by WHEN the task was completed rather than
+# by priority: once a card is done, its place in the queue stopped meaning
+# anything, and "what finished most recently" is the useful reading.
+_CLOSED_STATUSES = frozenset({"done", "archived"})
 
 _BOARD_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 _TASK_ID_RE = re.compile(r"^t_[A-Za-z0-9_-]+$")
@@ -120,7 +128,7 @@ def _task_rows(board: str):
     try:
         cur = con.execute(
             """
-            SELECT id, title, status, assignee, created_at,
+            SELECT id, title, status, assignee, priority, created_at,
                    started_at, completed_at, last_heartbeat_at
             FROM tasks
             """
@@ -168,16 +176,29 @@ def _row_to_task(r, board: str, comment_count: int = 0) -> dict:
         "assignee": r["assignee"] or "",
         "board": board,
         "comment_count": comment_count or 0,
+        "priority": _to_int(r["priority"]),
         "created_at": _to_int(r["created_at"]),
         "started_at": _to_int(r["started_at"]),
+        "completed_at": _to_int(r["completed_at"]),
         "last_heartbeat_at": _to_int(r["last_heartbeat_at"]),
     }
 
 
 def _sort_key(t: dict):
+    """Display order within a status group (ТЗ).
+
+    Finished cards (``done``/``archived``) go by completion time, most recent
+    first. Everything still in flight goes by priority, highest first — that is
+    the order the dispatcher itself will pick them up in, so the list reads as
+    the queue does. Recency of activity only breaks ties inside the same
+    priority, so a burst of low-priority cards cannot bury a high-priority one.
+    """
+    closed = t["status"] in _CLOSED_STATUSES
     return (
         _STATUS_ORDER.get(t["status"], 99),
-        # newest activity first within the same status
+        # closed: newest completion first; open: highest priority first
+        -(t["completed_at"] or 0) if closed else -(t["priority"] or 0),
+        # newest activity first within the same priority / completion instant
         -(t["last_heartbeat_at"] or 0),
         -(t["started_at"] or 0),
         -(t["created_at"] or 0),

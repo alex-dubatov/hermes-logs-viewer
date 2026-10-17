@@ -387,8 +387,35 @@ function fieldByLabel(labelText) {
 
   const rtField = fieldByLabel("Время");
   const rtInput = rtField && rtField.querySelector("input");
-  check("в форме есть поле «Время, сек»", !!rtInput);
-  if (rtInput) check("время по умолчанию 0 = бесконечно", rtInput.value === "0", "value=" + rtInput.value);
+  check("в форме есть поле «Время, мин»", !!rtInput);
+  if (rtInput) {
+    check("время по умолчанию 0 = бесконечно", rtInput.value === "0", "value=" + rtInput.value);
+    check(
+      "подпись поля времени — в минутах",
+      rtField.querySelector(".hlv-field-label").textContent.trim() === "Время, мин",
+      rtField.querySelector(".hlv-field-label").textContent
+    );
+  }
+
+  // --- 7a. workspace stays locked until a board is chosen (ТЗ) ---------
+  {
+    const wsField0 = fieldByLabel("Воркспейс");
+    const wsSel0 = wsField0 && wsField0.querySelector("select");
+    check("поле «Воркспейс» есть в форме", !!wsSel0);
+    check("воркспейс заблокирован, пока доска не выбрана",
+      !!wsSel0 && wsSel0.disabled === true,
+      wsSel0 ? "disabled=" + wsSel0.disabled : "нет select");
+    check(
+      "под воркспейсом объяснено, почему он заблокирован",
+      !!wsField0 && /доска не выбрана/.test(wsField0.textContent),
+      wsField0 ? wsField0.textContent.slice(0, 80) : "нет поля"
+    );
+    check(
+      "в заблокированном воркспейсе видна подсказка «сначала выберите доску»",
+      !!wsSel0 && /сначала выберите доску/.test(wsSel0.getAttribute("title") || ""),
+      wsSel0 ? wsSel0.getAttribute("title") : "нет title"
+    );
+  }
 
   const stField = fieldByLabel("Состояние");
   const stSel = stField && stField.querySelector("select");
@@ -432,6 +459,14 @@ function fieldByLabel(labelText) {
       "доска " + repoBoard.slug + " → " + (wsSel && wsSel.value));
     check("путь доски подставлен в поле Путь", wsPath && wsPath.value === repoBoard.default_workdir,
       wsPath ? wsPath.value : "нет поля пути");
+    // The lock is the board's doing, so choosing a board must lift it.
+    check("воркспейс разблокирован после выбора доски", wsSel && wsSel.disabled === false,
+      wsSel ? "disabled=" + wsSel.disabled : "нет select");
+    check(
+      "блокировка объяснена подсказкой под полем",
+      !!wsField && !/доска не выбрана/.test(wsField.textContent),
+      wsField ? "hint=" + /доска не выбрана/.test(wsField.textContent) : "нет поля"
+    );
   } else {
     check("нашлась доска с git-репозиторием для проверки worktree", false, "нет такой доски");
   }
@@ -466,9 +501,12 @@ function fieldByLabel(labelText) {
   setSelectValue(boardSel, target.slug);
   await sleep(300);
   const testTitle = "hlv-autotest: проверка времени и состояния " + Date.now();
-  setInputValue(titleInput, testTitle);
-  const rtInput2 = fieldByLabel("Время").querySelector("input");
-  setInputValue(rtInput2, "1800");
+      setInputValue(titleInput, testTitle);
+      const rtInput2 = fieldByLabel("Время").querySelector("input");
+      // 30 MINUTES on the form must land as 1800 SECONDS in the DB — the field
+      // speaks minutes, the API speaks seconds, and the conversion is the
+      // plugin's job. An unconverted 30 would read as a 30-second cap.
+      setInputValue(rtInput2, "30");
   const stSel2 = fieldByLabel("Состояние").querySelector("select");
   setSelectValue(stSel2, "todo");
   await sleep(200);
@@ -514,7 +552,7 @@ function fieldByLabel(labelText) {
     const full = await fetchJSON(
       "/api/plugins/kanban/tasks/" + encodeURIComponent(row.id) +
       "?board=" + encodeURIComponent(target.slug));
-    check("max_runtime_seconds сохранён (1800)",
+    check("max_runtime_seconds = 30 мин × 60 = 1800 с",
       full.task && full.task.max_runtime_seconds === 1800,
       full.task ? String(full.task.max_runtime_seconds) : "нет задачи");
     // Clean up: hard-delete the throwaway card so no archive clutter is left.
@@ -526,6 +564,165 @@ function fieldByLabel(labelText) {
   }
 
   function editor2Available() { return false; }
+
+  // --- 8. ordering: closed by completion time, open by priority (ТЗ) ----
+  // Checked against the DOM rows themselves (data-status / data-priority /
+  // data-completed-at), not against a re-implementation of the rule: the point
+  // is what the user SEES, including rows the panel ordered itself after an
+  // optimistic insert.
+  {
+    const CLOSED = { done: 1, archived: 1 };
+    const rowsNow = $$(".hlv-row");
+    const seen = rowsNow.map((r) => ({
+      status: r.getAttribute("data-status"),
+      priority: Number(r.getAttribute("data-priority") || 0),
+      completed: Number(r.getAttribute("data-completed-at") || 0),
+    }));
+    check(
+      "у каждой строки списка есть статус и время завершения в data-атрибутах",
+      seen.length > 0 && seen.every((r) => r.status && r.completed >= 0),
+      seen.length + " строк"
+    );
+
+    // Within one status: closed → completed_at descending; open → priority
+    // descending. Both are non-decreasing once negated, so the walk flags any
+    // row whose negated key went BACKWARDS (i.e. a more important card sitting
+    // below a less important one).
+    const violations = [];
+    for (let i = 1; i < seen.length; i++) {
+      const prev = seen[i - 1];
+      const cur = seen[i];
+      if (prev.status !== cur.status) continue;
+      const key = (r) =>
+        CLOSED[r.status] ? -r.completed : -r.priority;
+      if (key(cur) < key(prev)) {
+        violations.push(
+          `${prev.status} ${CLOSED[prev.status] ? prev.completed : prev.priority} → ` +
+          `${cur.status} ${CLOSED[cur.status] ? cur.completed : cur.priority}`
+        );
+      }
+    }
+    check(
+      "внутри статуса: complete/archive — по порядку завершения, остальные — по приоритету",
+      violations.length === 0,
+      violations.length ? "нарушено: " + violations.slice(0, 3).join("; ") : seen.length + " строк"
+    );
+
+    // The rule must be visible in the data, not just vacuously true because
+    // every card in the group shares one value — so require at least one group
+    // that actually discriminates, and report what it sorted on.
+    const groups = {};
+    for (const r of seen) (groups[r.status] = groups[r.status] || []).push(r);
+    const discriminating = Object.entries(groups).filter(([, rs]) =>
+      CLOSED[rs[0].status]
+        ? new Set(rs.map((r) => r.completed)).size > 1
+        : new Set(rs.map((r) => r.priority)).size > 1
+    );
+    check(
+      "на доске есть группа, где порядок реально различает карточки",
+      discriminating.length > 0,
+      discriminating.length
+        ? discriminating.map(([s, rs]) =>
+            s + " (" + (CLOSED[s]
+              ? [...new Set(rs.map((r) => r.completed))].length + " разных completed_at"
+              : [...new Set(rs.map((r) => r.priority))].length + " разных приоритетов")
+          ).join(", ")
+        : Object.entries(groups).map(([s, rs]) => s + ":" + rs.length).join(", ")
+    );
+
+    // A checker that cannot fail is not a check: run the same walk over a
+    // deliberately WRONG order and require it to be reported. Without this, an
+    // inverted comparison would pass this suite forever.
+    const bad = [
+      { status: "ready", priority: 0, completed: 0 },
+      { status: "ready", priority: 9, completed: 0 },
+      { status: "done", priority: 0, completed: 100 },
+      { status: "done", priority: 0, completed: 900 },
+    ];
+    const badKey = (r) => (CLOSED[r.status] ? -r.completed : -r.priority);
+    const wouldFlag = bad.some((r, i) => i > 0 && badKey(r) < badKey(bad[i - 1]));
+    check(
+      "проверка порядка действительно ловит нарушение (негативный контроль)",
+      wouldFlag,
+      "приоритет 0 перед 9 и завершение 100 перед 900 должны быть помечены"
+    );
+
+    // The walk above only proves the list is SELF-CONSISTENT: it would pass on a
+    // list where every priority were a fabricated constant. So compare against
+    // the board itself — fetch the same cards from the bundled route and require
+    // that each row's rendered priority/completed_at equals the real one.
+    const rowIds = rowsNow.map((r) => r.getAttribute("data-task-id"));
+    const truth = new Map();
+    for (const b of boards0.boards) {
+      const bd = await fetchJSON(
+        "/api/plugins/kanban/board?include_archived=true&board=" + encodeURIComponent(b.slug));
+      for (const col of (bd.columns || [])) {
+        for (const t of (col.tasks || [])) {
+          truth.set(t.id, { priority: t.priority || 0, completed: t.completed_at || 0 });
+        }
+      }
+    }
+    const mismatched = [];
+    for (const r of rowsNow) {
+      const id = r.getAttribute("data-task-id");
+      const want = truth.get(id);
+      if (!want) continue;
+      const gotPri = Number(r.getAttribute("data-priority"));
+      const gotDone = Number(r.getAttribute("data-completed-at"));
+      if (gotPri !== want.priority || gotDone !== want.completed) {
+        mismatched.push(`${id}: приоритет ${gotPri}≠${want.priority}, завершение ${gotDone}≠${want.completed}`);
+      }
+    }
+    check(
+      "приоритет и время завершения в списке совпадают с доской",
+      mismatched.length === 0,
+      mismatched.length
+        ? mismatched.slice(0, 3).join("; ")
+        : rowIds.length + " строк сверено с /board"
+    );
+  }
+
+  // --- 9. mobile: the task list is a horizontal carousel (ТЗ) ----------
+  // jsdom applies no media queries, so the responsive rule is asserted
+  // against the stylesheet the dashboard actually serves, and the runtime half
+  // (axis-aware autoscroll) against the JS that drives it.
+  {
+    check(
+      "медиазапрос мобильной вёрстки на месте",
+      /@media\s*\(max-width:\s*1023px\)/.test(css),
+      "max-width: 1023px"
+    );
+    // The rule block the carousel lives in.
+    const mq = css.slice(css.indexOf("@media (max-width: 1023px)"));
+    check(
+      "на мобильном список задач становится горизонтальным",
+      /flex-direction:\s*row/.test(mq) && /overflow-x:\s*auto/.test(mq),
+      mq.slice(0, 120).replace(/\s+/g, " ")
+    );
+    check(
+      "карусель листается по карточкам (scroll-snap)",
+      /scroll-snap-type:\s*x\s+mandatory/.test(mq) && /scroll-snap-align:\s*start/.test(mq),
+      "snap по x"
+    );
+    check(
+      "карточка карусели — почти ширина экрана, следующая peek-ится",
+      /flex:\s*0\s+0\s*82%/.test(mq),
+      "flex: 0 0 82%"
+    );
+    check(
+      "старая вертикальная полоса на мобильном убрана",
+      !/max-height:\s*38vh/.test(mq),
+      "max-height: 38vh не осталось"
+    );
+    // The JS half: autoscroll must follow the axis the list scrolls on.
+    const js = fs.readFileSync(PLUGIN, "utf8");
+    check(
+      "автоскролл списка учитывает ось (scrollLeft на карусели)",
+      /function isCarousel\(\)/.test(js) && /list\.scrollLeft \+=/.test(js) &&
+        /function listPos\(/.test(js) && /scrollTop \+=/.test(js),
+      "isCarousel + listPos + обе оси"
+    );
+  }
 
   const failed = results.filter((r) => !r.ok);
   console.log("\n=== " + (results.length - failed.length) + "/" + results.length + " checks passed ===");

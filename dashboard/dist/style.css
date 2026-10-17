@@ -547,6 +547,15 @@
   border-color: var(--color-ring, var(--color-success));
 }
 
+/* A locked field (the workspace before a board is chosen) must read as locked:
+   the dashboard's own inputs do not dim on `disabled` on their own. */
+.hlv-input:disabled,
+.hlv-select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  background: var(--color-muted);
+}
+
 .hlv-textarea {
   resize: vertical;
   line-height: 1.4;
@@ -812,26 +821,52 @@
 }
 
 /* ------------------------------------------------------------------ */
-/* Mobile: stack the task list above the detail pane. The shell already
-   reserves the mobile top-bar height (an `h-14 lg:hidden` spacer in the
-   content flow), so no extra top padding is needed here.             */
+/* Mobile: the task list becomes a HORIZONTAL carousel (ТЗ) — one card
+   per screen-width with the next one peeking, snapped by column — above
+   the detail pane. The shell already reserves the mobile top-bar height
+   (an `h-14 lg:hidden` spacer in the content flow), so no extra top
+   padding is needed here.                                             */
 /* ------------------------------------------------------------------ */
 @media (max-width: 1023px) {
   .hlv-main {
     flex-direction: column;
   }
-  /* Column becomes full-width; the list keeps its capped-height strip so the
-     detail pane keeps most space. */
+  /* Column becomes full-width. */
   .hlv-left {
     width: 100%;
     min-width: 0;
   }
-  /* List becomes a capped-height strip so the detail pane keeps most space. */
+  /* Carousel: a row of cards that scrolls sideways. `scroll-snap` lands each
+     card flush with the left edge, so a swipe always leaves exactly one card
+     in place instead of a sliver of the next one. */
   .hlv-list {
     width: 100%;
     min-width: 0;
     flex-shrink: 1;
-    max-height: 38vh;
+    flex-direction: row;
+    align-items: stretch;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scroll-snap-type: x mandatory;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-x: contain;
+    /* A card is one screen wide minus a peek of the next one, which is what
+       tells the finger there is more to the right. */
+    gap: 8px;
+    padding: 6px;
+  }
+  /* One card per "page"; flex-basis (not width) keeps the basis honest even
+     when the content itself is narrower. */
+  .hlv-row {
+    flex: 0 0 82%;
+    min-width: 0;
+    scroll-snap-align: start;
+    justify-content: center;
+  }
+  /* The row's meta line is a single non-wrapping strip on a narrow card. */
+  .hlv-row-meta {
+    flex-wrap: nowrap;
+    overflow: hidden;
   }
   .hlv-main > .hlv-right {
     flex: 1;

@@ -145,22 +145,71 @@
   // Display order, mirroring the backend's _sort_key, so a task inserted
   // optimistically after create lands where the next poll would put it
   // instead of jumping to the bottom of the list.
+  //
+  // Within one status: finished cards (done/archived) by completion time,
+  // newest first; everything still in flight by priority, highest first —
+  // the order the dispatcher itself will pick them up in.
   var STATUS_ORDER = {
     running: 0, scheduled: 1, ready: 2, blocked: 3,
     review: 4, triage: 5, todo: 6, done: 7, archived: 8,
   };
 
+  // Same set the backend uses (plugin_api._CLOSED_STATUSES).
+  var CLOSED_STATUSES = { done: 1, archived: 1 };
+
+  // Sort-key backfill cache: taskId -> {priority, completed_at}.
+  //
+  // /tasks/all is the canonical source of these two fields and it carries them
+  // cheaply (one indexed query per board). But the plugin's own Python route is
+  // imported when the dashboard PROCESS starts, so a freshly edited
+  // plugin_api.py only reaches the browser after
+  // `systemctl --user restart hermes-dashboard` — until then /tasks/all answers
+  // without them and every priority sorts as 0.
+  //
+  // The bundled kanban `/board` route returns priority and completed_at and is
+  // mounted at process start, so it is ALWAYS live. It is ~4x heavier
+  // (169 KB and 25 ms per board against 41 KB / 8 ms), which is why it is only
+  // used as a fallback, on a slow 15 s tick, and only for boards that actually
+  // have visible tasks — never on the 2 s list poll.
+  //
+  // `SORT_KEYS_NATIVE` latches as soon as /tasks/all reports the fields
+  // themselves; the backfill then stops entirely, so a restarted dashboard
+  // pays nothing and this file's fallback becomes dead weight rather than a
+  // permanent tax.
+  var SORT_KEYS = Object.create(null);
+  var SORT_KEYS_NATIVE = false;
+  var SORT_KEYS_POLL_MS = 15000;
+
+  // The sort inputs for a task, preferring what /tasks/all reported and
+  // falling back to the backfill cache. One place, so the list order, the
+  // optimistic insert after create and the rendered data-attributes can never
+  // disagree about a card's priority.
+  function sortInputs(t) {
+    var back = SORT_KEYS[t.id];
+    if (back) {
+      return {
+        priority: t.priority != null ? t.priority : back.priority,
+        completed_at: t.completed_at != null ? t.completed_at : back.completed_at,
+      };
+    }
+    return { priority: t.priority || 0, completed_at: t.completed_at || 0 };
+  }
+
+  function taskSortKey(t) {
+    var closed = !!CLOSED_STATUSES[t.status];
+    var inp = sortInputs(t);
+    return [
+      STATUS_ORDER[t.status] == null ? 99 : STATUS_ORDER[t.status],
+      // negated so the array sorts ascending = "highest first"
+      closed ? -(inp.completed_at || 0) : -(inp.priority || 0),
+      -(t.last_heartbeat_at || 0), -(t.started_at || 0), -(t.created_at || 0),
+      t.board || "", t.id || "",
+    ];
+  }
+
   function compareTasks(a, b) {
-    var ka = [
-      STATUS_ORDER[a.status] == null ? 99 : STATUS_ORDER[a.status],
-      -(a.last_heartbeat_at || 0), -(a.started_at || 0), -(a.created_at || 0),
-      a.board || "", a.id || "",
-    ];
-    var kb = [
-      STATUS_ORDER[b.status] == null ? 99 : STATUS_ORDER[b.status],
-      -(b.last_heartbeat_at || 0), -(b.started_at || 0), -(b.created_at || 0),
-      b.board || "", b.id || "",
-    ];
+    var ka = taskSortKey(a);
+    var kb = taskSortKey(b);
     for (var i = 0; i < ka.length; i++) {
       if (ka[i] < kb[i]) return -1;
       if (ka[i] > kb[i]) return 1;
@@ -168,7 +217,29 @@
     return 0;
   }
 
-  function Page() {
+  // The task list scrolls on ONE axis at a time: a vertical column on desktop, a
+// horizontal carousel on mobile (see the media query in style.css). Everything
+// that moves the list — autoscroll, "did the user take over?" — asks which axis
+// is live instead of assuming scrollTop, otherwise a selection on a phone
+// scrolls the carousel sideways while the code tries to move it vertically.
+var MOBILE_QUERY = "(max-width: 1023px)";
+
+function isCarousel() {
+  try {
+    if (window.matchMedia) return window.matchMedia(MOBILE_QUERY).matches;
+  } catch (e) {
+    /* no matchMedia — fall through to the width check */
+  }
+  return (window.innerWidth || 0) < 1024;
+}
+
+// Current scroll offset of the list on whichever axis it scrolls.
+function listPos(list) {
+  if (!list) return 0;
+  return isCarousel() ? list.scrollLeft : list.scrollTop;
+}
+
+function Page() {
     var tasksState = useState([]);
     var tasks = tasksState[0];
     var setTasks = tasksState[1];
@@ -236,6 +307,14 @@
     var showArchivedState = useState(false);
     var showArchived = showArchivedState[0];
     var setShowArchived = showArchivedState[1];
+    var showArchivedRef = useRef(showArchived);
+    showArchivedRef.current = showArchived;
+
+    // Bumped by the sort-key backfill when it fills priority/completed_at
+    // from the bundled /board route, so the list re-renders in the new order.
+    var sortTickState = useState(0);
+    var sortTick = sortTickState[0];
+    var setSortTick = sortTickState[1];
 
     // Board filter for the left list. ALL_BOARDS ("") = every board.
     var boardState = useState(readStoredBoard());
@@ -253,6 +332,8 @@
     var queryState = useState("");
     var query = queryState[0];
     var setQuery = queryState[1];
+    var queryRef = useRef(query);
+    queryRef.current = query;
     // taskId -> lowercased `body`, used for description matches. The bundled
     // `/board` route is the only one that returns the FULL body, so it is read
     // from there — lazily, the first time a query is typed, and cached after
@@ -297,9 +378,9 @@
     var draftBoardState = useState("");
     var draftBoard = draftBoardState[0];
     var setDraftBoard = draftBoardState[1];
-    // Per-task runtime cap in seconds; 0 = бесконечно (no cap). The bundled
-    // POST /tasks takes max_runtime_seconds and the dispatcher SIGTERMs the
-    // worker once it elapses.
+    // Per-task runtime cap in MINUTES; 0 = бесконечно (no cap). The bundled
+    // POST /tasks takes max_runtime_seconds, so the form collects minutes (what
+    // a human plans in) and converts once on submit.
     var draftRuntimeState = useState("0");
     var draftRuntime = draftRuntimeState[0];
     var setDraftRuntime = draftRuntimeState[1];
@@ -353,9 +434,10 @@
     // Auto-scroll arm for the list: re-armed on every selection / board switch,
     // dropped as soon as the user scrolls the list themselves.
     var listFollowRef = useRef(true);
-    // scrollTop we set ourselves. A scroll event that lands on it is our own
-    // jump — including the clamp the browser fires when a re-render shrinks
-    // the list — and must not read as "the user took over".
+    // scrollTop (desktop) / scrollLeft (mobile carousel) we set ourselves. A
+    // scroll event that lands on it is our own jump — including the clamp the
+    // browser fires when a re-render shrinks the list — and must not read as
+    // "the user took over".
     var selfScrollTopRef = useRef(0);
     // The comments thread scroll container (auto-follow the newest comment).
     var commentsScrollRef = useRef(null);
@@ -598,7 +680,9 @@
     }, [board, tasks, showArchived, boardOf]);
 
     // --- Autoscroll ------------------------------------------------------
-    // Move the list just enough to bring the selected row back on screen.
+    // Move the list just enough to bring the selected row back on screen, along
+    // whichever axis the list scrolls on (vertical desktop column, horizontal
+    // mobile carousel).
     // Never uses scrollIntoView: that would also scroll the page around it.
     function ensureRowVisible() {
       var list = listRef.current;
@@ -608,6 +692,16 @@
       if (!row) return;
       var lb = list.getBoundingClientRect();
       var rb = row.getBoundingClientRect();
+      if (isCarousel()) {
+        if (rb.left >= lb.left && rb.right <= lb.right) return;
+        list.scrollLeft += rb.left < lb.left
+          ? rb.left - lb.left
+          : rb.right - lb.right;
+        // Read back: the browser clamps, and the event we are about to cause
+        // reports the clamped value.
+        selfScrollTopRef.current = list.scrollLeft;
+        return;
+      }
       if (rb.top >= lb.top && rb.bottom <= lb.bottom) return;
       list.scrollTop += rb.top < lb.top
         ? rb.top - lb.top
@@ -620,14 +714,14 @@
     // A manual scroll of the list wins until the next selection / board switch.
     function onListScroll(e) {
       var node = e.currentTarget || e.target;
-      if (Math.abs(node.scrollTop - selfScrollTopRef.current) < 2) return;
+      if (Math.abs(listPos(node) - selfScrollTopRef.current) < 2) return;
       listFollowRef.current = false;
     }
 
     // Selecting a task (or switching boards) puts its row back on screen.
     useEffect(function () {
       listFollowRef.current = true;
-      if (listRef.current) selfScrollTopRef.current = listRef.current.scrollTop;
+      if (listRef.current) selfScrollTopRef.current = listPos(listRef.current);
       ensureRowVisible();
     }, [selected, board]);
 
@@ -1167,13 +1261,16 @@
         setCreateNote({ kind: "err", text: "нужен путь к каталогу" });
         return;
       }
-      // Runtime cap in seconds; 0 or blank = бесконечно. Reject negatives and
-      // junk early rather than sending them to the dispatcher.
-      var runtime = parseInt(draftRuntime, 10);
-      if (isNaN(runtime) || runtime < 0) {
-        setCreateNote({ kind: "err", text: "время должно быть числом секунд (0 = бесконечно)" });
+      // Runtime cap in MINUTES; 0 or blank = бесконечно. Reject negatives and
+      // junk early rather than sending them to the dispatcher. The API speaks
+      // seconds (`max_runtime_seconds`), so the conversion happens here — once,
+      // in one place.
+      var minutes = parseInt(draftRuntime, 10);
+      if (isNaN(minutes) || minutes < 0) {
+        setCreateNote({ kind: "err", text: "время должно быть числом минут (0 = бесконечно)" });
         return;
       }
+      var runtimeSeconds = minutes * 60;
       setCreateBusy(true);
       setCreateNote({ kind: "", text: "" });
       var payload = {
@@ -1183,7 +1280,7 @@
         priority: parseInt(draftPriority, 10) || 0,
         // 0 means "no cap" — the column stays NULL so the dispatcher's
         // `max_runtime_seconds IS NOT NULL` guard skips the task entirely.
-        max_runtime_seconds: runtime > 0 ? runtime : null,
+        max_runtime_seconds: runtimeSeconds > 0 ? runtimeSeconds : null,
       };
       // `triage` and `blocked` are create-time states in the core; `todo` is
       // reached by the follow-up PATCH below.
@@ -1311,15 +1408,92 @@
       }
     }
 
+    // Rows are rendered from the SORTED list, and the sort inputs come from the
+    // backfill cache when /tasks/all does not carry them yet — so the rendered
+    // data-attributes below always describe the numbers the order was built
+    // from, never a stale 0.
+    var sortedTasks = tasks.slice().sort(compareTasks);
+
     function visibleTasks() {
       var filter = board === ALL_BOARDS ? null : board;
       var q = (query || "").trim();
-      return tasks.filter(function (t) {
+      return sortedTasks.filter(function (t) {
         if (filter && boardSlug(t) !== filter) return false;
         if (!showArchived && t.status === "archived") return false;
         if (q && !matchesQuery(t)) return false;
         return true;
       });
+    }
+
+    // --- Sort-key backfill ---------------------------------------------------
+    // /tasks/all sorts by priority and completion time, but those fields only
+    // reach the browser after the dashboard process re-imports this plugin's
+    // Python (i.e. after a restart). Until then it answers without them, and a
+    // priority-ordered list is indistinguishable from an unsorted one.
+    //
+    // The bundled kanban `/board` route carries both fields and is mounted at
+    // process start, so it is always live — at ~4x the payload, on a 15 s tick,
+    // and only for boards that currently show tasks. As soon as one /tasks/all
+    // response carries the fields natively, the whole backfill shuts down.
+    useEffect(function () {
+      if (SORT_KEYS_NATIVE) return;
+      var stop = false;
+      var busy = false;
+      function tick() {
+        if (busy) return;
+        // Boards that actually contribute rows right now — a board filtered out
+        // (or holding no visible task) costs no request.
+        var needed = {};
+        tasksRef.current.forEach(function (t) {
+          if (boardRef.current !== ALL_BOARDS && boardSlug(t) !== boardRef.current) return;
+          if (!showArchivedRef.current && t.status === "archived") return;
+          if (!(queryRef.current || "").trim()) return;
+          needed[t.board || "default"] = true;
+        });
+        var slugs = Object.keys(needed);
+        if (!slugs.length) return;
+        busy = true;
+        Promise.all(slugs.map(function (slug) {
+          return fetchJSON(
+            KANBAN_API + "/board?include_archived=true&board=" + encodeURIComponent(slug)
+          ).then(function (r) {
+            if (!r || r.__error || !r.columns) return null;
+            var out = [];
+            for (var i = 0; i < r.columns.length; i++) {
+              var ts = r.columns[i].tasks || [];
+              for (var j = 0; j < ts.length; j++) {
+                if (!ts[j].id) continue;
+                out.push([ts[j].id, ts[j].priority || 0, ts[j].completed_at || 0]);
+              }
+            }
+            return out;
+          }).catch(function () { return null; });
+        })).then(function (perBoard) {
+          busy = false;
+          if (stop) return;
+          for (var i = 0; i < perBoard.length; i++) {
+            for (var j = 0; j < (perBoard[i] || []).length; j++) {
+              var e = perBoard[i][j];
+              SORT_KEYS[e[0]] = { priority: e[1], completed_at: e[2] };
+            }
+          }
+          setSortTick(function (n) { return n + 1; });
+        });
+      }
+      tick();
+      var h = setInterval(tick, SORT_KEYS_POLL_MS);
+      return function () {
+        stop = true;
+        clearInterval(h);
+      };
+    }, [tasks, board, showArchived, query]);
+
+    // Latch off the backfill the moment the cheap route reports the fields
+    // itself. Read off the task payload rather than a probe request: the very
+    // poll that delivers a native priority is already in hand.
+    if (!SORT_KEYS_NATIVE && tasks.length && tasks[0] &&
+        tasks[0].priority != null) {
+      SORT_KEYS_NATIVE = true;
     }
 
     // Counters describe what the list is showing: with a board chosen they
@@ -1336,6 +1510,11 @@
     }
 
     var c = counts();
+    // `sortTick` is read here (not merely declared) so the backfill's state bump
+    // re-renders the rows in their new priority/completion order. Without this
+    // reference the value would be dead and the fill-in would only show up on
+    // the next 2 s list poll.
+    if (sortTick < 0) return null;
     var vt = visibleTasks();
 
     var el = R.createElement;
@@ -1448,12 +1627,18 @@
                   : "на доске «" + board + "» задач нет")
         : vt.map(function (t) {
             var active = t.id === selected;
+            var inp = sortInputs(t);
             return el(
               "button",
               {
                 key: t.id,
                 type: "button",
                 "data-task-id": t.id,
+                // Mirror of the sort inputs, so the ordering rule can be
+                // asserted from the DOM instead of inferred from the titles.
+                "data-status": t.status || "",
+                "data-priority": String(inp.priority),
+                "data-completed-at": String(inp.completed_at),
                 className: "hlv-row" + (active ? " active" : ""),
                 ref: function (node) {
                   if (node) rowRefs.current.set(t.id, node);
@@ -1813,14 +1998,14 @@
             })
           ),
           el("label", { className: "hlv-field hlv-field-narrow" },
-            el("span", { className: "hlv-field-label" }, "Время, сек"),
+            el("span", { className: "hlv-field-label" }, "Время, мин"),
             el("input", {
               className: "hlv-input",
               type: "number",
               min: "0",
               value: draftRuntime,
               placeholder: "0",
-              title: "лимит времени воркера; 0 = бесконечно",
+              title: "лимит времени воркера в минутах; 0 = бесконечно",
               onChange: function (e) { setDraftRuntime(e.target.value); },
               onKeyDown: onCreateKeyDown,
             })
@@ -1853,25 +2038,34 @@
         el("div", { className: "hlv-field-row" },
           el("label", { className: "hlv-field" },
             el("span", { className: "hlv-field-label" }, "Воркспейс"),
+            // The workspace is derived from the board, so it stays locked until
+            // a board is picked (ТЗ): a value chosen before that would be
+            // silently replaced by the board's defaults one click later.
             el(
               "select",
               {
                 className: "hlv-select hlv-input",
                 value: draftWsKind,
-                title: "временный каталог удаляется после завершения; dir/worktree — сохраняются",
+                disabled: !draftBoard,
+                title: draftBoard
+                  ? "временный каталог удаляется после завершения; dir/worktree — сохраняются"
+                  : "сначала выберите доску — воркспейс берётся из неё",
                 onChange: function (e) { setDraftWsKind(e.target.value); },
                 onKeyDown: onCreateKeyDown,
               },
               el("option", { value: "scratch" }, "временный (scratch)"),
               el("option", { value: "dir" }, "каталог (dir)"),
               el("option", { value: "worktree" }, "git worktree")
-            )
+            ),
+            !draftBoard ? el("span", { className: "hlv-modal-hint" },
+              "доска не выбрана — воркспейс станет доступен") : null
           ),
           draftWsKind !== "scratch" ? el("label", { className: "hlv-field" },
             el("span", { className: "hlv-field-label" }, "Путь"),
             el("input", {
               className: "hlv-input",
               value: draftWsPath,
+              disabled: !draftBoard,
               placeholder: draftWsKind === "dir"
                 ? "/путь/к/каталогу"
                 : "/путь/к/репозиторию",
