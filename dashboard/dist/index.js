@@ -147,10 +147,15 @@
   // instead of jumping to the bottom of the list.
   //
   // Within one status: finished cards (done/archived) by completion time,
-  // newest first; everything still in flight by priority, highest first —
-  // the order the dispatcher itself will pick them up in.
+  // newest first; everything still in flight by priority, highest first. The
+  // `ready` group is the exception — see taskSortKey.
+  //
+  // Status group order. `scheduled` sits AFTER `ready` on purpose: a scheduled
+  // card is parked waiting on time and is not dispatchable, so it must not read
+  // as "next up" — while the `ready` lane IS the dispatch queue (see
+  // taskSortKey, which mirrors the dispatcher's own ORDER BY for that group).
   var STATUS_ORDER = {
-    running: 0, scheduled: 1, ready: 2, blocked: 3,
+    running: 0, ready: 1, scheduled: 2, blocked: 3,
     review: 4, triage: 5, todo: 6, done: 7, archived: 8,
   };
 
@@ -198,8 +203,37 @@
   function taskSortKey(t) {
     var closed = !!CLOSED_STATUSES[t.status];
     var inp = sortInputs(t);
+    var group = STATUS_ORDER[t.status] == null ? 99 : STATUS_ORDER[t.status];
+    // The `ready` group is the dispatch queue, so it is ordered by the
+    // dispatcher's OWN rule — `ORDER BY priority DESC, created_at ASC`
+    // (kanban_db_dispatch._lane_rows). The generic keys below tie-break equal
+    // priorities by newest activity first, which is the opposite direction; used
+    // here the list would advertise an in-progress order the dispatcher does
+    // not honour. Mirroring it exactly means the first ready row really is the
+    // card that goes in-progress next.
+    if (t.status === "ready") {
+      return [
+        group,
+        -(inp.priority || 0),  // priority DESC
+        t.created_at || 0,     // created_at ASC (oldest first)
+        t.board || "", t.id || "",
+      ];
+    }
+    // A RUNNING card must not move because its worker spoke. The generic keys
+    // below tie-break on last_heartbeat_at, which changes on every heartbeat —
+    // two equally-prioritised running cards used to swap places whenever either
+    // one reported in, reshuffling the list under the cursor. Started-at is
+    // stable for the whole run and still meaningful: longest-running first.
+    if (t.status === "running") {
+      return [
+        group,
+        -(inp.priority || 0),
+        t.started_at || t.created_at || 0,   // ASC, and never negated
+        t.board || "", t.id || "",
+      ];
+    }
     return [
-      STATUS_ORDER[t.status] == null ? 99 : STATUS_ORDER[t.status],
+      group,
       // negated so the array sorts ascending = "highest first"
       closed ? -(inp.completed_at || 0) : -(inp.priority || 0),
       -(t.last_heartbeat_at || 0), -(t.started_at || 0), -(t.created_at || 0),
@@ -318,6 +352,28 @@ function Page() {
     var descNoteState = useState({ kind: "", text: "" });
     var descNote = descNoteState[0];
     var setDescNote = descNoteState[1];
+
+    // --- "Прочее" tab: priority + status -----------------------------------
+    // Both are plain PATCH /tasks/{id} calls against the bundled plugin — the
+    // same route the description editor already uses. `status` is deliberately
+    // NOT offered as a free select: the bundled handler refuses `running`
+    // (400, #19535 — a task may only enter running through the dispatcher's
+    // claim path), so the buttons below offer only the statuses that route
+    // actually accepts.
+    var metaEditState = useState(false);
+    var metaEdit = metaEditState[0];
+    var setMetaEdit = metaEditState[1];
+    var metaEditRef = useRef(false);
+    metaEditRef.current = metaEdit;
+    var metaDraftState = useState("0");
+    var metaDraft = metaDraftState[0];
+    var setMetaDraft = metaDraftState[1];
+    var metaBusyState = useState(false);
+    var metaBusy = metaBusyState[0];
+    var setMetaBusy = metaBusyState[1];
+    var metaNoteState = useState({ kind: "", text: "" });
+    var metaNote = metaNoteState[0];
+    var setMetaNote = metaNoteState[1];
 
     var showArchivedState = useState(false);
     var showArchived = showArchivedState[0];
@@ -1032,14 +1088,17 @@ function Page() {
       if (el) el.scrollTop = el.scrollHeight;
     }, [pane, comments.length]);
 
-    // Description of the selected task, polled while the description tab is
-    // open. The route is the bundled one (GET /tasks/{id}?board=), which returns
-    // the FULL body — the list route only carries a 200-char preview.
+    // Full detail of the selected task, polled while the description OR the
+    // "прочее" tab is open — both read the same payload, so one fetch serves
+    // two panes. The route is the bundled one (GET /tasks/{id}?board=), which
+    // returns the FULL body (the list route only carries a 200-char preview)
+    // plus the priority and status the "прочее" controls write.
     var DESC_POLL_MS = 5000;
     useEffect(function () {
-      if (!selected || pane !== "description") {
+      if (!selected || (pane !== "description" && pane !== "other")) {
         setDesc(null);
         setDescEdit(false);
+        setMetaEdit(false);
         return;
       }
       var stop = false;
@@ -1056,6 +1115,7 @@ function Page() {
             body: r.task.body || "",
             status: r.task.status,
             assignee: r.task.assignee || "",
+            priority: r.task.priority == null ? 0 : r.task.priority,
             workspace: (r.task.workspace_kind || "scratch") +
               (r.task.workspace_path ? " · " + r.task.workspace_path : ""),
             runtime: r.task.max_runtime_seconds || 0,
@@ -1063,6 +1123,9 @@ function Page() {
           // Never overwrite an open editor with a poll result. Read through
           // the ref: the closed-over `descEdit` is the mount-time value.
           if (!descEditRef.current) setDescDraft(r.task.body || "");
+          // Same rule for the priority field: an open editor keeps what is
+          // typed until it is saved or cancelled.
+          if (!metaEditRef.current) setMetaDraft(String(r.task.priority || 0));
         }).catch(function () {});
       }
       load();
@@ -1071,8 +1134,9 @@ function Page() {
         stop = true;
         clearInterval(h);
       };
-      // descEdit is read through the ref above; re-running on it would restart
-      // the poller on every keystroke, so it is intentionally absent.
+      // descEdit / metaEdit are read through refs above; re-running on them
+      // would restart the poller on every keystroke, so they are intentionally
+      // absent.
     }, [selected, pane, boardOf]);
 
     function startDescEdit() {
@@ -1143,6 +1207,116 @@ function Page() {
       if (e.key === "Escape") {
         e.preventDefault();
         cancelDescEdit();
+      }
+    }
+
+    // --- "Прочее": priority + status writes ---------------------------------
+    // One PATCH helper for both, so the busy flag, the success note and the
+    // error shape (the route answers 400/409 with `detail`, 200 with `{task}`)
+    // are handled in exactly one place.
+    function patchTask(patch, okText, onOk) {
+      var id = selectedRef.current;
+      if (!id || metaBusy) return;
+      setMetaBusy(true);
+      setMetaNote({ kind: "", text: "" });
+      fetchJSON(
+        KANBAN_API + "/tasks/" + encodeURIComponent(id) + "?board=" +
+        encodeURIComponent(boardOf(id)),
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(patch),
+        }
+      ).then(function (r) {
+        setMetaBusy(false);
+        if (r.__error || r.detail || !r.task) {
+          setMetaNote({
+            kind: "err",
+            // 409 carries the actionable refusal text (e.g. which parent blocks
+            // `ready`), so `detail` is preferred over our generic text.
+            text: r.detail || r.error || r.__error || "не удалось применить изменение",
+          });
+          return;
+        }
+        setMetaNote({ kind: "ok", text: okText });
+        if (onOk) onOk(r.task);
+        setTimeout(function () {
+          setMetaNote(function (n) {
+            return n.kind === "ok" ? { kind: "", text: "" } : n;
+          });
+        }, 2500);
+      }).catch(function (e) {
+        setMetaBusy(false);
+        setMetaNote({ kind: "err", text: String((e && e.message) || e) });
+      });
+    }
+
+    // Merge one field of the fresh task into `desc`, keeping the rest — the
+    // detail poller owns the other keys and would otherwise blank them for a
+    // tick if we replaced the object wholesale.
+    function setDescField(key, value) {
+      setDesc(function (prev) {
+        if (!prev) return prev;
+        var next = {};
+        for (var k in prev) {
+          if (Object.prototype.hasOwnProperty.call(prev, k)) next[k] = prev[k];
+        }
+        next[key] = value;
+        return next;
+      });
+    }
+
+    function startMetaEdit() {
+      if (!desc) return;
+      setMetaDraft(String(desc.priority || 0));
+      setMetaNote({ kind: "", text: "" });
+      setMetaEdit(true);
+    }
+
+    function cancelMetaEdit() {
+      setMetaEdit(false);
+      setMetaDraft(desc ? String(desc.priority || 0) : "0");
+      setMetaNote({ kind: "", text: "" });
+    }
+
+    // An empty / non-numeric field would send NaN, and `Number("")||0` would
+    // silently write 0 over a real priority. Refuse it and say why instead.
+    function saveMeta() {
+      var raw = (metaDraft || "").trim();
+      if (!/^-?\d+$/.test(raw)) {
+        setMetaNote({ kind: "err", text: "приоритет — целое число (сейчас «" + raw + "»)" });
+        return;
+      }
+      var n = parseInt(raw, 10);
+      patchTask({ priority: n }, "приоритет сохранён: " + n, function (task) {
+        setDescField("priority", task.priority == null ? 0 : task.priority);
+        setMetaEdit(false);
+      });
+    }
+
+    function setStatus(status) {
+      // `done` / `archived` / `blocked` release the worker's claim and can
+      // promote children — the bundled plugin confirms exactly these three, and
+      // so do we, rather than silently performing the same thing from a button.
+      var destructive = status === "done" || status === "archived" || status === "blocked";
+      if (destructive && !window.confirm(
+        "Перевести задачу в " + status + "? Действие отпустит Claim воркера.")) {
+        return;
+      }
+      patchTask({ status: status }, "состояние: " + status, function (task) {
+        setDescField("status", task.status);
+      });
+    }
+
+    function onMetaKeyDown(e) {
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        saveMeta();
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        cancelMetaEdit();
       }
     }
 
@@ -1882,6 +2056,12 @@ function Page() {
                 "data-status": t.status || "",
                 "data-priority": String(inp.priority),
                 "data-completed-at": String(inp.completed_at),
+                // The `ready` lane is ordered by created_at ASC (see taskSortKey),
+                // so the row has to carry it — without this attribute the DOM
+                // cannot show which of two equal-priority cards goes first, and
+                // the render test can only re-derive the order by re-implementing
+                // the rule instead of reading it off the page.
+                "data-created-at": String(t.created_at || 0),
                 className: "hlv-row" + (active ? " active" : ""),
                 ref: function (node) {
                   if (node) rowRefs.current.set(t.id, node);
@@ -2120,6 +2300,112 @@ function Page() {
       descActions
     );
 
+    // --- "Прочее" pane ------------------------------------------------------
+    // The controls the description pane has no room for: priority and status.
+    // Both write through PATCH /tasks/{id} on the bundled kanban plugin, so no
+    // route is added here and the tab works without a dashboard restart.
+    //
+    // The status set is exactly what that route accepts. `running` is absent by
+    // design: the route rejects it with 400 (#19535) because a task may only
+    // enter running through the dispatcher's claim path — offering the button
+    // would only ever produce a refusal.
+    var STATUS_BUTTONS = [
+      { value: "triage", label: "→ triage", title: "вернуть в разбор" },
+      { value: "todo", label: "→ todo", title: "в бэклог" },
+      { value: "ready", label: "→ ready", title: "поставить в очередь на запуск" },
+      { value: "scheduled", label: "→ scheduled", title: "отложить (ждёт времени)" },
+      { value: "blocked", label: "→ blocked", title: "заблокировать (отпустит claim воркера)" },
+      { value: "review", label: "→ review", title: "отправить на проверку" },
+      { value: "done", label: "→ done", title: "завершить (отпустит claim воркера)" },
+      { value: "archived", label: "→ archived", title: "в архив" },
+    ];
+
+    var otherView;
+    if (!selected) {
+      otherView = el("div", { className: "hlv-empty" }, "выберите задачу слева");
+    } else if (!desc) {
+      otherView = el("div", { className: "hlv-empty" }, "загрузка…");
+    } else {
+      var curStatus = desc.status;
+      otherView = el(
+        "div",
+        { className: "hlv-log hlv-other" },
+        el("div", { className: "hlv-desc-head" },
+          el("span", { className: "hlv-desc-title" }, desc.title || desc.id),
+          el("span", { className: "hlv-desc-meta" },
+            el("span", { className: statusClass(curStatus) },
+              STATUS_LABEL[curStatus] || curStatus),
+            desc.assignee ? el("span", null, "@" + desc.assignee) : null,
+            el("span", null, "воркспейс: " + desc.workspace))
+        ),
+        el("div", { className: "hlv-field-row" },
+          el("span", { className: "hlv-field-label" }, "приоритет"),
+          metaEdit
+            ? el("input", {
+                className: "hlv-input hlv-prio-input",
+                type: "number",
+                step: "1",
+                value: metaDraft,
+                autoFocus: true,
+                onChange: function (e) { setMetaDraft(e.target.value); },
+                onKeyDown: onMetaKeyDown,
+              })
+            : el("span", { className: "hlv-prio-value" },
+                String(desc.priority == null ? 0 : desc.priority)),
+          el("span", { className: "hlv-field-hint" },
+            "чем выше, тем раньше воркер возьмёт задачу; порядок ready — как в диспетчере")
+        ),
+        el("div", { className: "hlv-field-row" },
+          el("span", { className: "hlv-field-label" }, "состояние"),
+          el("div", { className: "hlv-status-btns" },
+            STATUS_BUTTONS.map(function (b) {
+              return el("button", {
+                key: b.value,
+                type: "button",
+                className: "hlv-btn" + (curStatus === b.value ? " hlv-btn-current" : ""),
+                title: b.title,
+                disabled: metaBusy || curStatus === b.value,
+                onClick: function () { setStatus(b.value); },
+              }, b.label);
+            })
+          )
+        )
+      );
+    }
+
+    var otherActions = el(
+      "div",
+      { className: "hlv-desc-actions" },
+      metaNote.text ? el("span", { className: "hlv-desc-note " + metaNote.kind }, metaNote.text) : null,
+      metaEdit
+        ? el("button", {
+            type: "button",
+            className: "hlv-btn",
+            disabled: metaBusy,
+            onClick: cancelMetaEdit,
+          }, "отмена")
+        : el("button", {
+            type: "button",
+            className: "hlv-btn",
+            disabled: !desc,
+            onClick: startMetaEdit,
+            title: "править приоритет (Ctrl+Enter — сохранить, Esc — отмена)",
+          }, "править приоритет"),
+      metaEdit ? el("button", {
+        type: "button",
+        className: "hlv-btn hlv-btn-primary",
+        disabled: metaBusy,
+        onClick: saveMeta,
+      }, metaBusy ? "сохранение…" : "сохранить") : null
+    );
+
+    var otherPane = el(
+      "div",
+      { className: "hlv-desc-wrap" },
+      otherView,
+      otherActions
+    );
+
     // Tab bar above the right pane.
     var rightPane = el(
       "div",
@@ -2141,6 +2427,12 @@ function Page() {
           onClick: function () { setPane("description"); },
           title: "описание задачи (тело карточки), с редактированием",
         }, "дескрипшен"),
+        el("button", {
+          type: "button",
+          className: "hlv-tab" + (pane === "other" ? " active" : ""),
+          onClick: function () { setPane("other"); },
+          title: "приоритет и состояние задачи",
+        }, "прочее"),
         el("div", { className: "hlv-tabs-right" },
           sizeInfo,
           expandBtn
@@ -2148,6 +2440,7 @@ function Page() {
       ),
       pane === "log" ? logPane
         : pane === "description" ? descriptionView
+        : pane === "other" ? otherPane
         : commentsView
     );
 

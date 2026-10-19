@@ -67,8 +67,13 @@ from pydantic import BaseModel
 
 router = APIRouter()
 
+# Display order of the status groups. `scheduled` deliberately sits AFTER
+# `ready`: a scheduled card is parked waiting on time and is not dispatchable
+# (kanban_db.schedule_task), so it must never read as "next up". The `ready`
+# lane, by contrast, IS the dispatch queue and is ordered by _sort_key to match
+# the dispatcher exactly.
 _STATUS_ORDER = {
-    "running": 0, "scheduled": 1, "ready": 2, "blocked": 3,
+    "running": 0, "ready": 1, "scheduled": 2, "blocked": 3,
     "review": 4, "triage": 5, "todo": 6, "done": 7, "archived": 8,
 }
 
@@ -314,12 +319,46 @@ def _sort_key(t: dict):
     """Display order within a status group (ТЗ).
 
     Finished cards (``done``/``archived``) go by completion time, most recent
-    first. Everything still in flight goes by priority, highest first — that is
-    the order the dispatcher itself will pick them up in, so the list reads as
-    the queue does. Recency of activity only breaks ties inside the same
-    priority, so a burst of low-priority cards cannot bury a high-priority one.
+    first. Everything still in flight goes by priority, highest first. Recency
+    of activity only breaks ties inside the same priority, so a burst of
+    low-priority cards cannot bury a high-priority one.
+
+    The ``ready`` group is the exception and gets the dispatcher's OWN order:
+    ``priority DESC, created_at ASC`` — the exact ``ORDER BY`` of
+    ``kanban_db_dispatch._lane_rows``. The general rule below sorts ready cards
+    newest-activity-first among equal priorities, which is the opposite of what
+    the dispatcher does, so a list built on it would promise an in-progress
+    order the dispatcher would not honour. Here the tiebreak is oldest-first,
+    matching ``created_at ASC``, so the first ready row is genuinely the card
+    that goes in-progress next.
+
+    The ``running`` group opts OUT of the ``last_heartbeat_at`` tiebreak. That
+    key changes on every worker heartbeat, so two equally-prioritised running
+    cards swapped places in the list whenever either one happened to report in
+    — the queue reshuffled under the cursor on a live board, with no change in
+    what was actually queued. Running cards sort by when they STARTED instead:
+    stable for the whole run, and still meaningful (the worker that has been
+    going longest comes first).
     """
     closed = t["status"] in _CLOSED_STATUSES
+    if t["status"] == "ready":
+        return (
+            _STATUS_ORDER["ready"],
+            -(t["priority"] or 0),   # same as _lane_rows: priority DESC
+            t["created_at"] or 0,    # same as _lane_rows: created_at ASC
+            t["board"],
+            t["id"],
+        )
+    if t["status"] == "running":
+        return (
+            _STATUS_ORDER["running"],
+            -(t["priority"] or 0),
+            # started_at ASC — NOT heartbeat, and never negated: the list must
+            # not move a card because its worker spoke.
+            t["started_at"] or t["created_at"] or 0,
+            t["board"],
+            t["id"],
+        )
     return (
         _STATUS_ORDER.get(t["status"], 99),
         # closed: newest completion first; open: highest priority first

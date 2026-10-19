@@ -2,6 +2,18 @@
 /**
  * Demo data for the README screenshots.
  *
+ * !!!! DO NOT RUN THIS WITHOUT THE USER SAYING SO. !!!!
+ *
+ * Seeding creates a REAL board on the user's live dashboard, and
+ * `tools/screenshots.js` then OVERWRITES the committed PNGs in docs/. The user
+ * asked (2026-10-19) not to have either happen unannounced: a demo board left
+ * on the real dashboard and silently updated screenshots, both of which they
+ * only found by noticing. Ask first, every time — even for a feature that looks
+ * like it needs a picture, and even when the repo already documents this
+ * command as the way to produce screenshots. If a task genuinely needs a
+ * screenshot, SAY SO and let the user decide; the alternative is asking
+ * afterwards, which is what this note exists to prevent.
+ *
  * Creates a throwaway board (`hlv-demo`) filled with fake cards across every
  * status, plus a synthetic worker log for the running ones, so the screenshots
  * show a realistic panel without exposing real task titles. Everything lives on
@@ -17,7 +29,7 @@
  * /tmp/hlv.cookies (see README → «Скриншоты»).
  *
  * Usage:
- *   node tools/seed_demo.js            # seed
+ *   node tools/seed_demo.js            # seed        (ask the user first!)
  *   node tools/seed_demo.js --clean    # hard-delete the board
  */
 const fs = require("fs");

@@ -2,14 +2,24 @@
 /**
  * README screenshots for hermes-logs-viewer.
  *
+ * !!!! DO NOT RUN THIS WITHOUT THE USER SAYING SO. !!!!
+ *
+ * This script OVERWRITES the committed PNGs in docs/. The user asked (2026-10-19)
+ * that screenshots never be updated without their knowledge — they noticed a
+ * silent refresh rather than being told about it. It also requires seeding the
+ * throwaway `hlv-demo` board first (tools/seed_demo.js), which puts a real
+ * board on the user's live dashboard; that needs the same permission. Ask
+ * before either, even when a new UI feature looks like it needs a picture.
+ * If the user does say yes, run `seed_demo.js` first and `--clean` afterwards
+ * so no demo board is left behind.
+ *
  * Drives the real plugin in Chromium against the live dashboard and writes PNGs
  * into docs/. Everything shown is fake data from tools/seed_demo.js, on the
  * throwaway `hlv-demo` board — no real task title ever reaches a screenshot.
  *
- * Requires:
- *   - a dashboard on 127.0.0.1:9119 with the plugin installed
- *   - a curl cookie jar at /tmp/hlv.cookies (dashboard session)
- *   - demo data: node tools/seed_demo.js
+ * Requires a dashboard on 127.0.0.1:9119 with the plugin installed, a curl
+ * cookie jar at /tmp/hlv.cookies, and — with permission — demo data:
+ *   node tools/seed_demo.js
  *
  * Usage: node tools/screenshots.js
  */

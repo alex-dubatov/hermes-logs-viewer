@@ -1255,6 +1255,8 @@ async function openDialog(boardSlug) {
       status: r.getAttribute("data-status"),
       priority: Number(r.getAttribute("data-priority") || 0),
       completed: Number(r.getAttribute("data-completed-at") || 0),
+      created: Number(r.getAttribute("data-created-at") || 0),
+      id: r.getAttribute("data-task-id"),
     }));
     check(
       "у каждой строки списка есть статус и время завершения в data-атрибутах",
@@ -1285,6 +1287,93 @@ async function openDialog(boardSlug) {
       violations.length === 0,
       violations.length ? "нарушено: " + violations.slice(0, 3).join("; ") : seen.length + " строк"
     );
+
+    // --- ready lane: the order the DISPATCHER will use ---------------------
+    // The list promises an in-progress order, so it has to BE one. The
+    // dispatcher claims the ready lane with `ORDER BY priority DESC,
+    // created_at ASC` (kanban_db_dispatch._lane_rows) — read off the DOM rows,
+    // not re-derived from a copy of the rule.
+    //
+    // Violation = a LATER row ranking HIGHER than the one above it: priority
+    // going UP, or equal priority with a SMALLER created_at (the dispatcher
+    // takes the oldest first). Note the direction: `c.priority > p.priority`,
+    // not `<` — the earlier version had it backwards and stayed green only
+    // because every ready card on a quiet board shares priority 0, which makes
+    // the comparison vacuously true. The fixtures below and the negative
+    // control after this walk exist so that cannot happen again.
+    {
+      const readyRows = seen.filter((r) => r.status === "ready");
+      const bad = [];
+      for (let i = 1; i < readyRows.length; i++) {
+        const p = readyRows[i - 1], c = readyRows[i];
+        if (c.priority > p.priority ||
+            (c.priority === p.priority && c.created < p.created)) {
+          bad.push(`${p.id} (прио ${p.priority}, создан ${p.created}) → ` +
+                   `${c.id} (прио ${c.priority}, создан ${c.created})`);
+        }
+      }
+      check(
+        "ready: идут в том же порядке, что и воркер их возьмёт (приоритет ↓, создан ↑)",
+        bad.length === 0,
+        bad.length ? "нарушено: " + bad.slice(0, 3).join("; ")
+          : readyRows.length + " ready"
+      );
+
+      // Negative control: a hand-built sequence that is genuinely out of
+      // dispatch order MUST be reported by the same comparison above. Without
+      // it this check could only ever pass — an inverted comparison would look
+      // identical to a correct one whenever the priorities happen to be equal.
+      const ctrl = [
+        { id: "c1", status: "ready", priority: 5, created: 300, completed: 0 },
+        { id: "c2", status: "ready", priority: 9, created: 400, completed: 0 },
+        { id: "c3", status: "ready", priority: 9, created: 100, completed: 0 },
+      ];
+      const ctrlBad = [];
+      for (let i = 1; i < ctrl.length; i++) {
+        const p = ctrl[i - 1], c = ctrl[i];
+        if (c.priority > p.priority ||
+            (c.priority === p.priority && c.created < p.created)) {
+          ctrlBad.push(`${p.id}->${c.id}`);
+        }
+      }
+      check("негативный контроль: обратный порядок ready ловится",
+        ctrlBad.length === 2, "поймано: " + ctrlBad.join(", "));
+    }
+
+    // A scheduled card is parked waiting on time — not dispatchable. It must
+    // never sit above the ready queue, or the list promises an in-progress
+    // order it cannot keep.
+    {
+      const firstScheduled = seen.findIndex((r) => r.status === "scheduled");
+      const lastReady = seen.map((r) => r.status).lastIndexOf("ready");
+      check(
+        "scheduled идёт после всех ready",
+        firstScheduled === -1 || lastReady === -1 || lastReady < firstScheduled,
+        firstScheduled === -1 ? "scheduled на доске нет"
+          : `последний ready @${lastReady}, первый scheduled @${firstScheduled}`
+      );
+    }
+
+    // A running card must not move just because its worker sent a heartbeat.
+    // last_heartbeat_at changes every few seconds, so a heartbeat-based
+    // tiebreak made running cards swap places under the cursor on a live
+    // board. Started-at is stable for the whole run, so consecutive polls of
+    // the SAME board must render the running rows in the same order.
+    {
+      const runningIds = () =>
+        $$(".hlv-row")
+          .filter((r) => r.getAttribute("data-status") === "running")
+          .map((r) => r.getAttribute("data-task-id"));
+      const snap1 = runningIds();
+      // Long enough for at least one heartbeat to land on a busy worker.
+      await sleep(9000);
+      const snap2 = runningIds();
+      check(
+        "running-задачи не меняются местами от heartbeat'ов",
+        snap1.length > 0 && snap1.join(",") === snap2.join(","),
+        snap1.join(",") + "  →  " + snap2.join(",") + " (" + snap1.length + " running)"
+      );
+    }
 
     // The rule must be visible in the data, not just vacuously true because
     // every card in the group shares one value — so require at least one group
@@ -1517,6 +1606,248 @@ async function openDialog(boardSlug) {
     );
     click($(".hlv-search-clear"));
     await sleep(500);
+  }
+
+  // --- 12. "прочее" tab: priority + status --------------------------------
+  // Driven against a throwaway card so both writes (priority, status) are real
+  // and reversible: the card is hard-deleted at the end, so a failed run leaves
+  // no debris. Nothing here is checked against a re-implementation of the UI —
+  // the priority is re-read from the server after the write.
+  {
+    // Earlier sections drive the board selector, so the list may be showing one
+    // board. The throwaway card goes on `default`; without switching the filter
+    // back to "all boards" it would simply be filtered out of the list below and
+    // every later check would fail for a reason that has nothing to do with the
+    // tab. "" is the "Все доски" value (ALL_BOARDS).
+    const boardSel = $(".hlv-board-select");
+    if (boardSel) {
+      setSelectValue(boardSel, "");
+      await sleep(600);
+    }
+    const b0 = await fetchJSON("/api/plugins/kanban/boards");
+    const defaultBoard = (b0.boards || []).find((b) => b.slug === "default") ||
+      (b0.boards || [])[0];
+    check("вкладка «прочее» присутствует",
+      $$(".hlv-tab").some((t) => (t.textContent || "").trim().indexOf("прочее") === 0),
+      $$(".hlv-tab").map((t) => (t.textContent || "").trim()).join(" | "));
+
+    let made = null;
+    if (defaultBoard) {
+      const r = await fetchJSON(
+        "/api/plugins/kanban/tasks?board=" + encodeURIComponent(defaultBoard.slug),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            title: "hlv-prochee-" + Date.now(),
+            body: "временная карточка для проверки вкладки «прочее»",
+            // `triage: true` because CreateTaskBody has NO `status` field: the
+            // card is born `ready`, i.e. dispatchable, and the dispatcher could
+            // claim it and start a real worker. Landing in triage keeps it out
+            // of the queue until the PATCH below puts it in `todo`.
+            triage: true,
+            priority: 0,
+            workspace_kind: "scratch",
+          }),
+        });
+      made = (r && r.task) || null;
+      // Same order the plugin's own create dialog uses: POST, then PATCH to the
+      // wanted state.
+      if (made) {
+        await fetchJSON(
+          "/api/plugins/kanban/tasks/" + encodeURIComponent(made.id) +
+          "?board=" + encodeURIComponent(defaultBoard.slug),
+          {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ status: "todo" }),
+          });
+      }
+    }
+    check("временная карточка создана для проверки", !!made,
+      made ? made.id : "не создана");
+
+    if (made) {
+      // The list polls every TASK_POLL_MS (2 s), so a card created a moment ago
+      // is not in the rendered rows yet — wait for a tick before looking for it.
+      await sleep(2500);
+      setInputValue($(".hlv-search-input"), made.id);
+      await sleep(800);
+      const sel = $$(".hlv-row").find((r) => r.getAttribute("data-task-id") === made.id);
+      check("карточка видна в списке", !!sel);
+      if (sel) {
+        sel.click();
+        await sleep(800);
+      }
+      click(findButton("прочее"));
+      await sleep(1500);
+
+      const pane = $(".hlv-other");
+      check("панель «прочее» открылась", !!pane,
+        pane ? "ok" : "нет .hlv-other");
+
+      // Priority: the value must be READ from the task, not invented.
+      const shown = $(".hlv-prio-value");
+      const serverBefore = (await fetchJSON(
+        "/api/plugins/kanban/tasks/" + encodeURIComponent(made.id) +
+        "?board=" + encodeURIComponent(defaultBoard.slug))).task;
+      check("приоритет показан и совпадает с доской",
+        !!shown && Number(shown.textContent) === (serverBefore.priority || 0),
+        shown ? "в панели " + shown.textContent + ", на доске " + serverBefore.priority
+              : "нет .hlv-prio-value");
+
+      // Round-trip a priority through the editor.
+      const WANT = 42;
+      if (findButton("править приоритет")) {
+        click(findButton("править приоритет"));
+        await sleep(400);
+        const input = $(".hlv-prio-input");
+        check("поле приоритета открылось", !!input);
+        if (input) {
+          setInputValue(input, String(WANT));
+          await sleep(200);
+          click(findButton("сохранить"));
+          await sleep(2000);
+          const after = (await fetchJSON(
+            "/api/plugins/kanban/tasks/" + encodeURIComponent(made.id) +
+            "?board=" + encodeURIComponent(defaultBoard.slug))).task;
+          check("приоритет сохранился через bundled PATCH",
+            after && after.priority === WANT,
+            after ? "на доске priority=" + after.priority : "нет задачи");
+          check("приоритет обновился в панели",
+            !!$(".hlv-prio-value") && Number($(".hlv-prio-value").textContent) === WANT,
+            $(".hlv-prio-value") ? $(".hlv-prio-value").textContent : "нет значения");
+        }
+      } else {
+        check("кнопка «править приоритет» есть", false, "не найдена");
+      }
+
+      // Non-numeric input must be refused, not silently written as 0.
+      if (findButton("править приоритет")) {
+        click(findButton("править приоритет"));
+        await sleep(400);
+        const input2 = $(".hlv-prio-input");
+        if (input2) {
+          setInputValue(input2, "не число");
+          await sleep(200);
+          click(findButton("сохранить"));
+          await sleep(1200);
+          const note = $(".hlv-desc-note.err");
+          check("нечисловой приоритет отклонён с объяснением",
+            !!note && /целое число/.test(note.textContent || ""),
+            note ? note.textContent : "нет сообщения об ошибке");
+          const still = (await fetchJSON(
+            "/api/plugins/kanban/tasks/" + encodeURIComponent(made.id) +
+            "?board=" + encodeURIComponent(defaultBoard.slug))).task;
+          check("при отказе значение на доске не изменилось",
+            still && still.priority === WANT,
+            still ? "priority=" + still.priority : "нет задачи");
+          const cancel = findButton("отмена");
+          if (cancel) { click(cancel); await sleep(400); }
+        }
+      }
+
+      // Status buttons: the current one is disabled, a different one works.
+      const btns = $$(".hlv-status-btns .hlv-btn");
+      const labels = btns.map((b) => (b.textContent || "").trim());
+      check("кнопки состояний на месте", btns.length >= 8,
+        labels.join(" | "));
+      check("кнопки `running` нет (маршрут её отвергает, #19535)",
+        !labels.some((l) => /running/.test(l)), labels.join(" | "));
+
+      // Read the CURRENT status off the rendered pane, not off the fetch taken
+      // before the priority tests: a stale read would pick a target button that
+      // the card may have reached in the meantime, and that button is
+      // legitimately disabled — the check would fail for the right behaviour.
+      const cur = ($(".hlv-other .hlv-status") || {}).textContent || "";
+      const curLabel = "→ " + cur.trim();
+      const curBtn = btns.find((b) => (b.textContent || "").trim() === curLabel);
+      check("кнопка текущего состояния неактивна",
+        !!curBtn && curBtn.disabled === true,
+        curBtn ? curLabel + " disabled=" + curBtn.disabled : "нет кнопки " + curLabel);
+
+      // Pick a target that is NOT the current state, so the click is a real
+      // transition rather than a disabled no-op.
+      const TARGET = ["ready", "todo", "triage"].find((s) => "→ " + s !== curLabel) || "todo";
+      const targetBtn = btns.find((b) => (b.textContent || "").trim() === "→ " + TARGET);
+      check("кнопка `→ " + TARGET + "` доступна для переключения",
+        !!targetBtn && targetBtn.disabled === false,
+        "текущее состояние: " + curLabel);
+      if (targetBtn && !targetBtn.disabled) {
+        click(targetBtn);
+        await sleep(2000);
+        const st = (await fetchJSON(
+          "/api/plugins/kanban/tasks/" + encodeURIComponent(made.id) +
+          "?board=" + encodeURIComponent(defaultBoard.slug))).task;
+        check("состояние переключилось кнопкой",
+          st && st.status === TARGET,
+          st ? "status=" + st.status + " (ждали " + TARGET + ")" : "нет задачи");
+        check("кнопка текущего состояния обновилась после переключения",
+          ($$(".hlv-status-btns .hlv-btn")
+            .find((b) => (b.textContent || "").trim() === "→ " + TARGET) || {}).disabled === true,
+          "→ " + TARGET + " должна стать неактивной");
+      }
+
+      // `done` releases the worker's claim, so it must ASK first. Stub the
+      // dialog to record the prompt, and check that declining changes nothing.
+      //
+      // The accept branch is asserted as "the guard's refusal is SHOWN", not
+      // "the task becomes done": `complete_task` refuses a card with no
+      // result/summary evidence (EmptyCompletionError), so a status button is
+      // not a way to fake a completion. That is the right behaviour to pin —
+      // it proves the pane reports the refusal instead of swallowing it.
+      const asked = [];
+      const realConfirm = dom.window.confirm;
+      dom.window.confirm = (m) => { asked.push(String(m)); return false; };
+      const doneBtn = $$(".hlv-status-btns .hlv-btn")
+        .find((b) => (b.textContent || "").trim() === "→ done");
+      if (doneBtn && !doneBtn.disabled) {
+        click(doneBtn);
+        await sleep(1500);
+      }
+      const afterDecline = (await fetchJSON(
+        "/api/plugins/kanban/tasks/" + encodeURIComponent(made.id) +
+        "?board=" + encodeURIComponent(defaultBoard.slug))).task;
+      check("разрушающий переход спрашивает подтверждение",
+        asked.length === 1 && /done/.test(asked[0]),
+        asked.length ? "вопрос: «" + asked[0] + "»" : "диалог не показывался");
+      check("отказ от подтверждения ничего не меняет",
+        afterDecline && afterDecline.status !== "done",
+        afterDecline ? "status=" + afterDecline.status : "нет задачи");
+
+      dom.window.confirm = (m) => { asked.push(String(m)); return true; };
+      const doneBtn2 = $$(".hlv-status-btns .hlv-btn")
+        .find((b) => (b.textContent || "").trim() === "→ done");
+      if (doneBtn2 && !doneBtn2.disabled) {
+        click(doneBtn2);
+        await sleep(2500);
+      }
+      const afterAccept = (await fetchJSON(
+        "/api/plugins/kanban/tasks/" + encodeURIComponent(made.id) +
+        "?board=" + encodeURIComponent(defaultBoard.slug))).task;
+      // Empty completion is refused by core, so the card must still be alive…
+      check("карточка без результата не завершается «в обход» (гвард core)",
+        afterAccept && afterAccept.status !== "done",
+        afterAccept ? "status=" + afterAccept.status : "нет задачи");
+      // …and the refusal must reach the user, verbatim. A silent no-op here
+      // would read as "the button works" while nothing happened.
+      const errNote = $(".hlv-desc-note.err");
+      check("отказ маршрута показан пользователю",
+        !!errNote && /completion blocked|no result or summary/.test(errNote.textContent || ""),
+        errNote ? errNote.textContent : "нет сообщения об ошибке");
+      dom.window.confirm = realConfirm;
+
+      // Leave no debris, whatever happened above.
+      await fetchJSON(
+        "/api/plugins/kanban/tasks/" + encodeURIComponent(made.id) +
+        "?board=" + encodeURIComponent(defaultBoard.slug),
+        { method: "DELETE" });
+      const gone = await fetchJSON(
+        "/api/plugins/kanban/tasks/" + encodeURIComponent(made.id) +
+        "?board=" + encodeURIComponent(defaultBoard.slug));
+      check("временная карточка удалена", !gone.task,
+        gone.task ? "осталась: " + gone.task.status : "удалена");
+    }
   }
 
   const failed = results.filter((r) => !r.ok);

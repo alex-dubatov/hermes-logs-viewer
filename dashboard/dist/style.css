@@ -853,6 +853,65 @@
 }
 
 /* ------------------------------------------------------------------ */
+/* Right pane: "прочее" — priority + status controls                     */
+/* ------------------------------------------------------------------ */
+.hlv-other {
+  flex: 1;
+  min-height: 0;
+  padding-bottom: 8px;
+}
+
+/* Label / value / hint on one row. `hlv-field-row` / `hlv-field-label`
+   already exist for the create dialog (align-items: flex-end, no wrap), so the
+   overrides are scoped to .hlv-other — redefining them globally would silently
+   restyle that form. */
+.hlv-other .hlv-field-row {
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.hlv-other .hlv-field-label {
+  flex-shrink: 0;
+  width: 92px;
+}
+
+.hlv-field-hint {
+  flex: 1 1 220px;
+  font-size: 0.7rem;
+  color: var(--color-muted-foreground);
+}
+
+.hlv-prio-value {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--color-card-foreground, var(--foreground));
+}
+
+.hlv-prio-input {
+  width: 90px;
+}
+
+/* The status buttons wrap as a group; `flex-basis` is what makes them break
+   into rows instead of one long line on a narrow pane. */
+.hlv-status-btns {
+  display: flex;
+  flex: 1 1 320px;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* The status the task is already in: visible as "where it is", but not
+   clickable — PATCHing a task to the status it already has is a no-op that
+   still writes an event row. */
+.hlv-btn-current {
+  font-weight: 600;
+  opacity: 0.75;
+  cursor: default;
+}
+
+/* ------------------------------------------------------------------ */
 /* Narrow layout: the task list lies on ONE axis only — horizontally,
    above the detail pane. The shell already reserves the mobile top-bar
    height (an `h-14 lg:hidden` spacer in the content flow), so no extra
