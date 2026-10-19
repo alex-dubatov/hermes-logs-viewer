@@ -27,6 +27,26 @@ Endpoints:
      Append a comment to the task, exactly as the built-in Kanban plugin does.
      `author` defaults to "dashboard". 400 on empty body / bad id / unknown
      board, 404 when the task does not exist on that board.
+  GET /projects                                 -> {"projects": [{id, slug, name,
+                                          primary_path, board_slug}, ...]}
+     Every non-archived project of the per-profile ``projects.db``, each
+     carrying the board it is bound to (``board_slug``, NULL when unbound).
+
+     WHY THIS ROUTE EXISTS: the bundled kanban plugin cannot answer "which
+     projects belong to board X". Its ``GET /boards`` annotates each board with
+     ``project_name`` — the single project named by that board's own
+     ``board.json.project_id`` — and its ``GET /projects`` lists every project
+     WITHOUT ``board_slug``. Neither exposes the board↔projects relation, so a
+     per-board project picker cannot be built on top of them. Fixed here by
+     reading ``projects.board_slug`` directly (see ``_projects_db_path``).
+
+     Upstream gap worth closing in hermes_cli: adding ``board_slug`` to the
+     bundled ``GET /projects`` payload would let this plugin drop the route.
+
+     Only ``primary_path`` is returned. ``project_folders`` is deliberately not
+     read: the core anchors every project-linked workspace on ``primary_path``
+     (``kanban_db._resolve_project_link``), so extra folders would be data the
+     form has no way to honour.
 """
 
 from __future__ import annotations
@@ -92,11 +112,69 @@ def _board_db_path(board: str) -> Path:
     return root / "kanban" / "boards" / board / "kanban.db"
 
 
+def _profile_home() -> Path:
+    """This profile's Hermes home — the directory that holds ``projects.db``.
+
+    Deliberately does NOT reuse ``_kanban_root``: kanban boards are shared
+    across profiles by design, but the project store is per-profile
+    (``hermes_cli.projects_db.projects_db_path`` is ``get_hermes_home() /
+    "projects.db"``), so collapsing ``<root>/profiles/<name>`` two levels up
+    would read another profile's projects. Same env-var precedence as
+    ``hermes_constants.get_hermes_home``: override → ``HERMES_HOME`` → default.
+    """
+    root = os.environ.get("HERMES_HOME", "").strip()
+    if root:
+        return Path(root).expanduser()
+    return Path.home() / ".hermes"
+
+
+def _projects_db_path() -> Path:
+    return _profile_home() / "projects.db"
+
+
 def _ro_connect(db_path: Path) -> sqlite3.Connection:
     uri = "file:" + str(db_path) + "?mode=ro"
     con = sqlite3.connect(uri, uri=True, timeout=5)
     con.row_factory = sqlite3.Row
     return con
+
+
+def _project_rows() -> tuple[Optional[list], Optional[str]]:
+    """Return ``(rows, error)`` for every non-archived project.
+
+    ``board_slug`` is the column that binds a project to a board, and it is the
+    one field the bundled kanban plugin's ``/projects`` route omits. ``NULL``
+    means the project is not attached to any board; the form shows it only on
+    the "no board" case and never links a card to it implicitly.
+
+    An older ``projects.db`` predating the ``board_slug`` / ``primary_path``
+    columns is read as "every project is unbound" rather than erroring — the
+    picker degrades to an empty list instead of taking the whole panel down.
+    """
+    db_path = _projects_db_path()
+    if not db_path.exists():
+        return None, f"no projects.db at {db_path}"
+    try:
+        con = _ro_connect(db_path)
+    except sqlite3.Error as e:
+        return None, f"cannot open {db_path}: {e}"
+    try:
+        cols = {r["name"] for r in con.execute("PRAGMA table_info(projects)")}
+        # A pre-column projects.db degrades to "everything is unbound" rather
+        # than failing the request; the form then simply has no projects to show.
+        board_expr = "board_slug" if "board_slug" in cols else "NULL"
+        primary_expr = "primary_path" if "primary_path" in cols else "NULL"
+        archived_expr = "archived" if "archived" in cols else "0"
+        rows = con.execute(
+            f"SELECT id, slug, name, {primary_expr} AS primary_path, "
+            f"{board_expr} AS board_slug FROM projects "
+            f"WHERE {archived_expr} = 0 ORDER BY created_at ASC, name ASC"
+        ).fetchall()
+    except sqlite3.Error as e:
+        return None, f"query failed: {e}"
+    finally:
+        con.close()
+    return rows, None
 
 
 def _board_slugs() -> List[str]:
@@ -224,6 +302,50 @@ async def list_all_tasks():
             )
         tasks.sort(key=_sort_key)
         return {"tasks": tasks}
+
+    return await asyncio.to_thread(_run)
+
+
+# --- Projects (the create form's project picker) ---------------------------
+
+@router.get("/projects")
+async def list_projects(board: Optional[str] = Query(None)):
+    """Non-archived projects, each tagged with the board it belongs to.
+
+    Optional ``board`` filter narrows to one board. The filter is applied HERE
+    rather than in the browser so the answer cannot depend on which projects
+    happen to be in the payload: the bundled kanban route cannot express this
+    at all (its ``/projects`` has no ``board_slug``), so this is the single
+    place the board↔projects relation is decided.
+
+    A project bound to another board is simply absent from a filtered answer —
+    the form resets its selection on a board switch rather than sending a
+    project the new board does not own.
+    """
+    def _run():
+        want = None
+        if board is not None:
+            try:
+                want = _normalize_board(board)
+            except ValueError as e:
+                return JSONResponse({"error": str(e)}, status_code=400)
+        rows, err = _project_rows()
+        if err:
+            # No project store yet is a normal state (projects are optional),
+            # not an error: the picker just stays empty.
+            return {"projects": [], "error": err}
+        out = [
+            {
+                "id": r["id"],
+                "slug": r["slug"],
+                "name": r["name"] or r["slug"],
+                "primary_path": r["primary_path"] or "",
+                "board_slug": r["board_slug"] or "",
+            }
+            for r in rows
+            if want is None or (r["board_slug"] or "") == want
+        ]
+        return {"projects": out}
 
     return await asyncio.to_thread(_run)
 

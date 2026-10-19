@@ -355,6 +355,14 @@ function Page() {
     var profiles = profilesState[0];
     var setProfiles = profilesState[1];
 
+    // Projects for the create form's project picker, each carrying the board it
+    // belongs to. Read from THIS plugin's `/projects`, not the bundled kanban
+    // one: that route lists every project but omits `board_slug`, so it cannot
+    // answer "which projects does this board have" (see plugin_api.py).
+    var projectsState = useState([]);
+    var projects = projectsState[0];
+    var setProjects = projectsState[1];
+
     // --- New-task form -------------------------------------------------
     var createOpenState = useState(false);
     var createOpen = createOpenState[0];
@@ -378,6 +386,13 @@ function Page() {
     var draftBoardState = useState("");
     var draftBoard = draftBoardState[0];
     var setDraftBoard = draftBoardState[1];
+    // Project this card belongs to, as a project id ("" = no project). Stored
+    // by id, never by slug: the payload is a contract with
+    // `kanban_db.create_task`, and an id is the only form it can resolve
+    // without a slug→id lookup that could drift.
+    var draftProjectState = useState("");
+    var draftProject = draftProjectState[0];
+    var setDraftProject = draftProjectState[1];
     // Per-task runtime cap in MINUTES; 0 = бесконечно (no cap). The bundled
     // POST /tasks takes max_runtime_seconds, so the form collects minutes (what
     // a human plans in) and converts once on submit.
@@ -538,6 +553,37 @@ function Page() {
             })
           );
           setCurrentBoard(r.current || "");
+        }).catch(function () {});
+      }
+      tick();
+      var h = setInterval(tick, BOARDS_POLL_MS);
+      return function () {
+        stop = true;
+        clearInterval(h);
+      };
+    }, []);
+
+    // Project list for the create form, on the same slow cadence as boards.
+    // Fetched unfiltered (every project at once) and narrowed to the chosen
+    // board in the browser: the picker only ever shows one board's projects, so
+    // a refetch on every board switch would be a round-trip for a set that is
+    // already in memory. `board_slug` is what makes that narrowing correct.
+    useEffect(function () {
+      var stop = false;
+      function tick() {
+        fetchJSON(API + "/projects").then(function (r) {
+          if (stop || r.__error || !r.projects) return;
+          setProjects(
+            r.projects.map(function (p) {
+              return {
+                id: p.id,
+                slug: p.slug,
+                name: p.name || p.slug,
+                primary_path: p.primary_path || "",
+                board_slug: p.board_slug || "",
+              };
+            })
+          );
         }).catch(function () {});
       }
       tick();
@@ -1211,6 +1257,14 @@ function Page() {
     // project directory is a git repo, dir otherwise, scratch without one.
     // Called both on open and whenever the board select changes, so switching
     // boards re-proposes the right workspace instead of keeping the old one.
+    //
+    // RETURNS the kind it applied. The caller needs it immediately: on a board
+    // switch the project re-anchors right after this, and reading `draftWsKind`
+    // there would return the PREVIOUS render's value — a setState from this very
+    // call has not landed yet. That staleness is not cosmetic: with a project
+    // selected it left `worktree` paired with the project's `primary_path`,
+    // and a path sent to create_task is exactly what suppresses the project
+    // worktree anchor.
     function applyBoardWorkspace(slug) {
       var meta = null;
       for (var i = 0; i < boards.length; i++) {
@@ -1220,15 +1274,91 @@ function Page() {
       if (!workdir) {
         setDraftWsKind("scratch");
         setDraftWsPath("");
-        return;
+        return "scratch";
       }
-      setDraftWsKind(meta.default_workspace_kind === "dir" ? "dir" : "worktree");
+      var kind = meta.default_workspace_kind === "dir" ? "dir" : "worktree";
+      setDraftWsKind(kind);
       setDraftWsPath(workdir);
+      return kind;
+    }
+
+    // Projects in picker order: the chosen board's own first, then projects
+    // bound to another board, then unbound ones.
+    //
+    // NOT filtered by board, deliberately. `projects.board_slug` names where a
+    // project is *used*, not where it *may* be used: the column is nullable (a
+    // project created without `--board` has NULL there, and would be
+    // unreachable behind a filter), and `_resolve_project_link` validates
+    // nothing about board membership — a card may legitimately carry a project
+    // that names some other board. Filtering would forbid a legal call.
+    //
+    // Stable within each group, so the list does not reshuffle between renders.
+    function orderedProjects(slug) {
+      var rank = function (p) {
+        if (!p.board_slug) return 2;          // unbound goes last
+        return p.board_slug === slug ? 0 : 1; // ours first, then other boards
+      };
+      return projects
+        .map(function (p, i) { return { p: p, i: i }; })
+        .sort(function (a, b) {
+          var d = rank(a.p) - rank(b.p);
+          return d !== 0 ? d : a.i - b.i;
+        })
+        .map(function (w) { return w.p; });
+    }
+
+    // The project object behind `draftProject`, or null when none is chosen
+    // (or when it vanished from the list — a project archived mid-form must
+    // degrade to "no project", never to a dangling id in the payload).
+    function findProject(id) {
+      for (var i = 0; i < projects.length; i++) {
+        if (projects[i].id === id) return projects[i];
+      }
+      return null;
+    }
+
+    // Re-derive the workspace PATH from the chosen project.
+    //
+    // A project is an ANCHOR, and `kanban_db._resolve_project_link` anchors it
+    // differently per workspace kind — the form has to follow, or the card runs
+    // somewhere the picker never promised:
+    //
+    //   worktree — the project's repo becomes the root. `create_task` builds
+    //     `<primary>/.worktrees/<task-id>` and the deterministic
+    //     `<project-slug>/<task-id>-<title-slug>` branch, but ONLY while no
+    //     path is sent: `_resolve_project_link` sets `project_repo` under
+    //     `workspace_path is None`. So the path is cleared here — a stale
+    //     `board.default_workdir` would otherwise win, and for board `ff` that
+    //     is /home/alexander/src/ff, a container that is not a git repo at all.
+    //
+    //   dir — the project supplies NO path. `create_task` falls straight through
+    //     to `board.default_workdir`, which for `ff` is that same container:
+    //     picking `ff-front` + dir would then run in /home/alexander/src/ff
+    //     rather than in /home/alexander/src/ff/ff-front-v1. Sending the
+    //     project's own `primary_path` is what makes `dir` mean what the
+    //     picker says. A manual edit afterwards still wins — this only sets
+    //     the default, it does not lock the field.
+    //
+    //   scratch — no path is sent and no project either, so nothing to derive.
+    //
+    // `kind` is passed in rather than read from state: this also runs from the
+    // workspace-kind select, whose new value has not reached state yet.
+    function applyProjectAnchor(projectId, kind) {
+      var proj = findProject(projectId);
+      if (!proj) return;
+      if (kind === "worktree") {
+        setDraftWsPath("");
+      } else if (kind === "dir" && proj.primary_path) {
+        setDraftWsPath(proj.primary_path);
+      }
     }
 
     function openCreate() {
       setDraftBoard("");
       applyBoardWorkspace("");
+      // No project until a board is chosen, same reason the workspace starts
+      // empty: a project is bound to one board, and there is no board yet.
+      setDraftProject("");
       setDraftTitle("");
       setDraftBody("");
       setDraftAssignee("");
@@ -1261,6 +1391,35 @@ function Page() {
         setCreateNote({ kind: "err", text: "нужен путь к каталогу" });
         return;
       }
+      // A project that vanished from the list (archived mid-form) must not be sent
+      // as a dangling id. Board membership is deliberately NOT checked: a card
+      // may legitimately carry a project bound to another board — or to none —
+      // and `_resolve_project_link` imposes no such rule.
+      var project = findProject(draftProject);
+      if (draftProject && !project) {
+        setCreateNote({
+          kind: "err",
+          text: "выбранный проект больше недоступен — выберите заново",
+        });
+        return;
+      }
+      // A project without `primary_path` cannot anchor anything: for worktree
+      // `create_task` would fall back to the board's default_workdir, and for
+      // dir it would land on the same board directory. Refuse rather than
+      // create a card whose workspace nobody chose.
+      if (project && !project.primary_path) {
+        setCreateNote({
+          kind: "err",
+          text: "у проекта «" + project.name + "» не задан primary_path — задайте его в настройках проекта",
+        });
+        return;
+      }
+      // `scratch` is an explicit opt-out from the project (#106342): the core
+      // reads a project as "anchor me to that repo", and scratch means the
+      // opposite. Sending both would have `create_task` either upgrade the kind
+      // or invent a worktree, so the project is simply not sent — and the form
+      // says so on screen rather than dropping it behind the user's back.
+      var sendProject = project && draftWsKind !== "scratch";
       // Runtime cap in MINUTES; 0 or blank = бесконечно. Reject negatives and
       // junk early rather than sending them to the dispatcher. The API speaks
       // seconds (`max_runtime_seconds`), so the conversion happens here — once,
@@ -1286,6 +1445,13 @@ function Page() {
       // reached by the follow-up PATCH below.
       if (draftStatus === "triage") payload.triage = true;
       if (draftWsKind) payload.workspace_kind = draftWsKind;
+      // The project goes out ONLY when one was picked. An empty picker means
+      // "no project" and the key is omitted entirely — which is also what
+      // keeps the card off the board's own `project_id` (see create_task: it
+      // only fills that in when `project_id is None` and the kind is not
+      // scratch). An explicit `project_id` always beats the board default, so
+      // the form never depends on what `board.json.project_id` happens to be.
+      if (sendProject) payload.project_id = project.id;
       // A path only means something for a persistent workspace; sending one
       // with scratch would pin a scratch task to a directory.
       if (draftWsKind !== "scratch" && draftWsPath.trim()) {
@@ -1898,6 +2064,59 @@ function Page() {
         : commentsView
     );
 
+    // The project picker, next to the board picker. Every project is offered —
+    // the chosen board's first, then other boards', then unbound — because
+    // `board_slug` says where a project is used, not where it may be used. Each
+    // option is labelled with its board so the choice stays meaningful.
+    //
+    // It stays disabled until a board is picked: with no board chosen there is
+    // nothing to order by and nothing to anchor the workspace against.
+    //
+    // `scratch` disables it too, and says why: a scratch card is an explicit
+    // opt-out from the project (#106342), so offering one there would promise
+    // a link the payload deliberately omits.
+    var ordered = orderedProjects(draftBoard);
+    var scratchProjectless = draftWsKind === "scratch";
+    // "привязан к этой доске" — the group a project belongs to, for the hint.
+    var mineCount = ordered.filter(function (p) { return p.board_slug === draftBoard; }).length;
+    var foreignCount = ordered.filter(function (p) {
+      return p.board_slug && p.board_slug !== draftBoard;
+    }).length;
+    var projectOptions = el(
+      "select",
+      {
+        className: "hlv-select hlv-input",
+        value: draftProject,
+        disabled: !draftBoard || scratchProjectless,
+        title: !draftBoard
+          ? "сначала выберите доску"
+          : scratchProjectless
+            ? "scratch — проект не привязывается, воркспейс одноразовый"
+            : "проект, к которому привязывается задача; пусто = без проекта",
+        onChange: function (e) {
+          var next = e.target.value;
+          setDraftProject(next);
+          // Re-derive the path from the new anchor right away, so the field
+          // never shows one project's directory while another is selected.
+          applyProjectAnchor(next, draftWsKind);
+        },
+        onKeyDown: onCreateKeyDown,
+      },
+      el(
+        "option",
+        { value: "" },
+        ordered.length ? "— без проекта —" : "— проектов нет —"
+      ),
+      ordered.map(function (p) {
+        return el(
+          "option",
+          { key: p.id, value: p.id, title: p.primary_path || "" },
+          (p.name === p.slug ? p.slug : p.slug + " — " + p.name) +
+            " · " + (p.board_slug || "без доски")
+        );
+      })
+    );
+
     // The board picker starts on the empty option and must be chosen explicitly
         // (ТЗ). The hint only names where the task would land — it never picks.
         var boardOptions = el(
@@ -1912,7 +2131,22 @@ function Page() {
               // Re-propose the workspace from the newly chosen board: a board
               // with a project directory gets a git worktree (or dir), one
               // without falls back to scratch.
-              applyBoardWorkspace(next);
+              var boardKind = applyBoardWorkspace(next);
+              // The project is KEPT across a board switch — it names a repo, not
+              // a board, and a card may carry a project of another board. Only a
+              // project that disappeared from the list is dropped.
+              //
+              // Order matters: applyBoardWorkspace just overwrote the path with
+              // the board's own, so the surviving project has to re-anchor it
+              // afterwards — otherwise the field would show the board directory
+              // while the payload claims the project. `boardKind` (not the stale
+              // `draftWsKind`) drives that re-anchor: the new kind has not
+              // reached state yet at this point.
+              if (findProject(draftProject)) {
+                applyProjectAnchor(draftProject, boardKind);
+              } else if (draftProject) {
+                setDraftProject("");
+              }
             },
             onKeyDown: onCreateKeyDown,
           },
@@ -2035,6 +2269,28 @@ function Page() {
             "доску нужно выбрать явно — задача не создастся на «" +
             (boardHint() || "default") + "» молча")
         ),
+        el("label", { className: "hlv-field" },
+          el("span", { className: "hlv-field-label" }, "Проект"),
+          projectOptions,
+          scratchProjectless
+            ? el("span", { className: "hlv-modal-hint" },
+                "воркспейс scratch — проект не привязывается, карточка одноразовая")
+            : !draftBoard
+              ? el("span", { className: "hlv-modal-hint" },
+                  "доска не выбрана — список проектов появится после её выбора")
+              : !ordered.length
+                ? el("span", { className: "hlv-modal-hint" },
+                    "проектов нет — задача будет без проекта")
+                : el("span", { className: "hlv-modal-hint" },
+                    "проект задаёт корень воркспейса; пусто = задача без проекта" +
+                    (foreignCount
+                      ? " · " + foreignCount + " из " + ordered.length +
+                        " привязаны к другой доске, " + (mineCount || "ни один") +
+                        " — к этой"
+                      : mineCount
+                        ? " · все " + mineCount + " привязаны к этой доске"
+                        : " · ни один не привязан к этой доске"))
+        ),
         el("div", { className: "hlv-field-row" },
           el("label", { className: "hlv-field" },
             el("span", { className: "hlv-field-label" }, "Воркспейс"),
@@ -2050,7 +2306,15 @@ function Page() {
                 title: draftBoard
                   ? "временный каталог удаляется после завершения; dir/worktree — сохраняются"
                   : "сначала выберите доску — воркспейс берётся из неё",
-                onChange: function (e) { setDraftWsKind(e.target.value); },
+                // Changing the kind re-anchors the path: the project means a
+                // different directory per kind (dir → primary_path, worktree →
+                // none, scratch → nothing), so a path left over from the old
+                // kind would be the one thing the new kind must not send.
+                onChange: function (e) {
+                  var next = e.target.value;
+                  setDraftWsKind(next);
+                  applyProjectAnchor(draftProject, next);
+                },
                 onKeyDown: onCreateKeyDown,
               },
               el("option", { value: "scratch" }, "временный (scratch)"),
@@ -2071,7 +2335,22 @@ function Page() {
                 : "/путь/к/репозиторию",
               onChange: function (e) { setDraftWsPath(e.target.value); },
               onKeyDown: onCreateKeyDown,
-            })
+            }),
+            // Spell out what the path will actually be, because for a worktree
+            // there IS none: `create_task` materialises `<primary>/.worktrees/
+            // <task-id>` itself. Showing an empty field with no explanation
+            // reads as "unset", and the natural fix — typing the board
+            // directory in — is exactly what breaks the anchor.
+            (draftBoard && findProject(draftProject))
+              ? el("span", { className: "hlv-modal-hint" },
+                  draftWsKind === "worktree"
+                    ? "путь не нужен: create_task сам создаст " +
+                      (findProject(draftProject).primary_path || "") +
+                      "/.worktrees/<id-задачи> и ветку " +
+                      (findProject(draftProject).slug || "") + "/<id-задачи>"
+                    : "путь взят из primary_path проекта «" +
+                      findProject(draftProject).name + "»; его можно изменить")
+              : null
           ) : null
         ),
         draftWsKind === "scratch" ? el("div", { className: "hlv-warn" },
