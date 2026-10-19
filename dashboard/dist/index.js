@@ -217,13 +217,17 @@
     return 0;
   }
 
-  // The task list scrolls on ONE axis at a time: a vertical column on desktop, a
-// horizontal carousel on mobile (see the media query in style.css). Everything
-// that moves the list — autoscroll, "did the user take over?" — asks which axis
-// is live instead of assuming scrollTop, otherwise a selection on a phone
-// scrolls the carousel sideways while the code tries to move it vertically.
+  // The task list scrolls on ONE axis at a time: a vertical column on desktop,
+// a horizontal strip on mobile (see the media queries in style.css) — a
+// horizontal LIST of several cards above 380px and a one-card CAROUSEL at or
+// below it. Everything that moves the list — autoscroll, "did the user take
+// over?" — asks which axis is live instead of assuming scrollTop, otherwise a
+// selection on a phone scrolls the strip sideways while the code tries to move
+// it vertically.
 var MOBILE_QUERY = "(max-width: 1023px)";
 
+// "Is the list horizontal?" — true for BOTH mobile variants (list and
+// carousel): they differ only in how many cards fit, never in the axis.
 function isCarousel() {
   try {
     if (window.matchMedia) return window.matchMedia(MOBILE_QUERY).matches;
@@ -294,6 +298,17 @@ function Page() {
     var descEditState = useState(false);
     var descEdit = descEditState[0];
     var setDescEdit = descEditState[1];
+    // The SAME flag through a ref. The description poller below must read it
+    // live, and it cannot: that effect deliberately leaves `descEdit` out of
+    // its deps (adding it would restart the 5 s poll on every keystroke), so
+    // the `descEdit` it closes over is frozen at mount time — `false`, because
+    // the editor only opens later. Its "never overwrite an open editor" guard
+    // was therefore dead code, and every tick overwrote the textarea with the
+    // server body — mid-edit text vanished within 5 s, and on a card whose
+    // body was empty the field went blank. The ref has no such restriction: it
+    // always answers for right now, and the poller keeps its cadence.
+    var descEditRef = useRef(false);
+    descEditRef.current = descEdit;
     var descDraftState = useState("");
     var descDraft = descDraftState[0];
     var setDescDraft = descDraftState[1];
@@ -581,6 +596,11 @@ function Page() {
                 name: p.name || p.slug,
                 primary_path: p.primary_path || "",
                 board_slug: p.board_slug || "",
+                // Server-side git probe. Coerced to a strict boolean and
+                // defaulted to false: the field is optional by contract, and a
+                // missing/null value must read as "not a repo" so the form
+                // falls back to the board's own recommendation.
+                primary_is_repo: p.primary_is_repo === true,
               };
             })
           );
@@ -667,9 +687,15 @@ function Page() {
       return function () { clearInterval(h); };
     }, [query, board, currentBoard]);
 
+    // Match a task against the query. The id is searched as well as the title
+    // and the body: an id is how a task is referred to everywhere else (board
+    // links, log filenames, chat), so pasting `t_2d2e4f8f` into the search box
+    // has to find that one card — and unlike the body, the id needs no index,
+    // so the hit appears on the very first keystroke.
     function matchesQuery(t) {
       var q = (query || "").trim().toLowerCase();
       if (!q) return true;
+      if ((t.id || "").toLowerCase().indexOf(q) !== -1) return true;
       if ((t.title || "").toLowerCase().indexOf(q) !== -1) return true;
       var body = searchRef.current.bodies.get(t.id);
       return !!(body && body.indexOf(q) !== -1);
@@ -1034,8 +1060,9 @@ function Page() {
               (r.task.workspace_path ? " · " + r.task.workspace_path : ""),
             runtime: r.task.max_runtime_seconds || 0,
           });
-          // Never overwrite an open editor with a poll result.
-          if (!descEdit) setDescDraft(r.task.body || "");
+          // Never overwrite an open editor with a poll result. Read through
+          // the ref: the closed-over `descEdit` is the mount-time value.
+          if (!descEditRef.current) setDescDraft(r.task.body || "");
         }).catch(function () {});
       }
       load();
@@ -1044,9 +1071,8 @@ function Page() {
         stop = true;
         clearInterval(h);
       };
-      // descEdit is read through the state captured per run; re-running on it
-      // would restart the poller on every keystroke, so it is intentionally
-      // absent and the guard above simply uses the value from mount time.
+      // descEdit is read through the ref above; re-running on it would restart
+      // the poller on every keystroke, so it is intentionally absent.
     }, [selected, pane, boardOf]);
 
     function startDescEdit() {
@@ -1318,31 +1344,31 @@ function Page() {
     }
 
     // Re-derive the workspace PATH from the chosen project.
-    //
-    // A project is an ANCHOR, and `kanban_db._resolve_project_link` anchors it
-    // differently per workspace kind — the form has to follow, or the card runs
-    // somewhere the picker never promised:
-    //
-    //   worktree — the project's repo becomes the root. `create_task` builds
-    //     `<primary>/.worktrees/<task-id>` and the deterministic
-    //     `<project-slug>/<task-id>-<title-slug>` branch, but ONLY while no
-    //     path is sent: `_resolve_project_link` sets `project_repo` under
-    //     `workspace_path is None`. So the path is cleared here — a stale
-    //     `board.default_workdir` would otherwise win, and for board `ff` that
-    //     is /home/alexander/src/ff, a container that is not a git repo at all.
-    //
-    //   dir — the project supplies NO path. `create_task` falls straight through
-    //     to `board.default_workdir`, which for `ff` is that same container:
-    //     picking `ff-front` + dir would then run in /home/alexander/src/ff
-    //     rather than in /home/alexander/src/ff/ff-front-v1. Sending the
-    //     project's own `primary_path` is what makes `dir` mean what the
-    //     picker says. A manual edit afterwards still wins — this only sets
-    //     the default, it does not lock the field.
-    //
-    //   scratch — no path is sent and no project either, so nothing to derive.
-    //
-    // `kind` is passed in rather than read from state: this also runs from the
-    // workspace-kind select, whose new value has not reached state yet.
+//
+//    A project is an ANCHOR, and `kanban_db._resolve_project_link` anchors it
+//    differently per workspace kind — the form has to follow, or the card runs
+//    somewhere the picker never promised:
+//
+//      worktree — the project's repo becomes the root. `create_task` builds
+//        `<primary>/.worktrees/<task-id>` and the deterministic
+//        `<project-slug>/<task-id>-<title-slug>` branch, but ONLY while no
+//        path is sent: `_resolve_project_link` sets `project_repo` under
+//        `workspace_path is None`. So the path is cleared here — a stale
+//        `board.default_workdir` would otherwise win, and for board `ff` that
+//        is /home/alexander/src/ff, a container that is not a git repo at all.
+//
+//      dir — the project supplies NO path. `create_task` falls straight through
+//        to `board.default_workdir`, which for `ff` is that same container:
+//        picking `ff-front` + dir would then run in /home/alexander/src/ff
+//        rather than in /home/alexander/src/ff/ff-front-v1. Sending the
+//        project's own `primary_path` is what makes `dir` mean what the
+//        picker says. A manual edit afterwards still wins — this only sets
+//        the default, it does not lock the field.
+//
+//      scratch — no path is sent and no project either, so nothing to derive.
+//
+//    `kind` is passed in rather than read from state: this also runs from the
+//    workspace-kind select, whose new value has not reached state yet.
     function applyProjectAnchor(projectId, kind) {
       var proj = findProject(projectId);
       if (!proj) return;
@@ -1351,6 +1377,25 @@ function Page() {
       } else if (kind === "dir" && proj.primary_path) {
         setDraftWsPath(proj.primary_path);
       }
+    }
+
+    // The workspace kind a chosen project implies, overriding the board's own
+    // recommendation.
+    //
+    // `primary_is_repo` comes from this plugin's /projects route (a git probe,
+    // cached server-side). A project whose repo EXISTS should default to a
+    // worktree even when the board's directory is not one — board `ff`'s
+    // `default_workdir` is the container /home/alexander/src/ff, so its
+    // `default_workspace_kind` is always `dir` and every project on it would
+    // otherwise be offered a plain directory despite having a repo to branch.
+    //
+    // Only a DEFAULT: a project without a repo keeps the board's answer, and the
+    // user can always override the kind by hand.
+    function kindForProject(projectId, boardKind) {
+      var proj = findProject(projectId);
+      if (!proj) return boardKind;
+      if (proj.primary_is_repo) return "worktree";
+      return boardKind;
     }
 
     function openCreate() {
@@ -1454,7 +1499,21 @@ function Page() {
       if (sendProject) payload.project_id = project.id;
       // A path only means something for a persistent workspace; sending one
       // with scratch would pin a scratch task to a directory.
-      if (draftWsKind !== "scratch" && draftWsPath.trim()) {
+      //
+      // For a project-linked WORKTREE the path must not go, whatever the form
+      // state says: `create_task` derives `<primary>/.worktrees/<task-id>` and
+      // the deterministic branch only while `workspace_path is None`
+      // (`_resolve_project_link`), and a path would suppress that anchor and
+      // point the card at whatever directory is in the field. The field shows a
+      // read-only preview here, but the rule is repeated on submit so the
+      // guarantee does not rest on that field being read-only.
+      //
+      // A worktree with NO project is the other case: there the path is the
+      // repository to branch from, and it must be sent — that is the long
+      // standing behaviour for a repo-backed board.
+      var pathForWorktree = draftWsKind === "worktree" && !sendProject;
+      if (draftWsKind !== "scratch" && draftWsPath.trim() &&
+          (pathForWorktree || draftWsKind !== "worktree")) {
         payload.workspace_path = draftWsPath.trim();
       }
       fetchJSON(
@@ -1687,12 +1746,30 @@ function Page() {
 
     // Board selector — which board's tasks the left list shows. "Все доски"
     // keeps the merged view; the choice is remembered between visits.
+    //
+    // The label carries the full "slug — name": a native <select> CLIPS its
+    // text instead of ellipsizing, so a name cut to "hypercube — Hyp…" is
+    // indistinguishable from another board starting with "hypercube". The
+    // control therefore gets room to show it (see .hlv-board-select in
+    // style.css), and the same string goes into `title` for the cases where the
+    // available width is genuinely too small — the user then hovers instead of
+    // guessing which board is selected.
+    var boardLabel = function (b) {
+      return b.name === b.slug ? b.slug : b.slug + " — " + b.name;
+    };
     var boardSelect = el(
       "select",
       {
-        className: "hlv-select",
+        className: "hlv-select hlv-board-select",
         value: board,
-        title: "доска задач",
+        title: board === ALL_BOARDS
+          ? "все доски сразу"
+          : "доска задач: " + (function () {
+              for (var i = 0; i < boards.length; i++) {
+                if (boards[i].slug === board) return boardLabel(boards[i]);
+              }
+              return board;
+            })(),
         "aria-label": "доска задач",
         onChange: function (e) {
           var next = e.target.value || ALL_BOARDS;
@@ -1705,7 +1782,7 @@ function Page() {
         return el(
           "option",
           { key: b.slug, value: b.slug },
-          b.name === b.slug ? b.slug : b.slug + " — " + b.name
+          boardLabel(b)
         );
       })
     );
@@ -1763,8 +1840,8 @@ function Page() {
         className: "hlv-input hlv-search-input",
         type: "search",
         value: query,
-        placeholder: "поиск по названию и описанию…",
-        "aria-label": "поиск задач по названию и описанию",
+        placeholder: "поиск: название, описание, id задачи…",
+        "aria-label": "поиск задач по названию, описанию и id",
         onChange: function (e) { setQuery(e.target.value); },
       }),
       query
@@ -1816,6 +1893,16 @@ function Page() {
               el("span", { className: "hlv-row-title" }, t.title),
               el("span", { className: "hlv-row-meta" },
                 el("span", { className: statusClass(t.status) }, STATUS_LABEL[t.status] || t.status),
+                // The priority the list is ORDERED by, not the raw field:
+                // sortInputs() already folds in the backfill cache, so this
+                // badge can never disagree with the row's position or with
+                // data-priority. Shown even at 0 — a card with no explicit
+                // priority is still ordered by one, and "no badge" would read
+                // as "the value is unknown".
+                el("span", {
+                  className: "hlv-row-priority",
+                  title: "приоритет: чем выше, тем раньше dispatcher возьмёт задачу",
+                }, "прио " + (inp.priority || 0)),
                 t.board ? el("span", { className: "hlv-row-board" }, t.board) : null,
                 t.assignee ? el("span", { className: "hlv-row-assignee" }, "@" + t.assignee) : null,
                 t.comment_count ? el("span", {
@@ -2077,6 +2164,15 @@ function Page() {
     // a link the payload deliberately omits.
     var ordered = orderedProjects(draftBoard);
     var scratchProjectless = draftWsKind === "scratch";
+    // Resolved once here: the path field, its hint and its title all need the
+    // same project, and re-looking it up three times invites them to disagree.
+    var selectedProject = findProject(draftProject);
+    // The worktree preview. Shown read-only in the path field so it reads as a
+    // filled value instead of "unset"; the placeholder stands in for the task
+    // id because it is only known after the card exists.
+    var previewWorktreePath = (draftWsKind === "worktree" && selectedProject && selectedProject.primary_path)
+      ? selectedProject.primary_path + "/.worktrees/<id-задачи>"
+      : "";
     // "привязан к этой доске" — the group a project belongs to, for the hint.
     var mineCount = ordered.filter(function (p) { return p.board_slug === draftBoard; }).length;
     var foreignCount = ordered.filter(function (p) {
@@ -2098,7 +2194,13 @@ function Page() {
           setDraftProject(next);
           // Re-derive the path from the new anchor right away, so the field
           // never shows one project's directory while another is selected.
-          applyProjectAnchor(next, draftWsKind);
+          // The kind can change too: a project WITH a repo defaults to a
+          // worktree even where the board itself would have said `dir`.
+          // `kindForProject` resolves against the CURRENT kind, which is what
+          // the field is about to be anchored for.
+          var kind = kindForProject(next, draftWsKind);
+          if (kind !== draftWsKind) setDraftWsKind(kind);
+          applyProjectAnchor(next, kind);
         },
         onKeyDown: onCreateKeyDown,
       },
@@ -2143,7 +2245,9 @@ function Page() {
               // `draftWsKind`) drives that re-anchor: the new kind has not
               // reached state yet at this point.
               if (findProject(draftProject)) {
-                applyProjectAnchor(draftProject, boardKind);
+                var kind = kindForProject(draftProject, boardKind);
+                if (kind !== boardKind) setDraftWsKind(kind);
+                applyProjectAnchor(draftProject, kind);
               } else if (draftProject) {
                 setDraftProject("");
               }
@@ -2325,31 +2429,47 @@ function Page() {
               "доска не выбрана — воркспейс станет доступен") : null
           ),
           draftWsKind !== "scratch" ? el("label", { className: "hlv-field" },
-            el("span", { className: "hlv-field-label" }, "Путь"),
+            el("span", { className: "hlv-field-label" },
+              // "Предпросмотр" in the label for a worktree: the field is filled
+              // but read-only, and nothing typed here reaches the card.
+              draftWsKind === "worktree" && selectedProject
+                ? "Путь (предпросмотр)"
+                : "Путь"),
             el("input", {
               className: "hlv-input",
-              value: draftWsPath,
+              // The worktree preview is derived, so it is shown INSTEAD of the
+              // empty state and cannot be edited. An empty field read as
+              // "unset", and the obvious fix — typing the board directory in —
+              // is precisely what breaks the project anchor.
+              value: previewWorktreePath || draftWsPath,
+              // readOnly, not disabled: a disabled input is skipped by
+              // assistive tech and cannot be focused to read the value, which
+              // is the one thing this field is for.
+              readOnly: !!previewWorktreePath,
               disabled: !draftBoard,
+              title: previewWorktreePath
+                ? "предпросмотр: create_task создаст этот каталог и ветку " +
+                  (selectedProject ? selectedProject.slug + "/<id-задачи>" : "") +
+                  ". Значение не уходит в задачу и не редактируется."
+                : "",
               placeholder: draftWsKind === "dir"
                 ? "/путь/к/каталогу"
                 : "/путь/к/репозиторию",
               onChange: function (e) { setDraftWsPath(e.target.value); },
               onKeyDown: onCreateKeyDown,
             }),
-            // Spell out what the path will actually be, because for a worktree
-            // there IS none: `create_task` materialises `<primary>/.worktrees/
-            // <task-id>` itself. Showing an empty field with no explanation
-            // reads as "unset", and the natural fix — typing the board
-            // directory in — is exactly what breaks the anchor.
-            (draftBoard && findProject(draftProject))
+            // Why the preview is what it is. Kept alongside the field rather
+            // than replacing it: the field says WHAT will exist, this says
+            // WHY it cannot be typed.
+            (draftBoard && selectedProject)
               ? el("span", { className: "hlv-modal-hint" },
                   draftWsKind === "worktree"
-                    ? "путь не нужен: create_task сам создаст " +
-                      (findProject(draftProject).primary_path || "") +
-                      "/.worktrees/<id-задачи> и ветку " +
-                      (findProject(draftProject).slug || "") + "/<id-задачи>"
+                    ? "путь и ветку создаст create_task — в задачу они не уходят, " +
+                      "поэтому поле только для чтения: " +
+                      previewWorktreePath + " и ветка " +
+                      (selectedProject.slug || "") + "/<id-задачи>"
                     : "путь взят из primary_path проекта «" +
-                      findProject(draftProject).name + "»; его можно изменить")
+                      selectedProject.name + "»; его можно изменить")
               : null
           ) : null
         ),

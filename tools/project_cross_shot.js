@@ -17,7 +17,7 @@ const CHROME = process.env.CHROME_PATH ||
 
 const CREDS = "/tmp/hlv.cookies";
 const ORIGIN = "http://127.0.0.1:9119";
-const PAGE = ORIGIN + "/hermes-logs-viewer";
+const PAGE = ORIGIN + "/hermes-logs-viewer?profile=default";
 const DB = "/home/alexander/.hermes/projects.db";
 const OUT = "/tmp/hlv-project-shots";
 const SEED_ID = "p_hlvshot";

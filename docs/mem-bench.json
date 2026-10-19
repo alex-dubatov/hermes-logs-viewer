@@ -1,0 +1,97 @@
+{
+  "task": "t_69498af7",
+  "board": "hlv-mem",
+  "lines": 40000,
+  "linesShown": 40000,
+  "idleRefreshes": 3,
+  "forcedRefreshes": 3,
+  "growthLimitMb": 20,
+  "rssGrowthMb": 148.4,
+  "rendererRssGrowthMb": 149.2,
+  "heapGrowthMb": 14.6,
+  "domNodeGrowth": 30,
+  "liveNodeGrowth": 0,
+  "listenerGrowth": 6,
+  "rssOk": false,
+  "retainedOk": false,
+  "verdict": "fail",
+  "samples": [
+    {
+      "label": "база (развёрнуто)",
+      "rendererMb": 475.6,
+      "treeMb": 1124.2,
+      "heapUsedMb": 22.5,
+      "heapTotalMb": 24,
+      "domNodes": 562,
+      "liveNodes": 382,
+      "domListeners": 241,
+      "procs": 9
+    },
+    {
+      "label": "холостая #1",
+      "rendererMb": 505.5,
+      "treeMb": 1148,
+      "heapUsedMb": 32.7,
+      "heapTotalMb": 34.7,
+      "domNodes": 562,
+      "liveNodes": 382,
+      "domListeners": 241,
+      "procs": 9
+    },
+    {
+      "label": "холостая #2",
+      "rendererMb": 529.3,
+      "treeMb": 1171.8,
+      "heapUsedMb": 32.7,
+      "heapTotalMb": 34.7,
+      "domNodes": 562,
+      "liveNodes": 382,
+      "domListeners": 241,
+      "procs": 9
+    },
+    {
+      "label": "холостая #3",
+      "rendererMb": 547.6,
+      "treeMb": 1190.2,
+      "heapUsedMb": 32.7,
+      "heapTotalMb": 34.5,
+      "domNodes": 562,
+      "liveNodes": 382,
+      "domListeners": 241,
+      "procs": 9
+    },
+    {
+      "label": "принудительная #1",
+      "rendererMb": 580.5,
+      "treeMb": 1229,
+      "heapUsedMb": 37,
+      "heapTotalMb": 39.8,
+      "domNodes": 572,
+      "liveNodes": 382,
+      "domListeners": 243,
+      "procs": 9
+    },
+    {
+      "label": "принудительная #2",
+      "rendererMb": 604.9,
+      "treeMb": 1251.8,
+      "heapUsedMb": 27.7,
+      "heapTotalMb": 30.1,
+      "domNodes": 582,
+      "liveNodes": 382,
+      "domListeners": 257,
+      "procs": 9
+    },
+    {
+      "label": "принудительная #3",
+      "rendererMb": 624.8,
+      "treeMb": 1272.6,
+      "heapUsedMb": 37.1,
+      "heapTotalMb": 39.8,
+      "domNodes": 592,
+      "liveNodes": 382,
+      "domListeners": 247,
+      "procs": 9
+    }
+  ]
+}

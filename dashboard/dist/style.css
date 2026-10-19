@@ -53,6 +53,20 @@
   border-color: var(--color-ring, var(--color-success));
 }
 
+/* The board selector must show its WHOLE label. A native <select> clips text
+   instead of ellipsizing it, so the inherited 180px cap silently cut
+   "hlv-mem — Bench (memory)" and "hypercube — Hyper-Cube" mid-word, leaving
+   the closed control reading as "hypercube — Hyp…" — indistinguishable from a
+   different board, with nothing to tell the user so. The control sizes to its
+   widest option (that is a native select's default) and only yields when the
+   header itself runs out of room; the full label is in `title` for that case.
+   `min-width: 0` keeps it shrinkable inside the wrapping header flex row. */
+.hlv-board-select {
+  width: auto;
+  max-width: 100%;
+  min-width: 0;
+}
+
 .hlv-check {
   display: inline-flex;
   align-items: center;
@@ -202,6 +216,24 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: 120px;
+}
+
+/* Priority badge. Drawn like the board chip so the meta line keeps one visual
+   family, but it is NOT dimmed to a "no value" look: every card has a
+   priority (0 is a value — "no explicit priority", not "unknown"), so hiding it
+   behind a muted chip would make the number the dispatcher actually orders by
+   the one field the list does not show. */
+.hlv-row-priority {
+  white-space: nowrap;
+  font-size: 0.62rem;
+  font-variant-numeric: tabular-nums;
+  border: 1px solid var(--color-border);
+  border-radius: 0;
+  padding: 0 4px;
+  color: var(--color-card-foreground, var(--foreground));
+  background: color-mix(in srgb, var(--color-ring, var(--color-success)) 12%, transparent);
+  border-color: color-mix(in srgb, var(--color-ring, var(--color-success)) 40%,
+    var(--color-border));
 }
 
 .hlv-row-time {
@@ -821,11 +853,25 @@
 }
 
 /* ------------------------------------------------------------------ */
-/* Mobile: the task list becomes a HORIZONTAL carousel (ТЗ) — one card
-   per screen-width with the next one peeking, snapped by column — above
-   the detail pane. The shell already reserves the mobile top-bar height
-   (an `h-14 lg:hidden` spacer in the content flow), so no extra top
-   padding is needed here.                                             */
+/* Narrow layout: the task list lies on ONE axis only — horizontally,
+   above the detail pane. The shell already reserves the mobile top-bar
+   height (an `h-14 lg:hidden` spacer in the content flow), so no extra
+   top padding is needed here.
+
+   Two horizontal variants, split at 380px of list width (on this layout
+   the list IS the viewport width — `.hlv-left` is 100%):
+
+     > 380px  a horizontal LIST — several cards at once, scrolled freely.
+     <= 380px a CAROUSEL — one card per screen, snapped.
+
+   Why the split: one card per screen is the right shape only when the
+   screen cannot show a useful second card. At 390px+ it wasted the row —
+   a whole screen-filling card, one task at a time, with the log pushed
+   below the fold — so the same horizontal space now shows several cards
+   and the list reads as a list. Below 380px a second card would be an
+   unusable sliver, so there the carousel is the better of the two. Both
+   scroll on X, which is what the JS asks about (it needs the axis, not
+   the variant).                                                  */
 /* ------------------------------------------------------------------ */
 @media (max-width: 1023px) {
   .hlv-main {
@@ -836,9 +882,7 @@
     width: 100%;
     min-width: 0;
   }
-  /* Carousel: a row of cards that scrolls sideways. `scroll-snap` lands each
-     card flush with the left edge, so a swipe always leaves exactly one card
-     in place instead of a sliver of the next one. */
+  /* The shared half: a row of cards that scrolls sideways. */
   .hlv-list {
     width: 100%;
     min-width: 0;
@@ -847,26 +891,23 @@
     align-items: stretch;
     overflow-x: auto;
     overflow-y: hidden;
-    scroll-snap-type: x mandatory;
     -webkit-overflow-scrolling: touch;
     overscroll-behavior-x: contain;
-    /* A card is one screen wide minus a peek of the next one, which is what
-       tells the finger there is more to the right. */
     gap: 8px;
     padding: 6px;
   }
-  /* One card per "page"; flex-basis (not width) keeps the basis honest even
-     when the content itself is narrower. */
+  /* flex-basis (not width) keeps the basis honest even when the content
+     itself is narrower. */
   .hlv-row {
-    flex: 0 0 82%;
     min-width: 0;
-    scroll-snap-align: start;
-    justify-content: center;
   }
-  /* The row's meta line is a single non-wrapping strip on a narrow card. */
+  /* Chips wrap instead of being clipped: the meta line carries status,
+     priority, board, assignee, comments and time, and on a card this
+     narrow the tail of that line was disappearing behind `overflow:
+     hidden` with nothing to indicate it. */
   .hlv-row-meta {
-    flex-wrap: nowrap;
-    overflow: hidden;
+    flex-wrap: wrap;
+    row-gap: 2px;
   }
   .hlv-main > .hlv-right {
     flex: 1;
@@ -875,5 +916,33 @@
   /* Tighter log font on narrow screens. */
   .hlv-log-pre {
     font-size: 0.7rem;
+  }
+}
+
+/* Variant 1 — a horizontal LIST (list width above 380px). Several cards fit,
+   so the strip is a plain scroller: no per-card snapping, because snapping to
+   a card that is not a whole screen only fights the user's swipe. Cards get a
+   fixed basis so a row of them is visible at once and the count on screen
+   grows with the width. */
+@media (min-width: 381px) and (max-width: 1023px) {
+  .hlv-list {
+    scroll-snap-type: none;
+  }
+  .hlv-row {
+    flex: 0 0 clamp(200px, 45%, 320px);
+  }
+}
+
+/* Variant 2 — a CAROUSEL (list width 380px and below). One card per screen
+   with the next one peeking, snapped by column: below this width a second card
+   would be an unreadable sliver, so paging is the honest shape. */
+@media (max-width: 380px) {
+  .hlv-list {
+    scroll-snap-type: x mandatory;
+  }
+  .hlv-row {
+    flex: 0 0 82%;
+    scroll-snap-align: start;
+    justify-content: center;
   }
 }

@@ -16,7 +16,7 @@ const CHROME = process.env.CHROME_PATH ||
 
 const CREDS = "/tmp/hlv.cookies";
 const ORIGIN = "http://127.0.0.1:9119";
-const PAGE = ORIGIN + "/hermes-logs-viewer";
+const PAGE = ORIGIN + "/hermes-logs-viewer?profile=default";
 const OUT = "/tmp/hlv-project-shots";
 
 function cookies() {
@@ -37,9 +37,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   await ctx.addCookies(cookies());
   const page = await ctx.newPage();
   page.on("pageerror", (e) => console.error("PAGE ERROR:", e.message));
+  page.on("console", (m) => { if (m.type() === "error") console.error("console:", m.text()); });
   await page.goto(PAGE, { waitUntil: "domcontentloaded" });
-  await sleep(3000);
-
+  // The plugin registers through the host SPA after its own bundles load, so
+  // wait for the button rather than guessing a delay.
+  await page.waitForSelector("text=+ Новая задача", { timeout: 60000 });
+  await sleep(1500);
   await page.click("text=+ Новая задача");
   await sleep(600);
 
@@ -77,22 +80,26 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   await titleInput.fill("Проверка выбора проекта");
   await report("1-board-ff-no-project");
 
-  // dir + a real project
+  // Pick a repo-backed project and report BEFORE forcing any kind: the form
+  // must have switched the workspace kind on its own.
   await prjSel.selectOption({ index: 1 });
-  await sleep(400);
+  await sleep(600);
+  await report("2-auto-kind-after-project");
+
+  // now force dir to check that path
   await wsSel.selectOption("dir");
   await sleep(500);
-  await report("2-dir-with-project");
+  await report("3-dir-with-project");
 
   // worktree + the same project: the path must vanish
   await wsSel.selectOption("worktree");
   await sleep(500);
-  await report("3-worktree-with-project");
+  await report("4-worktree-with-project");
 
   // scratch: the project must be locked out and explained
   await wsSel.selectOption("scratch");
   await sleep(500);
-  await report("4-scratch-projectless");
+  await report("5-scratch-projectless");
 
   await browser.close();
   console.log("\nshots in " + OUT);

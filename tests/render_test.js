@@ -228,6 +228,28 @@ async function openDialog(boardSlug) {
       "в шапке не осталось отдельной копии чекбокса",
       $$(".hlv-header input[type=checkbox]").length === 1
     );
+    // The label must FIT. A native <select> clips instead of ellipsizing, so a
+    // cap that is a few pixels short silently turns "hypercube — Hyper-Cube"
+    // into "hypercube — Hyp…" — the reported "переключатель досок поломался".
+    // jsdom lays nothing out, so the cap itself is asserted here and the real
+    // rendered fit is measured by tools/board_label_fit.js in a real browser.
+    const cssText = fs.readFileSync(
+      path.join(path.dirname(PLUGIN), "style.css"), "utf8");
+    check(
+      "у селектора досок свой класс (снимает общий max-width: 180px)",
+      !!boardBlock.querySelector("select.hlv-board-select"),
+      "hlv-board-select"
+    );
+    check(
+      "в CSS селектор досок не ограничен 180px",
+      /\.hlv-board-select\s*\{[^}]*max-width:\s*100%/.test(cssText),
+      "width: auto; max-width: 100%"
+    );
+    check(
+      "полное имя доски есть в подсказке селектора",
+      !!boardBlock.querySelector("select").getAttribute("title"),
+      boardBlock.querySelector("select").getAttribute("title")
+    );
   }
 
   // --- 3. status badges are tinted per status --------------------------
@@ -295,6 +317,49 @@ async function openDialog(boardSlug) {
       }
       const restored = $(".hlv-desc-body");
       check("исходное описание восстановлено", !!restored && (restored.textContent || "").indexOf("[hlv-check") === -1);
+
+      // The poller must not eat text that is being typed.
+      //
+      // The description tab polls every 5 s to pick up edits made elsewhere.
+      // Its "never overwrite an open editor" guard used the `descEdit` value
+      // captured when the effect was created — and that effect deliberately
+      // does not depend on `descEdit` (adding it would restart the poll on
+      // every keystroke), so the captured value was frozen at `false`. The
+      // guard could therefore never be true: every tick replaced the textarea
+      // with the server body, so a sentence typed at second 2 was gone by
+      // second 5 — and on a card with an empty body the field went blank.
+      //
+      // This waits out a real tick rather than inspecting the source: the bug
+      // was a stale closure, and only elapsed time reproduces it.
+      if (findButton("редактировать")) {
+        click(findButton("редактировать"));
+        await sleep(300);
+        const ed3 = $(".hlv-desc-editor");
+        if (ed3) {
+          const typing = (originalBody || "") + "\n[hlv-typing " + Date.now() + "]";
+          setInputValue(ed3, typing);
+          await sleep(6500);   // > DESC_POLL_MS (5000)
+          const live = $(".hlv-desc-editor");
+          check(
+            "опрос описания не затирает текст, который печатают",
+            !!live && live.value === typing,
+            live
+              ? (live.value || "").slice(-24)
+              : "редактор закрылся"
+          );
+          // Leave the card as it was found: cancel, do not save.
+          if (live) {
+            const cancel = findButton("отмена");
+            if (cancel) { click(cancel); await sleep(400); }
+          }
+          const bodyNow = $(".hlv-desc-body");
+          check(
+            "отменённая правка не сохранилась",
+            !!bodyNow && (bodyNow.textContent || "").indexOf("[hlv-typing") === -1,
+            "описание на доске не тронуто"
+          );
+        }
+      }
     }
   }
 
@@ -722,10 +787,16 @@ async function openDialog(boardSlug) {
       const pathNow = Array.from(modal.querySelectorAll(".hlv-field input.hlv-input"))
         .find((i) => (i.placeholder || "").indexOf("/путь/") === 0);
       const pathVal = pathNow ? pathNow.value : "";
+      // For a worktree the field carries the read-only PREVIEW, not the empty
+      // draft path — what matters is that it points at the project's repo and
+      // that the payload will still omit workspace_path.
       check("после смены доски вид и путь согласованы с якорем проекта",
-        kindNow === "worktree" ? pathVal === "" : pathVal === mine.primary_path,
+        kindNow === "worktree"
+          ? pathVal === mine.primary_path + "/.worktrees/<id-задачи>"
+          : pathVal === mine.primary_path,
         "вид=" + kindNow + " путь=" + JSON.stringify(pathVal) +
-          " (ожидался " + (kindNow === "worktree" ? "пусто" : mine.primary_path) + ")");
+          " (ожидался " + (kindNow === "worktree"
+            ? mine.primary_path + "/.worktrees/<id-задачи>" : mine.primary_path) + ")");
 
       setSelectValue(boardSel, pbSlug);
       await sleep(600);
@@ -883,10 +954,17 @@ async function openDialog(boardSlug) {
       setSelectValue(fieldByLabel("Воркспейс").querySelector("select"), "worktree");
       await sleep(400);
       const wtPath = pathInputOf();
+      // Not empty any more: the field shows a read-only PREVIEW of what
+      // create_task will materialise. The real payload check is below.
       check(
-        "worktree + проект: путь не подставляется (его материализует create_task)",
-        !!wtPath && wtPath.value === "",
+        "worktree + проект: поле пути показывает предпросмотр <primary>/.worktrees/",
+        !!wtPath && wtPath.value === proj.primary_path + "/.worktrees/<id-задачи>",
         wtPath ? JSON.stringify(wtPath.value) : "нет поля пути"
+      );
+      check(
+        "worktree + проект: поле пути read-only",
+        !!wtPath && wtPath.readOnly === true && wtPath.disabled === false,
+        wtPath ? "readOnly=" + wtPath.readOnly + " disabled=" + wtPath.disabled : "нет поля"
       );
       const wtTitle = "hlv-autotest: worktree+проект " + Date.now();
       setInputValue(fieldByLabel("Заголовок").querySelector("input"), wtTitle);
@@ -944,6 +1022,153 @@ async function openDialog(boardSlug) {
         scratchBody ? JSON.stringify(scratchBody.workspace_path) : "нет тела"
       );
     }
+  }
+
+  // --- 7d. вид по умолчанию и предпросмотр пути -------------------------
+  // A project with a repo should default to `worktree` even when the board's
+  // own directory is NOT a repo — that is exactly board `ff`
+  // (default_workdir = /home/alexander/src/ff, a container), whose
+  // `default_workspace_kind` is therefore always `dir`.
+  if (prjSel && projBoard) {
+    const [pbSlug2, pbProjects2] = projBoard;
+    const boardMeta2 = boards.boards.find((b) => b.slug === pbSlug2);
+    const boardKind = boardMeta2 ? boardMeta2.default_workspace_kind : "";
+    const repoProj = pbProjects2.find((p) => p.primary_path && p.primary_is_repo);
+    const wsKindOf = () => fieldByLabel("Воркспейс").querySelector("select").value;
+
+    // A project WITHOUT a repo, so "primary_is_repo=false keeps the board's
+    // kind" is checked against a real one. Its primary_path is the board's own
+    // non-repo directory, which is a genuine "not a git repository" answer.
+    const NONREPO_ID = "p_hlvrepo0";
+    const NONREPO_SLUG = "hlv-autotest-nonrepo";
+    const { DatabaseSync } = require("node:sqlite");
+    let seededNonRepo = false;
+    const seedNonRepo = (path) => {
+      const db = new DatabaseSync("/home/alexander/.hermes/projects.db");
+      db.prepare("DELETE FROM projects WHERE slug = ?").run(NONREPO_SLUG);
+      db.prepare(
+        "INSERT OR REPLACE INTO projects (id, slug, name, description, icon, color, " +
+        "board_slug, primary_path, created_at, archived) VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?, ?, 0)"
+      ).run(NONREPO_ID, NONREPO_SLUG, "HLV Autotest Nonrepo", pbSlug2, path,
+        Math.floor(Date.now() / 1000));
+      db.close();
+      seededNonRepo = true;
+    };
+    const dropNonRepo = () => {
+      if (!seededNonRepo) return;
+      const db = new DatabaseSync("/home/alexander/.hermes/projects.db");
+      db.prepare("DELETE FROM projects WHERE slug = ?").run(NONREPO_SLUG);
+      db.close();
+      seededNonRepo = false;
+    };
+
+    check("у доски с проектами вид по умолчанию НЕ worktree (иначе тест не различает)",
+      boardKind === "dir", "default_workspace_kind=" + boardKind);
+
+    // (2) No project → the board's kind is untouched (regression guard).
+    await openDialog(pbSlug2);
+    check("без проекта вид остаётся как у доски", wsKindOf() === boardKind,
+      "вид=" + wsKindOf() + " доска=" + boardKind);
+
+    // (1) A project WITH a repo → worktree.
+    if (!repoProj) {
+      check("нашёлся проект с primary_is_repo=true", false,
+        JSON.stringify(pbProjects2.map((p) => [p.slug, p.primary_is_repo])));
+    } else {
+      setSelectValue(fieldByLabel("Проект").querySelector("select"), repoProj.id);
+      await sleep(500);
+      check("проект с репозиторием → вид по умолчанию worktree", wsKindOf() === "worktree",
+        "проект " + repoProj.slug + " (primary_is_repo=" + repoProj.primary_is_repo +
+          ") вид=" + wsKindOf() + ", доска предлагала " + boardKind);
+
+      // (4) The preview is read-only and shows the worktree path.
+      const prev = pathInputOf();
+      check("worktree: предпросмотр = <primary>/.worktrees/<id-задачи>",
+        !!prev && prev.value === repoProj.primary_path + "/.worktrees/<id-задачи>",
+        prev ? JSON.stringify(prev.value) : "нет поля");
+      check("worktree: поле предпросмотра read-only, но не disabled",
+        !!prev && prev.readOnly === true && prev.disabled === false,
+        prev ? "readOnly=" + prev.readOnly + " disabled=" + prev.disabled : "нет поля");
+      const labelTxt = fieldByLabel("Путь").textContent;
+      check("worktree: поле помечено как предпросмотр", /предпросмотр/i.test(labelTxt),
+        labelTxt.replace(/\s+/g, " ").slice(0, 60));
+      check("worktree: подсказка объясняет, что create_task создаст путь и ветку",
+        /create_task/.test(labelTxt) && /<id-задачи>/.test(labelTxt),
+        labelTxt.replace(/\s+/g, " ").slice(-90));
+
+      // (6) Switching project while worktree recomputes the preview.
+      const otherRepo = pbProjects2.find(
+        (p) => p.primary_path && p.primary_is_repo && p.id !== repoProj.id);
+      if (otherRepo) {
+        setSelectValue(fieldByLabel("Проект").querySelector("select"), otherRepo.id);
+        await sleep(500);
+        check("смена проекта при worktree пересчитывает предпросмотр",
+          pathInputOf() && pathInputOf().value ===
+            otherRepo.primary_path + "/.worktrees/<id-задачи>",
+          pathInputOf() ? pathInputOf().value : "нет поля");
+      } else {
+        check("нашёлся второй проект с репозиторием для проверки пересчёта", false,
+          "нет");
+      }
+
+      // (5) REGRESSION: no workspace_path for a project-linked worktree, even
+      // though the field now displays a value.
+      await openDialog(pbSlug2);
+      setSelectValue(fieldByLabel("Проект").querySelector("select"), repoProj.id);
+      await sleep(500);
+      const rTitle = "hlv-autotest: worktree без пути " + Date.now();
+      setInputValue(fieldByLabel("Заголовок").querySelector("input"), rTitle);
+      POSTS.length = 0;
+      click(findButton("создать"));
+      await sleep(2500);
+      const post5 = POSTS.filter((p) => p.path.indexOf("/tasks?board=") !== -1).pop();
+      const body5 = post5 ? post5.body : null;
+      check("worktree: workspace_path НЕ отправляется, хотя поле заполнено предпросмотром",
+        !!body5 && body5.workspace_path === undefined,
+        body5 ? "workspace_path=" + JSON.stringify(body5.workspace_path) : "POST не ушёл");
+      check("worktree: отправлены kind=worktree и project_id",
+        !!body5 && body5.workspace_kind === "worktree" && body5.project_id === repoProj.id,
+        body5 ? JSON.stringify({ k: body5.workspace_kind, p: body5.project_id }) : "нет тела");
+      const bd5 = await fetchJSON(
+        "/api/plugins/kanban/board?include_archived=true&board=" + encodeURIComponent(pbSlug2));
+      let made5 = null;
+      for (const col of (bd5.columns || [])) {
+        for (const t of (col.tasks || [])) if (t.title === rTitle) made5 = t;
+      }
+      check("worktree: карточка создана с якорем проекта",
+        !!made5 && made5.workspace_kind === "worktree" &&
+          made5.project_id === repoProj.id &&
+          made5.workspace_path === repoProj.primary_path + "/.worktrees/" + made5.id,
+        made5 ? JSON.stringify({ k: made5.workspace_kind, p: made5.project_id, w: made5.workspace_path })
+              : "карточка не найдена");
+      if (made5) {
+        await fetchJSON(
+          "/api/plugins/kanban/tasks/" + encodeURIComponent(made5.id) +
+            "?board=" + encodeURIComponent(pbSlug2),
+          { method: "DELETE" });
+      }
+    }
+
+    // (3) A project whose primary_path is NOT a repo keeps the board's kind.
+    const nonRepoPath = boardMeta2 && boardMeta2.default_workdir;
+    if (nonRepoPath) {
+      seedNonRepo(nonRepoPath);
+      await sleep(BOARDS_POLL_WAIT);
+      await openDialog(pbSlug2);
+      setSelectValue(fieldByLabel("Проект").querySelector("select"), NONREPO_ID);
+      await sleep(500);
+      check("проект БЕЗ репозитория → вид остаётся как у доски (dir)",
+        wsKindOf() === "dir", "вид=" + wsKindOf() + " (путь " + nonRepoPath + ")");
+      check("у нерепозиторного проекта primary_is_repo=false",
+        (await fetchJSON("/api/plugins/hermes-logs-viewer/projects")).projects
+          .filter((p) => p.id === NONREPO_ID).every((p) => p.primary_is_repo === false),
+        "проверено через роут");
+      const np2 = pathInputOf();
+      check("dir у нерепозиторного проекта: путь = primary_path, поле редактируемое",
+        np2 && np2.value === nonRepoPath && np2.readOnly === false,
+        np2 ? JSON.stringify(np2.value) + " readOnly=" + np2.readOnly : "нет поля");
+    }
+    dropNonRepo();
   }
 
   // --- 7. real create round-trip (runtime + initial status) ------------
@@ -1135,46 +1360,163 @@ async function openDialog(boardSlug) {
     );
   }
 
-  // --- 9. mobile: the task list is a horizontal carousel (ТЗ) ----------
-  // jsdom applies no media queries, so the responsive rule is asserted
+  // --- 9. narrow layout: the task list is horizontal, in two variants ----
+  // jsdom applies no media queries, so the responsive rules are asserted
   // against the stylesheet the dashboard actually serves, and the runtime half
   // (axis-aware autoscroll) against the JS that drives it.
   {
     check(
-      "медиазапрос мобильной вёрстки на месте",
+      "медиазапрос узкой вёрстки на месте",
       /@media\s*\(max-width:\s*1023px\)/.test(css),
       "max-width: 1023px"
     );
-    // The rule block the carousel lives in.
-    const mq = css.slice(css.indexOf("@media (max-width: 1023px)"));
+    // The shared rule block the horizontal layout lives in.
+    const mq = css.slice(
+      css.indexOf("@media (max-width: 1023px)"),
+      css.indexOf("@media (min-width: 381px)")
+    );
     check(
-      "на мобильном список задач становится горизонтальным",
+      "на узком экране список задач становится горизонтальным",
       /flex-direction:\s*row/.test(mq) && /overflow-x:\s*auto/.test(mq),
       mq.slice(0, 120).replace(/\s+/g, " ")
     );
+    // The card width must NOT be pinned in the shared block any more: the two
+    // variants below own it, and a value left here would silently beat both
+    // (same specificity, later in the file wins only by accident of order).
     check(
-      "карусель листается по карточкам (scroll-snap)",
-      /scroll-snap-type:\s*x\s+mandatory/.test(mq) && /scroll-snap-align:\s*start/.test(mq),
-      "snap по x"
+      "общая часть не задаёт ширину карточки",
+      !/flex:\s*0\s+0\s*\d/.test(mq) && !/scroll-snap-type:/.test(mq),
+      "flex-basis и snap вынесены в варианты"
     );
+
+    // Variant 1 (> 380px): a horizontal LIST — several cards, no paging.
+    const listMq = css.slice(css.indexOf("@media (min-width: 381px)"));
     check(
-      "карточка карусели — почти ширина экрана, следующая peek-ится",
-      /flex:\s*0\s+0\s*82%/.test(mq),
-      "flex: 0 0 82%"
+      "выше 380px — горизонтальный список, а не карусель",
+      /@media\s*\(min-width:\s*381px\)\s*and\s*\(max-width:\s*1023px\)/.test(css) &&
+        /scroll-snap-type:\s*none/.test(listMq) &&
+        /\.hlv-row\s*\{[^}]*flex:\s*0\s+0\s*clamp\(/.test(listMq),
+      "snap выключен, у карточки своя ширина"
+    );
+
+    // Variant 2 (<= 380px): the carousel survives where it is the right shape.
+    const carMq = css.slice(css.indexOf("@media (max-width: 380px)"));
+    check(
+      "до 380px остаётся карусель (одна карточка, snap)",
+      /scroll-snap-type:\s*x\s+mandatory/.test(carMq) &&
+        /scroll-snap-align:\s*start/.test(carMq) &&
+        /flex:\s*0\s+0\s*82%/.test(carMq),
+      "одна карточка на экран"
     );
     check(
       "старая вертикальная полоса на мобильном убрана",
-      !/max-height:\s*38vh/.test(mq),
+      !/max-height:\s*38vh/.test(css),
       "max-height: 38vh не осталось"
     );
-    // The JS half: autoscroll must follow the axis the list scrolls on.
+    // The JS half: autoscroll must follow the axis the list scrolls on —
+    // and both horizontal variants share that axis, so one predicate covers them.
     const js = fs.readFileSync(PLUGIN, "utf8");
     check(
-      "автоскролл списка учитывает ось (scrollLeft на карусели)",
+      "автоскролл списка учитывает ось (scrollLeft на горизонтальном списке)",
       /function isCarousel\(\)/.test(js) && /list\.scrollLeft \+=/.test(js) &&
         /function listPos\(/.test(js) && /scrollTop \+=/.test(js),
       "isCarousel + listPos + обе оси"
     );
+  }
+
+  // --- 10. priority is shown on every row -------------------------------
+  // The list is ORDERED by priority, so a row that hides it cannot be checked
+  // against the order by eye. The badge must carry the same number the sort
+  // used — the one the row's own data-priority already mirrors.
+  {
+    const rowsP = $$(".hlv-row");
+    const withBadge = rowsP.filter((r) => r.querySelector(".hlv-row-priority"));
+    check(
+      "у каждой строки списка подписан приоритет",
+      rowsP.length > 0 && withBadge.length === rowsP.length,
+      withBadge.length + " из " + rowsP.length
+    );
+    const badBadge = withBadge.filter((r) => {
+      const want = Number(r.getAttribute("data-priority"));
+      const got = Number((r.querySelector(".hlv-row-priority").textContent || "")
+        .replace(/[^0-9-]/g, ""));
+      return want !== got;
+    });
+    check(
+      "подпись приоритета совпадает с тем, по чему отсортирован список",
+      badBadge.length === 0,
+      badBadge.length
+        ? badBadge.slice(0, 3).map((r) => r.getAttribute("data-task-id")).join(",")
+        : withBadge.length + " строк сверено с data-priority"
+    );
+    check(
+      "приоритет 0 тоже показан (0 — значение, а не «нет данных»)",
+      withBadge.some((r) => /прио\s*0\b/.test(r.querySelector(".hlv-row-priority").textContent || "")),
+      withBadge.filter((r) => Number(r.getAttribute("data-priority")) === 0).length + " строк с приоритетом 0"
+    );
+    // And against the board itself, not just against our own attribute.
+    if (boards0 && boards0.boards) {
+      const truthP = new Map();
+      for (const b of boards0.boards) {
+        const bd = await fetchJSON(
+          "/api/plugins/kanban/board?include_archived=true&board=" + encodeURIComponent(b.slug));
+        for (const col of (bd.columns || [])) {
+          for (const t of (col.tasks || [])) truthP.set(t.id, t.priority || 0);
+        }
+      }
+      const drift = withBadge.filter((r) => {
+        const id = r.getAttribute("data-task-id");
+        if (!truthP.has(id)) return false;
+        const got = Number((r.querySelector(".hlv-row-priority").textContent || "")
+          .replace(/[^0-9-]/g, ""));
+        return got !== truthP.get(id);
+      });
+      check(
+        "подпись приоритета совпадает с доской",
+        drift.length === 0,
+        drift.length
+          ? drift.slice(0, 3).map((r) => r.getAttribute("data-task-id")).join(",")
+          : withBadge.length + " строк сверено с /board"
+      );
+    }
+  }
+
+  // --- 11. search by task id --------------------------------------------
+  // An id is how a task is named everywhere else (log file, board link, chat),
+  // so the search box must accept it — and without waiting for the body index.
+  if ($(".hlv-search-input")) {
+    const idRow = $$(".hlv-row")[3] || $$(".hlv-row")[0];
+    const id = idRow && idRow.getAttribute("data-task-id");
+    const beforeId = $$(".hlv-row").length;
+    setInputValue($(".hlv-search-input"), id);
+    await sleep(400);
+    const idHits = $$(".hlv-row").map((r) => r.getAttribute("data-task-id"));
+    check(
+      "поиск по id задачи находит ровно эту карточку",
+      !!id && idHits.length === 1 && idHits[0] === id,
+      "запрос «" + id + "» → " + idHits.length + " из " + beforeId
+    );
+    // A partial id works too — an id is typed from memory, not pasted whole.
+    if (id && id.length > 4) {
+      setInputValue($(".hlv-search-input"), id.slice(0, 5));
+      await sleep(400);
+      check(
+        "поиск работает по началу id",
+        $$(".hlv-row").some((r) => r.getAttribute("data-task-id") === id),
+        "запрос «" + id.slice(0, 5) + "»"
+      );
+    }
+    // ...and a query that is NOT an id still finds nothing, so the previous
+    // check cannot pass on a filter that matches everything.
+    setInputValue($(".hlv-search-input"), "t_нет_такой_карточки");
+    await sleep(400);
+    check(
+      "несуществующий id даёт пустой результат, а не все строки",
+      $$(".hlv-row").length === 0,
+      $$(".hlv-row").length + " строк"
+    );
+    click($(".hlv-search-clear"));
+    await sleep(500);
   }
 
   const failed = results.filter((r) => !r.ok);

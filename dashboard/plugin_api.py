@@ -56,6 +56,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -137,6 +138,53 @@ def _ro_connect(db_path: Path) -> sqlite3.Connection:
     con = sqlite3.connect(uri, uri=True, timeout=5)
     con.row_factory = sqlite3.Row
     return con
+
+
+# Is `path` inside a git repository? Keyed by path, memoised for the process.
+#
+# The project store has no such column and no cheap way to add one: whether a
+# directory is a repo is a property of the filesystem, not of the row. Probing
+# with git is the only honest source — the same probe the bundled route uses for
+# a board's `default_workspace_kind` (`kbw._git_toplevel`).
+#
+# Cached because the picker polls every 15 s and each miss is a process spawn;
+# a stale answer is harmless here (the worst case is a `dir` instead of a
+# `worktree`, which the user can still pick by hand). Bounded so a user with
+# hundreds of projects cannot grow it without limit.
+_GIT_REPO_CACHE: "dict[str, bool]" = {}
+_GIT_REPO_CACHE_MAX = 512
+_GIT_TIMEOUT_S = 5
+
+
+def _primary_is_repo(path: Optional[str]) -> bool:
+    """True when ``path`` sits inside a git repository (``git rev-parse
+    --show-toplevel`` succeeds). False for a missing/empty path, a missing git,
+    a timeout, or anything that goes wrong — a project without a usable repo
+    simply falls back to `dir`, which is the old behaviour."""
+    p = (path or "").strip()
+    if not p:
+        return False
+    cached = _GIT_REPO_CACHE.get(p)
+    if cached is not None:
+        return cached
+    if not Path(p).expanduser().is_dir():
+        _GIT_REPO_CACHE[p] = False
+        return False
+    result = False
+    try:
+        proc = subprocess.run(
+            ["git", "-C", p, "rev-parse", "--show-toplevel"],
+            capture_output=True, timeout=_GIT_TIMEOUT_S, check=False,
+        )
+        result = proc.returncode == 0 and bool(proc.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        # git missing, or the probe hung: treat as "not a repo" rather than
+        # failing the whole request.
+        result = False
+    if len(_GIT_REPO_CACHE) >= _GIT_REPO_CACHE_MAX:
+        _GIT_REPO_CACHE.clear()
+    _GIT_REPO_CACHE[p] = result
+    return result
 
 
 def _project_rows() -> tuple[Optional[list], Optional[str]]:
@@ -318,9 +366,15 @@ async def list_projects(board: Optional[str] = Query(None)):
     at all (its ``/projects`` has no ``board_slug``), so this is the single
     place the board↔projects relation is decided.
 
-    A project bound to another board is simply absent from a filtered answer —
-    the form resets its selection on a board switch rather than sending a
-    project the new board does not own.
+    ``primary_is_repo`` says whether the project's ``primary_path`` is inside a
+    git repository (probed and cached — see ``_primary_is_repo``). The form uses
+    it to default the workspace kind to ``worktree`` for a project that HAS a
+    repo, which matters for a board whose own ``default_workdir`` is a
+    non-repository container. Treat a missing/null value as "not a repo": the
+    picker then falls back to the board's own recommendation.
+
+    The filter narrows by board_slug, but it does NOT restrict what the form may
+    send — a project is not required to be bound to the card's board.
     """
     def _run():
         want = None
@@ -341,6 +395,7 @@ async def list_projects(board: Optional[str] = Query(None)):
                 "name": r["name"] or r["slug"],
                 "primary_path": r["primary_path"] or "",
                 "board_slug": r["board_slug"] or "",
+                "primary_is_repo": _primary_is_repo(r["primary_path"]),
             }
             for r in rows
             if want is None or (r["board_slug"] or "") == want
