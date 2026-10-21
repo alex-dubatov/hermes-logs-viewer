@@ -470,9 +470,10 @@ function Page() {
     var draftRuntimeState = useState("0");
     var draftRuntime = draftRuntimeState[0];
     var setDraftRuntime = draftRuntimeState[1];
-    // Initial status: `ready` (default), `todo`, `triage` or `blocked`. The core
-    // create route only parks a task in triage/blocked; `todo` is reached by a
-    // follow-up PATCH, exactly as a drag to Todo does in the built-in plugin.
+    // Initial status: `ready` (default), `todo`, `triage`, `blocked` or
+    // `scheduled`. The core create route only parks a task in triage/blocked;
+    // `todo` and `scheduled` are reached by a follow-up PATCH, exactly as a
+    // drag to that column does in the built-in plugin.
     var draftStatusState = useState("ready");
     var draftStatus = draftStatusState[0];
     var setDraftStatus = draftStatusState[1];
@@ -1606,6 +1607,16 @@ function Page() {
         setCreateNote({ kind: "err", text: "выберите доску явно" });
         return;
       }
+      // The profile is explicit too (ТЗ): an unassigned card sits in `ready`
+      // forever — the dispatcher skips it unless `kanban.default_assignee` is
+      // configured, and that setting is not this form's business. The picker
+      // is marked red and the button stays disabled until one is picked, so
+      // this guard is the backstop for the Enter key (which submits without
+      // going through the button).
+      if (!draftAssignee) {
+        setCreateNote({ kind: "err", text: "выберите профиль — без него задачу никто не выполнит" });
+        return;
+      }
       if (draftWsKind === "dir" && !draftWsPath.trim()) {
         setCreateNote({ kind: "err", text: "нужен путь к каталогу" });
         return;
@@ -1660,8 +1671,8 @@ function Page() {
         // `max_runtime_seconds IS NOT NULL` guard skips the task entirely.
         max_runtime_seconds: runtimeSeconds > 0 ? runtimeSeconds : null,
       };
-      // `triage` and `blocked` are create-time states in the core; `todo` is
-      // reached by the follow-up PATCH below.
+      // `triage` and `blocked` are create-time states in the core; `todo` and
+      // `scheduled` are reached by the follow-up PATCH below.
       if (draftStatus === "triage") payload.triage = true;
       if (draftWsKind) payload.workspace_kind = draftWsKind;
       // The project goes out ONLY when one was picked. An empty picker means
@@ -1707,15 +1718,18 @@ function Page() {
           return;
         }
         var created = r.task;
-        // `todo` and `blocked` are not create-time states in the core, so the
-        // card is created and then moved through the very same PATCH the
-        // built-in plugin uses for a drag into that column. `ready` (default)
-        // and `triage` (sent as a flag) need no second call.
+        // `todo`, `scheduled` and `blocked` are not create-time states in the
+        // core, so the card is created and then moved through the very same
+        // PATCH the built-in plugin uses for a drag into that column. `ready`
+        // (default) and `triage` (sent as a flag) need no second call.
         //
         // `wantStatus` is captured here rather than read off `draftStatus` at
         // every step, so one render's value drives the whole sequence.
         var wantStatus = draftStatus;
-        var wantsMove = wantStatus === "todo" || wantStatus === "blocked";
+        var wantsMove =
+          wantStatus === "todo" ||
+          wantStatus === "scheduled" ||
+          wantStatus === "blocked";
         var patchStatus = function () {
           return fetchJSON(
             KANBAN_API + "/tasks/" + encodeURIComponent(created.id) + "?board=" +
@@ -2517,9 +2531,12 @@ function Page() {
         var boardOptions = el(
           "select",
           {
-            className: "hlv-select hlv-input",
+            className:
+              "hlv-select hlv-input" + (draftBoard ? "" : " hlv-required"),
             value: draftBoard,
-            title: "доска, на которой появится задача — выберите явно",
+            title: draftBoard
+              ? "доска, на которой появится задача"
+              : "обязательно выберите доску: задача не создастся на «default» молча",
             onChange: function (e) {
               var next = e.target.value;
               setDraftBoard(next);
@@ -2599,13 +2616,19 @@ function Page() {
           el(
             "select",
             {
-              className: "hlv-select hlv-input",
+              // The red outline says "this one is still required" — the same
+              // signal the dashboard's own invalid fields give. It disappears
+              // the moment a profile is picked.
+              className:
+                "hlv-select hlv-input" + (draftAssignee ? "" : " hlv-required"),
               value: draftAssignee,
-              title: "кто выполнит задачу",
+              title: draftAssignee
+                ? "кто выполнит задачу"
+                : "обязательно выберите профиль: без него задача останется в ready и её никто не выполнит",
               onChange: function (e) { setDraftAssignee(e.target.value); },
               onKeyDown: onCreateKeyDown,
             },
-            el("option", { value: "" }, "— не назначен —"),
+            el("option", { value: "" }, "— выберите профиль —"),
             profiles.map(function (p) {
               return el(
                 "option",
@@ -2613,7 +2636,11 @@ function Page() {
                 "@" + p.name + (p.description ? " — " + p.description : "")
               );
             })
-          )
+          ),
+          !draftAssignee
+            ? el("span", { className: "hlv-modal-hint hlv-required-hint" },
+                "профиль обязателен — задача без него не уйдёт в работу")
+            : null
         ),
         el("div", { className: "hlv-field-row" },
           el("label", { className: "hlv-field hlv-field-narrow" },
@@ -2654,6 +2681,7 @@ function Page() {
               },
               el("option", { value: "ready" }, "ready — сразу в работу"),
               el("option", { value: "todo" }, "todo — в очередь"),
+              el("option", { value: "scheduled" }, "scheduled — отложена, не запустится сама"),
               el("option", { value: "triage" }, "triage — на уточнение"),
               el("option", { value: "blocked" }, "blocked — ждёт человека")
             )
@@ -2781,14 +2809,30 @@ function Page() {
           el("button", {
             type: "button",
             className: "hlv-btn hlv-btn-primary",
-            disabled: createBusy,
+            // The button is dead until the two REQUIRED picks are made: a board
+            // (where the card lands) and a profile (who runs it). A greyed-out
+            // button says "not yet" without a click and without a rejected
+            // submit; the red outline on the two comboboxes says which ones.
+            disabled: createBusy || !draftBoard || !draftAssignee,
+            title: !draftBoard
+              ? "сначала выберите доску"
+              : !draftAssignee
+                ? "сначала выберите профиль"
+                : "создать задачу (Enter — создать, Esc — закрыть)",
             onClick: submitCreate,
           }, createBusy ? "создание…" : "создать")
         ),
         el("div", { className: "hlv-modal-hint" },
-          draftStatus === "ready"
-            ? "состояние ready — задачу сразу подхватит dispatcher"
-            : "задача создастся в состоянии " + draftStatus + " и не уйдёт в работу сама")
+          !draftBoard
+            ? "выберите доску и профиль — до этого задача не создаётся"
+            : !draftAssignee
+              ? "выберите профиль — без него задача останется в ready и её никто не выполнит"
+              : draftStatus === "ready"
+                ? "состояние ready — задачу сразу подхватит dispatcher"
+                : draftStatus === "scheduled"
+                  ? "состояние scheduled — задача отложена и не запустится сама, " +
+                    "пока её не переведут в ready"
+                  : "задача создастся в состоянии " + draftStatus + " и не уйдёт в работу сама")
       )
     );
 

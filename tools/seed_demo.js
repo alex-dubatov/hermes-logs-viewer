@@ -4,6 +4,13 @@
  *
  * !!!! DO NOT RUN THIS WITHOUT THE USER SAYING SO. !!!!
  *
+ * The rule covers the DATA too, not just the capture: do not create tasks on
+ * the live dashboard to prepare screenshots either. The owner's rule (2026-10-21)
+ * is "не создавай задачи для генерации скриншотов" — seeding demo cards for a
+ * screenshot needs the same permission as taking the picture. Verify features
+ * with the stands (tests/render_test.js, tests/carousel_test.js) instead; they
+ * assert on the DOM and need no demo board.
+ *
  * Seeding creates a REAL board on the user's live dashboard, and
  * `tools/screenshots.js` then OVERWRITES the committed PNGs in docs/. The user
  * asked (2026-10-19) not to have either happen unannounced: a demo board left

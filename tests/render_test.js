@@ -191,13 +191,33 @@ function fieldByLabel(labelText) {
 // Reopen the create dialog on `boardSlug`. The dialog closes itself on a
 // successful create, and several blocks below create cards one after another,
 // so every one of them has to reopen it first.
-async function openDialog(boardSlug) {
+//
+// The PROFILE is picked here too: it is a required pick (ТЗ), so a dialog
+// without one cannot be submitted at all — the "создать" button stays
+// disabled and the form refuses on Enter. The profile is set to the one the
+// harness itself runs under, so a card the test creates is never handed to a
+// real worker: the assignee is not dispatchable from this board.
+async function openDialog(boardSlug, assignee) {
   click(findButton("+ Новая задача"));
   await sleep(500);
   setSelectValue(fieldByLabel("Доска").querySelector("select"), boardSlug);
   await sleep(450);
+  const who = assignee === undefined ? TEST_ASSIGNEE : assignee;
+  if (who) {
+    setSelectValue(fieldByLabel("Профиль").querySelector("select"), who);
+    await sleep(250);
+  }
   return $(".hlv-modal");
 }
+
+// The profile the harness assigns to the cards it creates.
+//
+// It must be a REAL profile (the picker only offers installed ones) and it
+// must not be one a worker is running under: a `ready` card assigned to a
+// live profile is picked up by the dispatcher within a minute and executed for
+// real. `default` is used because it is installed on every host and no worker
+// runs under it — the dispatcher has no `default` profile to claim from here.
+const TEST_ASSIGNEE = "default";
 
 (async () => {
   // Let the first poll cycle land (task list is on a 2s tick, boards fire once).
@@ -477,7 +497,100 @@ async function openDialog(boardSlug) {
       "в списке досок есть пустая опция-заглушка",
       Array.from(boardSel.options).some((o) => o.value === "")
     );
+    // The board is REQUIRED (ТЗ): the combobox is outlined in red until one
+    // is picked, so the "you still have to choose this" is visible, not just
+    // enforced.
+    check(
+      "невыбранная доска подсвечена красным",
+      boardSel.className.indexOf("hlv-required") !== -1,
+      "class=" + boardSel.className
+    );
   }
+
+  // --- 7-bis. the profile is required too (ТЗ) --------------------------
+  const whoField = fieldByLabel("Профиль");
+  const whoSel = whoField && whoField.querySelector("select");
+  check("в форме есть поле «Профиль»", !!whoSel);
+  if (whoSel) {
+    check(
+      "профиль по умолчанию НЕ выбран (требуется явный выбор)",
+      whoSel.value === "",
+      "value=" + JSON.stringify(whoSel.value)
+    );
+    check(
+      "невыбранный профиль подсвечен красным",
+      whoSel.className.indexOf("hlv-required") !== -1,
+      "class=" + whoSel.className
+    );
+    check(
+      "в списке профилей есть пустая опция-заглушка",
+      Array.from(whoSel.options).some((o) => o.value === "")
+    );
+    // The options must be the INSTALLED profiles — the picker is the roster
+    // from /profiles, so the value is a real profile the dispatcher can claim.
+    const roster = (await fetchJSON("/api/plugins/kanban/profiles")).profiles || [];
+    check(
+      "в списке профилей — установленные профили",
+      roster.length > 0 &&
+        roster.every((p) =>
+          Array.from(whoSel.options).some((o) => o.value === p.name)
+        ),
+      "ростер: " + roster.map((p) => p.name).join(", ")
+    );
+  }
+
+  // The create button stays dead until BOTH required picks are made.
+  const createBtn = () => findButton("создать");
+  check(
+    "кнопка «создать» неактивна, пока не выбраны доска и профиль",
+    !!createBtn() && createBtn().disabled === true,
+    createBtn() ? "disabled=" + createBtn().disabled : "нет кнопки"
+  );
+  // The board alone is not enough — the profile is a separate requirement.
+  setSelectValue(boardSel, (boards0.boards[0] || {}).slug);
+  await sleep(400);
+  check(
+    "с одной доской кнопка «создать» всё ещё неактивна (нужен профиль)",
+    !!createBtn() && createBtn().disabled === true,
+    createBtn() ? "disabled=" + createBtn().disabled : "нет кнопки"
+  );
+  // Enter bypasses the disabled button, so the guard must hold there too.
+  setInputValue(modal.querySelector(".hlv-field input.hlv-input"), "hlv-autotest: без профиля");
+  POSTS.length = 0;
+  modal.querySelector(".hlv-field input.hlv-input").dispatchEvent(
+    new dom.window.KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+  await sleep(800);
+  const noWhoNote = $(".hlv-composer-note");
+  check(
+    "без профиля задача не создаётся (Enter)",
+    !!noWhoNote && /профил/.test(noWhoNote.textContent) && !!$(".hlv-modal"),
+    noWhoNote ? noWhoNote.textContent : "нет note"
+  );
+  check(
+    "без профиля POST создания не уходит",
+    POSTS.filter((p) => p.path.indexOf("/tasks?board=") !== -1).length === 0,
+    "POST-ов: " + POSTS.filter((p) => p.path.indexOf("/tasks?board=") !== -1).length
+  );
+  setSelectValue(whoSel, TEST_ASSIGNEE);
+  await sleep(400);
+  check(
+    "с доской и профилем кнопка «создать» активна",
+    !!createBtn() && createBtn().disabled === false,
+    createBtn() ? "disabled=" + createBtn().disabled : "нет кнопки"
+  );
+  check(
+    "выбранная доска больше не подсвечена красным",
+    boardSel.className.indexOf("hlv-required") === -1,
+    "class=" + boardSel.className
+  );
+  check(
+    "выбранный профиль больше не подсвечен красным",
+    whoSel.className.indexOf("hlv-required") === -1,
+    "class=" + whoSel.className
+  );
+  // Put the board back to "not chosen" — the checks below start from there.
+  setSelectValue(boardSel, "");
+  await sleep(300);
 
   const rtField = fieldByLabel("Время");
   const rtInput = rtField && rtField.querySelector("input");
@@ -517,23 +630,49 @@ async function openDialog(boardSlug) {
   if (stSel) {
     check("состояние по умолчанию ready", stSel.value === "ready", "value=" + stSel.value);
     check(
-      "доступные состояния: ready/todo/triage/blocked",
-      Array.from(stSel.options).map((o) => o.value).join(",") === "ready,todo,triage,blocked",
+      "доступные состояния: ready/todo/scheduled/triage/blocked",
+      Array.from(stSel.options).map((o) => o.value).join(",") ===
+        "ready,todo,scheduled,triage,blocked",
       Array.from(stSel.options).map((o) => o.value).join(",")
     );
   }
 
-  // Submitting with no board must refuse.
+  // Submitting with no board must refuse. The button is disabled in that
+  // state, so a CLICK cannot even reach the form — the refusal is asserted
+  // twice: on the disabled button, and on the Enter path (which bypasses the
+  // button and reaches submitCreate directly).
   const titleInput = modal.querySelector(".hlv-field input.hlv-input");
   setInputValue(titleInput, "hlv-autotest: не должна создаться");
   await sleep(150);
-  click(findButton("создать"));
+  POSTS.length = 0;
+  check(
+    "без доски кнопка «создать» неактивна",
+    !!createBtn() && createBtn().disabled === true,
+    createBtn() ? "disabled=" + createBtn().disabled : "нет кнопки"
+  );
+  click(createBtn());
+  await sleep(800);
+  check(
+    "без доски задача не создаётся (клик по неактивной кнопке)",
+    POSTS.filter((p) => p.path.indexOf("/tasks?board=") !== -1).length === 0 &&
+      !!$(".hlv-modal"),
+    "POST-ов: " + POSTS.filter((p) => p.path.indexOf("/tasks?board=") !== -1).length
+  );
+  // Enter goes straight to submitCreate — the guard must hold there too.
+  titleInput.dispatchEvent(new dom.window.KeyboardEvent("keydown", {
+    key: "Enter", bubbles: true,
+  }));
   await sleep(800);
   const note = $(".hlv-composer-note");
   check(
-    "без доски задача не создаётся",
+    "без доски задача не создаётся (Enter)",
     !!note && note.textContent.indexOf("доску") !== -1 && !!$(".hlv-modal"),
     note ? note.textContent : "нет note"
+  );
+  check(
+    "без доски POST создания не уходит",
+    POSTS.filter((p) => p.path.indexOf("/tasks?board=") !== -1).length === 0,
+    "POST-ов: " + POSTS.filter((p) => p.path.indexOf("/tasks?board=") !== -1).length
   );
 
   // Picking a repo-backed board must propose a git worktree + its path.
@@ -1239,6 +1378,73 @@ async function openDialog(boardSlug) {
       "?board=" + encodeURIComponent(target.slug),
       { method: "DELETE" });
     check("тестовая задача удалена", true, row.id);
+  }
+
+  // --- 7d. the `scheduled` state round-trip -----------------------------
+  // `scheduled` is not a create-time state in the core: the card is created
+  // `ready` and then moved by the same PATCH the built-in plugin uses for a
+  // drag into that column. The form must offer it and the card must actually
+  // LAND there — a card that stayed `ready` would be picked up by the
+  // dispatcher, which is the opposite of what was asked for.
+  {
+    const schModal = await openDialog(target.slug);
+    check("окно создания открылось для проверки scheduled", !!schModal);
+    const schTitle = "hlv-autotest: scheduled " + Date.now();
+    setInputValue(fieldByLabel("Заголовок").querySelector("input"), schTitle);
+    setSelectValue(fieldByLabel("Состояние").querySelector("select"), "scheduled");
+    await sleep(300);
+    POSTS.length = 0;
+    click(findButton("создать"));
+    await sleep(3500);
+    const schPost = POSTS.filter((p) => p.path.indexOf("/tasks?board=") !== -1).pop();
+    check(
+      "scheduled: карточка создаётся как ready, а состояние ставится PATCH-ом",
+      !!schPost && schPost.body && schPost.body.status === undefined,
+      schPost ? JSON.stringify(schPost.body) : "POST не ушёл"
+    );
+    const schBd = await fetchJSON(
+      "/api/plugins/kanban/board?include_archived=true&board=" + encodeURIComponent(target.slug));
+    let schRow = null;
+    for (const col of (schBd.columns || [])) {
+      for (const t of (col.tasks || [])) if (t.title === schTitle) schRow = t;
+    }
+    check("scheduled: карточка создалась", !!schRow,
+      schRow ? schRow.id + " / " + schRow.status : "не найдена");
+    if (schRow) {
+      // Same settle-loop as the `todo` case: the PATCH lands a beat after the
+      // POST, so a single sample would read as a failure.
+      let schSettled = schRow;
+      for (let i = 0; i < 20 && schSettled.status !== "scheduled"; i++) {
+        await sleep(500);
+        const r = await fetchJSON(
+          "/api/plugins/kanban/tasks/" + encodeURIComponent(schRow.id) +
+          "?board=" + encodeURIComponent(target.slug));
+        if (r.task) schSettled = r.task;
+      }
+      check("состояние scheduled применено", schSettled.status === "scheduled",
+        "status=" + schSettled.status);
+      // The card must NOT be dispatchable: `scheduled` is exactly the state
+      // that keeps a card out of the dispatcher's ready lane.
+      check("scheduled: у карточки нет claim — диспетчер её не возьмёт",
+        !schSettled.claim_lock && !schSettled.current_run_id,
+        "claim=" + schSettled.claim_lock + " run=" + schSettled.current_run_id);
+      // The profile the form required must be on the card: that is the whole
+      // point of the required pick.
+      check("scheduled: карточка назначена выбранному профилю",
+        schSettled.assignee === TEST_ASSIGNEE,
+        "assignee=" + schSettled.assignee);
+      const schNote = (($(".hlv-create-flash") || {}).textContent) || "";
+      check(
+        "scheduled: результат создания не врёт про состояние",
+        schSettled.status === "scheduled" || /создано как/.test(schNote),
+        schSettled.status === "scheduled" ? "состояние верное" : "note=" + schNote
+      );
+      await fetchJSON(
+        "/api/plugins/kanban/tasks/" + encodeURIComponent(schRow.id) +
+        "?board=" + encodeURIComponent(target.slug),
+        { method: "DELETE" });
+      check("scheduled: тестовая карточка удалена", true, schRow.id);
+    }
   }
 
   function editor2Available() { return false; }

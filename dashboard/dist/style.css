@@ -579,6 +579,25 @@
   border-color: var(--color-ring, var(--color-success));
 }
 
+/* A REQUIRED pick that has not been made yet: the board the card lands on and
+   the profile that runs it. The red outline is the "you still have to choose
+   this" signal — it disappears the moment a value is picked, so it never
+   cries wolf on a filled form. It is a border, not a background: a native
+   <select> paints its own background, and a tint under it would read as a
+   highlighted value rather than an invalid one. */
+.hlv-required {
+  border-color: var(--color-destructive, #d14a4a);
+  box-shadow: 0 0 0 1px var(--color-destructive, #d14a4a);
+}
+
+.hlv-required:focus {
+  border-color: var(--color-destructive, #d14a4a);
+}
+
+.hlv-required-hint {
+  color: var(--color-destructive, #d14a4a);
+}
+
 /* A locked field (the workspace before a board is chosen) must read as locked:
    the dashboard's own inputs do not dim on `disabled` on their own. */
 .hlv-input:disabled,
