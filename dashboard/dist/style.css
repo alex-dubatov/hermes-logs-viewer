@@ -793,7 +793,15 @@
   gap: 8px;
 }
 
-.hlv-desc {
+/* The "основное" pane: the whole card (title, meta, priority, state, body).
+   Same scroll box as the log pane — the body may be long.
+
+   The class is `hlv-card`, NOT `hlv-main`: the layout wrapper below the
+   header already owns `.hlv-main`, and its rule sets `display: flex` with a
+   row direction. Sharing the name made the pane's four children (head,
+   priority row, state row, body) lay out HORIZONTALLY in one line instead of
+   stacked — the whole card became unreadable. */
+.hlv-card {
   flex: 1;
   min-height: 0;
 }
@@ -806,6 +814,66 @@
   margin-bottom: 10px;
   padding-bottom: 8px;
   border-bottom: 1px solid var(--color-border);
+}
+
+/* The title and its pencil share one line: the pencil sits immediately
+   after the title, so the thing it edits and the button that edits it are
+   read as one unit. `align-items: center` keeps the glyph on the text's
+   baseline instead of floating above it. */
+.hlv-main-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+/* While the title is being edited it becomes an input. `flex: 1` lets it
+   take the width the title had, so the row does not jump. */
+.hlv-title-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+/* The pencil (✎ → ✓ / ✕). A tiny inline button: same borderless look as
+   the rest of the dashboard's inline controls, but sized so the glyph is
+   legible without stealing attention from the value next to it. */
+.hlv-pencil-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.hlv-pencil {
+  appearance: none;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--color-muted-foreground);
+  font: inherit;
+  font-size: 0.85rem;
+  line-height: 1;
+  padding: 2px 5px;
+  cursor: pointer;
+  border-radius: 0;
+}
+
+.hlv-pencil:hover:not(:disabled) {
+  color: var(--color-card-foreground, var(--foreground));
+  border-color: var(--color-border);
+}
+
+/* The save glyph (✓) is the affirmative one — it gets the accent colour so
+   "the pencil became the save button" is visible at a glance. */
+.hlv-pencil-on {
+  color: var(--color-success);
+}
+
+.hlv-pencil:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .hlv-desc-title {
@@ -872,26 +940,21 @@
 }
 
 /* ------------------------------------------------------------------ */
-/* Right pane: "прочее" — priority + status controls                     */
+/* Right pane: "основное" — priority + status controls                  */
 /* ------------------------------------------------------------------ */
-.hlv-other {
-  flex: 1;
-  min-height: 0;
-  padding-bottom: 8px;
-}
 
 /* Label / value / hint on one row. `hlv-field-row` / `hlv-field-label`
    already exist for the create dialog (align-items: flex-end, no wrap), so the
-   overrides are scoped to .hlv-other — redefining them globally would silently
+   overrides are scoped to .hlv-card — redefining them globally would silently
    restyle that form. */
-.hlv-other .hlv-field-row {
+.hlv-card .hlv-field-row {
   align-items: center;
   flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 14px;
 }
 
-.hlv-other .hlv-field-label {
+.hlv-card .hlv-field-label {
   flex-shrink: 0;
   width: 92px;
 }

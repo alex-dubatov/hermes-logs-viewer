@@ -113,15 +113,16 @@ async function shot(page, name) {
     console.log("  !! поле поиска не найдено — снимок search пропущен");
   }
 
-  // 3. Вкладка «дескрипшен» — описание задачи с редактором.
-  const descTab = await page.$('.hlv-pane-tab:has-text("дескрипшен")')
-    || await page.$('button:has-text("дескрипшен")');
+  // 3. Вкладка «основное» — карточка задачи (заголовок, приоритет, состояние,
+  //    описание с редактором).
+  const descTab = await page.$('.hlv-pane-tab:has-text("основное")')
+    || await page.$('button:has-text("основное")');
   if (descTab) {
     await descTab.click();
     await settle(page, 2500);
     await shot(page, "description");
   } else {
-    console.log("  !! вкладка «дескрипшен» не найдена — снимок пропущен");
+    console.log("  !! вкладка «основное» не найдена — снимок пропущен");
   }
 
   // 4. Окно «Новая задача».

@@ -321,10 +321,10 @@ function Page() {
     var draft = draftState[0];
     var setDraft = draftState[1];
 
-    // --- Task description (third tab) -------------------------------------
+    // --- Task card: the "основное" tab ------------------------------------
     // Read/written through the bundled plugin's task routes: GET /tasks/{id}
-    // carries the full body, PATCH /tasks/{id} with {body} saves it — both
-    // already live, so no route is added here.
+    // carries the full body, PATCH /tasks/{id} with {body}/{title}/{priority}
+    // saves it — all already live, so no route is added here.
     var descState = useState(null);
     var desc = descState[0];
     var setDesc = descState[1];
@@ -346,20 +346,41 @@ function Page() {
     var descDraftState = useState("");
     var descDraft = descDraftState[0];
     var setDescDraft = descDraftState[1];
-    var descBusyState = useState(false);
-    var descBusy = descBusyState[0];
-    var setDescBusy = descBusyState[1];
-    var descNoteState = useState({ kind: "", text: "" });
-    var descNote = descNoteState[0];
-    var setDescNote = descNoteState[1];
+    // ONE busy flag for every write of this pane (body, title, priority,
+    // state): they all go through the same PATCH route, and two of them in
+    // flight at once would race each other over the same row.
+    //
+    // Named `cardBusy`, not `busy`: the log poller above already owns a
+    // `busyState` pair for its own fetch flag, and two `var busyState` in one
+    // scope would silently shadow the first — the log's spinner would freeze
+    // on the first render that reached the second declaration.
+    var cardBusyState = useState(false);
+    var cardBusy = cardBusyState[0];
+    var setCardBusy = cardBusyState[1];
+    // ONE note line for all of them: the last write's result, or the refusal
+    // the route answered with.
+    var noteState = useState({ kind: "", text: "" });
+    var note = noteState[0];
+    var setNote = noteState[1];
 
-    // --- "Прочее" tab: priority + status -----------------------------------
-    // Both are plain PATCH /tasks/{id} calls against the bundled plugin — the
-    // same route the description editor already uses. `status` is deliberately
-    // NOT offered as a free select: the bundled handler refuses `running`
-    // (400, #19535 — a task may only enter running through the dispatcher's
-    // claim path), so the buttons below offer only the statuses that route
-    // actually accepts.
+    // --- Title editing (the pencil next to the title) ----------------------
+    // The draft lives apart from `desc`, so the 5 s poll cannot overwrite what
+    // is being typed. The pencil opens the field and becomes the save ("✓").
+    var titleEditState = useState(false);
+    var titleEdit = titleEditState[0];
+    var setTitleEdit = titleEditState[1];
+    // Same ref trick as `descEdit`: the poller must see the CURRENT flag, and
+    // the closed-over value would be frozen at mount time.
+    var titleEditRef = useRef(false);
+    titleEditRef.current = titleEdit;
+    var titleDraftState = useState("");
+    var titleDraft = titleDraftState[0];
+    var setTitleDraft = titleDraftState[1];
+
+    // --- Priority (the pencil next to the priority value) ------------------
+    // A plain PATCH /tasks/{id} call against the bundled plugin — the same
+    // route the body editor already uses. The poll must not overwrite an open
+    // field, so the flag is read through a ref (same trick as `descEdit`).
     var metaEditState = useState(false);
     var metaEdit = metaEditState[0];
     var setMetaEdit = metaEditState[1];
@@ -368,12 +389,6 @@ function Page() {
     var metaDraftState = useState("0");
     var metaDraft = metaDraftState[0];
     var setMetaDraft = metaDraftState[1];
-    var metaBusyState = useState(false);
-    var metaBusy = metaBusyState[0];
-    var setMetaBusy = metaBusyState[1];
-    var metaNoteState = useState({ kind: "", text: "" });
-    var metaNote = metaNoteState[0];
-    var setMetaNote = metaNoteState[1];
 
     var showArchivedState = useState(false);
     var showArchived = showArchivedState[0];
@@ -1089,16 +1104,17 @@ function Page() {
       if (el) el.scrollTop = el.scrollHeight;
     }, [pane, comments.length]);
 
-    // Full detail of the selected task, polled while the description OR the
-    // "прочее" tab is open — both read the same payload, so one fetch serves
-    // two panes. The route is the bundled one (GET /tasks/{id}?board=), which
-    // returns the FULL body (the list route only carries a 200-char preview)
-    // plus the priority and status the "прочее" controls write.
+    // Full detail of the selected task, polled while the "основное" tab is
+    // open — it is the only pane that reads the whole card. The route is the
+    // bundled one (GET /tasks/{id}?board=), which returns the FULL body (the
+    // list route only carries a 200-char preview) plus the title, priority and
+    // status the controls here write.
     var DESC_POLL_MS = 5000;
     useEffect(function () {
-      if (!selected || (pane !== "description" && pane !== "other")) {
+      if (!selected || pane !== "main") {
         setDesc(null);
         setDescEdit(false);
+        setTitleEdit(false);
         setMetaEdit(false);
         return;
       }
@@ -1124,8 +1140,9 @@ function Page() {
           // Never overwrite an open editor with a poll result. Read through
           // the ref: the closed-over `descEdit` is the mount-time value.
           if (!descEditRef.current) setDescDraft(r.task.body || "");
-          // Same rule for the priority field: an open editor keeps what is
-          // typed until it is saved or cancelled.
+          // Same rule for the title and the priority field: an open editor
+          // keeps what is typed until it is saved or cancelled.
+          if (!titleEditRef.current) setTitleDraft(r.task.title || "");
           if (!metaEditRef.current) setMetaDraft(String(r.task.priority || 0));
         }).catch(function () {});
       }
@@ -1135,91 +1152,33 @@ function Page() {
         stop = true;
         clearInterval(h);
       };
-      // descEdit / metaEdit are read through refs above; re-running on them
-      // would restart the poller on every keystroke, so they are intentionally
-      // absent.
+      // descEdit / titleEdit / metaEdit are read through refs above; re-running
+      // on them would restart the poller on every keystroke, so they are
+      // intentionally absent.
     }, [selected, pane, boardOf]);
 
     function startDescEdit() {
       if (!desc) return;
       setDescDraft(desc.body || "");
-      setDescNote({ kind: "", text: "" });
+      setNote({ kind: "", text: "" });
       setDescEdit(true);
     }
 
     function cancelDescEdit() {
       setDescEdit(false);
       setDescDraft(desc ? desc.body || "" : "");
-      setDescNote({ kind: "", text: "" });
+      setNote({ kind: "", text: "" });
     }
 
-    function saveDesc() {
-      var id = selectedRef.current;
-      if (!id || descBusy) return;
-      setDescBusy(true);
-      setDescNote({ kind: "", text: "" });
-      fetchJSON(
-        KANBAN_API + "/tasks/" + encodeURIComponent(id) + "?board=" +
-        encodeURIComponent(boardOf(id)),
-        {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ body: descDraft }),
-        }
-      ).then(function (r) {
-        setDescBusy(false);
-        if (r.__error || r.detail || !r.task) {
-          setDescNote({
-            kind: "err",
-            text: r.detail || r.error || r.__error || "не удалось сохранить описание",
-          });
-          return;
-        }
-        setDesc(function (prev) {
-          if (!prev) return prev;
-          var next = {};
-          for (var k in prev) {
-            if (Object.prototype.hasOwnProperty.call(prev, k)) next[k] = prev[k];
-          }
-          next.body = r.task.body || "";
-          return next;
-        });
-        setDescEdit(false);
-        setDescNote({ kind: "ok", text: "описание сохранено" });
-        setTimeout(function () {
-          setDescNote(function (n) {
-            return n.kind === "ok" ? { kind: "", text: "" } : n;
-          });
-        }, 2500);
-      }).catch(function (e) {
-        setDescBusy(false);
-        setDescNote({ kind: "err", text: String((e && e.message) || e) });
-      });
-    }
-
-    function onDescKeyDown(e) {
-      // Ctrl/Cmd+Enter saves, Esc leaves the editor — same keys as the comment
-      // composer, so the two panes behave alike.
-      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
-        e.preventDefault();
-        saveDesc();
-        return;
-      }
-      if (e.key === "Escape") {
-        e.preventDefault();
-        cancelDescEdit();
-      }
-    }
-
-    // --- "Прочее": priority + status writes ---------------------------------
-    // One PATCH helper for both, so the busy flag, the success note and the
-    // error shape (the route answers 400/409 with `detail`, 200 with `{task}`)
-    // are handled in exactly one place.
+    // One PATCH helper for every write of this pane (body, title, priority,
+    // state): they all go through the same route, so the busy flag, the
+    // success note and the error shape (the route answers 400/409 with
+    // `detail`, 200 with `{task}`) are handled in exactly one place.
     function patchTask(patch, okText, onOk) {
       var id = selectedRef.current;
-      if (!id || metaBusy) return;
-      setMetaBusy(true);
-      setMetaNote({ kind: "", text: "" });
+      if (!id || cardBusy) return;
+      setCardBusy(true);
+      setNote({ kind: "", text: "" });
       fetchJSON(
         KANBAN_API + "/tasks/" + encodeURIComponent(id) + "?board=" +
         encodeURIComponent(boardOf(id)),
@@ -1229,9 +1188,9 @@ function Page() {
           body: JSON.stringify(patch),
         }
       ).then(function (r) {
-        setMetaBusy(false);
+        setCardBusy(false);
         if (r.__error || r.detail || !r.task) {
-          setMetaNote({
+          setNote({
             kind: "err",
             // 409 carries the actionable refusal text (e.g. which parent blocks
             // `ready`), so `detail` is preferred over our generic text.
@@ -1239,16 +1198,16 @@ function Page() {
           });
           return;
         }
-        setMetaNote({ kind: "ok", text: okText });
+        setNote({ kind: "ok", text: okText });
         if (onOk) onOk(r.task);
         setTimeout(function () {
-          setMetaNote(function (n) {
+          setNote(function (n) {
             return n.kind === "ok" ? { kind: "", text: "" } : n;
           });
         }, 2500);
       }).catch(function (e) {
-        setMetaBusy(false);
-        setMetaNote({ kind: "err", text: String((e && e.message) || e) });
+        setCardBusy(false);
+        setNote({ kind: "err", text: String((e && e.message) || e) });
       });
     }
 
@@ -1267,17 +1226,87 @@ function Page() {
       });
     }
 
+    function saveDesc() {
+      patchTask({ body: descDraft }, "описание сохранено", function (task) {
+        setDescField("body", task.body || "");
+        setDescEdit(false);
+      });
+    }
+
+    function onDescKeyDown(e) {
+      // Ctrl/Cmd+Enter saves, Esc leaves the editor — same keys as the comment
+      // composer, so the two panes behave alike.
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        saveDesc();
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        cancelDescEdit();
+      }
+    }
+
+    // --- Title: the pencil next to the title --------------------------------
+    // The pencil opens an input; while it is open the pencil becomes "✓"
+    // (save). The list on the left shows the new title on the next poll, and
+    // the header here updates at once.
+    function startTitleEdit() {
+      if (!desc) return;
+      setTitleDraft(desc.title || "");
+      setNote({ kind: "", text: "" });
+      setTitleEdit(true);
+    }
+
+    function cancelTitleEdit() {
+      setTitleEdit(false);
+      setTitleDraft(desc ? desc.title || "" : "");
+      setNote({ kind: "", text: "" });
+    }
+
+    function saveTitle() {
+      var raw = (titleDraft || "").trim();
+      if (!raw) {
+        setNote({ kind: "err", text: "заголовок не может быть пустым" });
+        return;
+      }
+      if (raw === (desc ? desc.title || "" : "")) {
+        // Nothing to write — a PATCH would only add an `edited` event.
+        setTitleEdit(false);
+        setNote({ kind: "", text: "" });
+        return;
+      }
+      patchTask({ title: raw }, "заголовок сохранён", function (task) {
+        setDescField("title", task.title || raw);
+        setTitleEdit(false);
+      });
+    }
+
+    function onTitleKeyDown(e) {
+      // Enter saves (a title is one line — no newline to keep), Esc cancels.
+      if (e.key === "Enter") {
+        e.preventDefault();
+        saveTitle();
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        cancelTitleEdit();
+      }
+    }
+
+    // --- Priority: the pencil next to the priority value --------------------
     function startMetaEdit() {
       if (!desc) return;
       setMetaDraft(String(desc.priority || 0));
-      setMetaNote({ kind: "", text: "" });
+      setNote({ kind: "", text: "" });
       setMetaEdit(true);
     }
 
     function cancelMetaEdit() {
       setMetaEdit(false);
       setMetaDraft(desc ? String(desc.priority || 0) : "0");
-      setMetaNote({ kind: "", text: "" });
+      setNote({ kind: "", text: "" });
     }
 
     // An empty / non-numeric field would send NaN, and `Number("")||0` would
@@ -1285,7 +1314,7 @@ function Page() {
     function saveMeta() {
       var raw = (metaDraft || "").trim();
       if (!/^-?\d+$/.test(raw)) {
-        setMetaNote({ kind: "err", text: "приоритет — целое число (сейчас «" + raw + "»)" });
+        setNote({ kind: "err", text: "приоритет — целое число (сейчас «" + raw + "»)" });
         return;
       }
       var n = parseInt(raw, 10);
@@ -2243,27 +2272,135 @@ function Page() {
       composer
     );
 
-    // --- Description pane --------------------------------------------------
-    // The task body, read-only until "редактировать" flips the same node into a
-    // textarea; Ctrl/Cmd+Enter saves, Esc cancels.
-    var descView;
+    // --- "Основное" pane ---------------------------------------------------
+    // The whole card in one place: the title (editable), the meta line, the
+    // body (editable), the priority and the state.
+    //
+    // The two pencils do the editing IN PLACE, next to the value they change:
+    // "✎" opens the field, "✓" saves it, "✕" cancels. Nothing is hidden in a
+    // separate mode, so the value is always on screen and always readable.
+    var STATUS_BUTTONS = [
+      { value: "triage", label: "→ triage", title: "вернуть в разбор" },
+      { value: "todo", label: "→ todo", title: "в бэклог" },
+      { value: "ready", label: "→ ready", title: "поставить в очередь на запуск" },
+      { value: "scheduled", label: "→ scheduled", title: "отложить (ждёт времени)" },
+      { value: "blocked", label: "→ blocked", title: "заблокировать (отпустит claim воркера)" },
+      { value: "review", label: "→ review", title: "отправить на проверку" },
+      { value: "done", label: "→ done", title: "завершить (отпустит claim воркера)" },
+      { value: "archived", label: "→ archived", title: "в архив" },
+    ];
+
+    // The pencil that opens a field. While the field is open the pencil turns
+    // into the save ("✓"); the cancel ("✕") sits next to it. The button keeps
+    // its size so the row does not jump when it changes its glyph.
+    function pencilBtn(edit, onOpen, onSave, onCancel, title, cls) {
+      return el(
+        "span",
+        { className: "hlv-pencil-group" + (cls ? " " + cls : "") },
+        el("button", {
+          type: "button",
+          className: "hlv-pencil" + (edit ? " hlv-pencil-on" : ""),
+          disabled: cardBusy || (!edit && !desc),
+          title: edit ? title + " (Enter — сохранить, Esc — отмена)" : title,
+          onClick: edit ? onSave : onOpen,
+        }, edit ? "✓" : "✎"),
+        edit ? el("button", {
+          type: "button",
+          className: "hlv-pencil hlv-pencil-cancel",
+          disabled: cardBusy,
+          title: "отмена",
+          onClick: onCancel,
+        }, "✕") : null
+      );
+    }
+
+    var mainView;
     if (!selected) {
-      descView = el("div", { className: "hlv-empty" }, "выберите задачу слева");
+      mainView = el("div", { className: "hlv-empty" }, "выберите задачу слева");
     } else if (!desc) {
-      descView = el("div", { className: "hlv-empty" }, "загрузка описания…");
+      mainView = el("div", { className: "hlv-empty" }, "загрузка…");
     } else {
-      descView = el(
+      var curStatus = desc.status;
+      // The title row: the title itself, the pencil that edits it, and the
+      // meta line (status, assignee, workspace, time limit).
+      var titleRow = el(
         "div",
-        { className: "hlv-log hlv-desc" },
+        { className: "hlv-main-title-row" },
+        titleEdit
+          ? el("input", {
+              className: "hlv-input hlv-title-input",
+              type: "text",
+              value: titleDraft,
+              autoFocus: true,
+              "aria-label": "заголовок задачи",
+              onChange: function (e) { setTitleDraft(e.target.value); },
+              onKeyDown: onTitleKeyDown,
+            })
+          : el("span", { className: "hlv-desc-title" }, desc.title || desc.id),
+        pencilBtn(
+          titleEdit,
+          startTitleEdit,
+          saveTitle,
+          cancelTitleEdit,
+          "править заголовок задачи"
+        )
+      );
+      mainView = el(
+        "div",
+        // `hlv-card`, not `hlv-main`: the layout wrapper owns `.hlv-main`, and
+        // its `display: flex` (row) rule would lay this pane's children out
+        // side by side instead of stacked.
+        { className: "hlv-log hlv-card" },
         el("div", { className: "hlv-desc-head" },
-          el("span", { className: "hlv-desc-title" }, desc.title || desc.id),
+          titleRow,
           el("span", { className: "hlv-desc-meta" },
-            el("span", { className: statusClass(desc.status) }, STATUS_LABEL[desc.status] || desc.status),
+            el("span", { className: statusClass(curStatus) },
+              STATUS_LABEL[curStatus] || curStatus),
             desc.assignee ? el("span", null, "@" + desc.assignee) : null,
             el("span", null, "воркспейс: " + desc.workspace),
             el("span", {
               title: "лимит времени воркера; 0 = бесконечно",
             }, "время: " + (desc.runtime ? desc.runtime + " с" : "∞"))
+          )
+        ),
+        el("div", { className: "hlv-field-row" },
+          el("span", { className: "hlv-field-label" }, "приоритет"),
+          metaEdit
+            ? el("input", {
+                className: "hlv-input hlv-prio-input",
+                type: "number",
+                step: "1",
+                value: metaDraft,
+                autoFocus: true,
+                "aria-label": "приоритет задачи",
+                onChange: function (e) { setMetaDraft(e.target.value); },
+                onKeyDown: onMetaKeyDown,
+              })
+            : el("span", { className: "hlv-prio-value" },
+                String(desc.priority == null ? 0 : desc.priority)),
+          pencilBtn(
+            metaEdit,
+            startMetaEdit,
+            saveMeta,
+            cancelMetaEdit,
+            "править приоритет (Ctrl+Enter — сохранить, Esc — отмена)"
+          ),
+          el("span", { className: "hlv-field-hint" },
+            "чем выше, тем раньше воркер возьмёт задачу; порядок ready — как в диспетчере")
+        ),
+        el("div", { className: "hlv-field-row" },
+          el("span", { className: "hlv-field-label" }, "состояние"),
+          el("div", { className: "hlv-status-btns" },
+            STATUS_BUTTONS.map(function (b) {
+              return el("button", {
+                key: b.value,
+                type: "button",
+                className: "hlv-btn" + (curStatus === b.value ? " hlv-btn-current" : ""),
+                title: b.title,
+                disabled: cardBusy || curStatus === b.value,
+                onClick: function () { setStatus(b.value); },
+              }, b.label);
+            })
           )
         ),
         descEdit
@@ -2281,15 +2418,18 @@ function Page() {
       );
     }
 
-    var descActions = el(
+    // One action row under the card. It carries the note of the last write
+    // (success or refusal) and the two body buttons — the description editor
+    // has its own buttons, but the title and the priority are edited in place.
+    var mainActions = el(
       "div",
       { className: "hlv-desc-actions" },
-      descNote.text ? el("span", { className: "hlv-desc-note " + descNote.kind }, descNote.text) : null,
+      note.text ? el("span", { className: "hlv-desc-note " + note.kind }, note.text) : null,
       descEdit
         ? el("button", {
             type: "button",
             className: "hlv-btn",
-            disabled: descBusy,
+            disabled: cardBusy,
             onClick: cancelDescEdit,
           }, "отмена")
         : el("button", {
@@ -2302,122 +2442,16 @@ function Page() {
       descEdit ? el("button", {
         type: "button",
         className: "hlv-btn hlv-btn-primary",
-        disabled: descBusy,
+        disabled: cardBusy,
         onClick: saveDesc,
-      }, descBusy ? "сохранение…" : "сохранить") : null
+      }, cardBusy ? "сохранение…" : "сохранить") : null
     );
 
-    var descriptionView = el(
+    var mainPane = el(
       "div",
       { className: "hlv-desc-wrap" },
-      descView,
-      descActions
-    );
-
-    // --- "Прочее" pane ------------------------------------------------------
-    // The controls the description pane has no room for: priority and status.
-    // Both write through PATCH /tasks/{id} on the bundled kanban plugin, so no
-    // route is added here and the tab works without a dashboard restart.
-    //
-    // The status set is exactly what that route accepts. `running` is absent by
-    // design: the route rejects it with 400 (#19535) because a task may only
-    // enter running through the dispatcher's claim path — offering the button
-    // would only ever produce a refusal.
-    var STATUS_BUTTONS = [
-      { value: "triage", label: "→ triage", title: "вернуть в разбор" },
-      { value: "todo", label: "→ todo", title: "в бэклог" },
-      { value: "ready", label: "→ ready", title: "поставить в очередь на запуск" },
-      { value: "scheduled", label: "→ scheduled", title: "отложить (ждёт времени)" },
-      { value: "blocked", label: "→ blocked", title: "заблокировать (отпустит claim воркера)" },
-      { value: "review", label: "→ review", title: "отправить на проверку" },
-      { value: "done", label: "→ done", title: "завершить (отпустит claim воркера)" },
-      { value: "archived", label: "→ archived", title: "в архив" },
-    ];
-
-    var otherView;
-    if (!selected) {
-      otherView = el("div", { className: "hlv-empty" }, "выберите задачу слева");
-    } else if (!desc) {
-      otherView = el("div", { className: "hlv-empty" }, "загрузка…");
-    } else {
-      var curStatus = desc.status;
-      otherView = el(
-        "div",
-        { className: "hlv-log hlv-other" },
-        el("div", { className: "hlv-desc-head" },
-          el("span", { className: "hlv-desc-title" }, desc.title || desc.id),
-          el("span", { className: "hlv-desc-meta" },
-            el("span", { className: statusClass(curStatus) },
-              STATUS_LABEL[curStatus] || curStatus),
-            desc.assignee ? el("span", null, "@" + desc.assignee) : null,
-            el("span", null, "воркспейс: " + desc.workspace))
-        ),
-        el("div", { className: "hlv-field-row" },
-          el("span", { className: "hlv-field-label" }, "приоритет"),
-          metaEdit
-            ? el("input", {
-                className: "hlv-input hlv-prio-input",
-                type: "number",
-                step: "1",
-                value: metaDraft,
-                autoFocus: true,
-                onChange: function (e) { setMetaDraft(e.target.value); },
-                onKeyDown: onMetaKeyDown,
-              })
-            : el("span", { className: "hlv-prio-value" },
-                String(desc.priority == null ? 0 : desc.priority)),
-          el("span", { className: "hlv-field-hint" },
-            "чем выше, тем раньше воркер возьмёт задачу; порядок ready — как в диспетчере")
-        ),
-        el("div", { className: "hlv-field-row" },
-          el("span", { className: "hlv-field-label" }, "состояние"),
-          el("div", { className: "hlv-status-btns" },
-            STATUS_BUTTONS.map(function (b) {
-              return el("button", {
-                key: b.value,
-                type: "button",
-                className: "hlv-btn" + (curStatus === b.value ? " hlv-btn-current" : ""),
-                title: b.title,
-                disabled: metaBusy || curStatus === b.value,
-                onClick: function () { setStatus(b.value); },
-              }, b.label);
-            })
-          )
-        )
-      );
-    }
-
-    var otherActions = el(
-      "div",
-      { className: "hlv-desc-actions" },
-      metaNote.text ? el("span", { className: "hlv-desc-note " + metaNote.kind }, metaNote.text) : null,
-      metaEdit
-        ? el("button", {
-            type: "button",
-            className: "hlv-btn",
-            disabled: metaBusy,
-            onClick: cancelMetaEdit,
-          }, "отмена")
-        : el("button", {
-            type: "button",
-            className: "hlv-btn",
-            disabled: !desc,
-            onClick: startMetaEdit,
-            title: "править приоритет (Ctrl+Enter — сохранить, Esc — отмена)",
-          }, "править приоритет"),
-      metaEdit ? el("button", {
-        type: "button",
-        className: "hlv-btn hlv-btn-primary",
-        disabled: metaBusy,
-        onClick: saveMeta,
-      }, metaBusy ? "сохранение…" : "сохранить") : null
-    );
-
-    var otherPane = el(
-      "div",
-      { className: "hlv-desc-wrap" },
-      otherView,
-      otherActions
+      mainView,
+      mainActions
     );
 
     // Tab bar above the right pane.
@@ -2437,24 +2471,17 @@ function Page() {
         }, "комментарии" + (comments.length ? " · " + comments.length : "")),
         el("button", {
           type: "button",
-          className: "hlv-tab" + (pane === "description" ? " active" : ""),
-          onClick: function () { setPane("description"); },
-          title: "описание задачи (тело карточки), с редактированием",
-        }, "дескрипшен"),
-        el("button", {
-          type: "button",
-          className: "hlv-tab" + (pane === "other" ? " active" : ""),
-          onClick: function () { setPane("other"); },
-          title: "приоритет и состояние задачи",
-        }, "прочее"),
+          className: "hlv-tab" + (pane === "main" ? " active" : ""),
+          onClick: function () { setPane("main"); },
+          title: "карточка задачи: заголовок, описание, приоритет и состояние",
+        }, "основное"),
         el("div", { className: "hlv-tabs-right" },
           sizeInfo,
           expandBtn
         )
       ),
       pane === "log" ? logPane
-        : pane === "description" ? descriptionView
-        : pane === "other" ? otherPane
+        : pane === "main" ? mainPane
         : commentsView
     );
 

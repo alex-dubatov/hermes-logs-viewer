@@ -291,16 +291,24 @@ const TEST_ASSIGNEE = "default";
   check("скругления убраны везде", nonZeroRadius.length === 0,
     nonZeroRadius.length ? "осталось: " + nonZeroRadius.join(" | ") : "0 не нулевых");
 
-  // --- 5. description tab exists and loads -----------------------------
+  // --- 5. "основное" tab exists and loads ------------------------------
   const tabs = $$(".hlv-tab").map((t) => (t.textContent || "").trim());
-  check("вкладка «дескрипшен» присутствует", tabs.some((t) => t.indexOf("дескрипшен") === 0),
+  check("вкладка «основное» присутствует", tabs.some((t) => t.indexOf("основное") === 0),
+    JSON.stringify(tabs));
+  check("вкладки «дескрипшен» и «прочее» больше нет",
+    !tabs.some((t) => t.indexOf("дескрипшен") === 0 || t.indexOf("прочее") === 0),
     JSON.stringify(tabs));
 
-  click(findButton("дескрипшен"));
+  click(findButton("основное"));
   await sleep(1500);
   const descTitle = $(".hlv-desc-title");
-  check("описание загрузилось", !!descTitle, descTitle ? descTitle.textContent : "нет .hlv-desc-title");
+  check("карточка загрузилась", !!descTitle, descTitle ? descTitle.textContent : "нет .hlv-desc-title");
   check("кнопка «редактировать» есть", !!findButton("редактировать"));
+  // The merged pane carries what used to live in "прочее".
+  check("в «основном» есть приоритет", !!$(".hlv-prio-value"),
+    $(".hlv-prio-value") ? $(".hlv-prio-value").textContent : "нет .hlv-prio-value");
+  check("в «основном» есть кнопки состояний", $$(".hlv-status-btns .hlv-btn").length >= 8,
+    $$(".hlv-status-btns .hlv-btn").length + " кнопок");
 
   // Live body round-trip: open the editor, type a marker, save, re-read.
   const bodyBefore = $(".hlv-desc-body");
@@ -1814,11 +1822,11 @@ const TEST_ASSIGNEE = "default";
     await sleep(500);
   }
 
-  // --- 12. "прочее" tab: priority + status --------------------------------
-  // Driven against a throwaway card so both writes (priority, status) are real
-  // and reversible: the card is hard-deleted at the end, so a failed run leaves
-  // no debris. Nothing here is checked against a re-implementation of the UI —
-  // the priority is re-read from the server after the write.
+  // --- 12. "основное" tab: title + priority + status ----------------------
+  // Driven against a throwaway card so every write (title, priority, status)
+  // is real and reversible: the card is hard-deleted at the end, so a failed
+  // run leaves no debris. Nothing here is checked against a re-implementation
+  // of the UI — the values are re-read from the server after the write.
   {
     // Earlier sections drive the board selector, so the list may be showing one
     // board. The throwaway card goes on `default`; without switching the filter
@@ -1833,8 +1841,8 @@ const TEST_ASSIGNEE = "default";
     const b0 = await fetchJSON("/api/plugins/kanban/boards");
     const defaultBoard = (b0.boards || []).find((b) => b.slug === "default") ||
       (b0.boards || [])[0];
-    check("вкладка «прочее» присутствует",
-      $$(".hlv-tab").some((t) => (t.textContent || "").trim().indexOf("прочее") === 0),
+    check("вкладка «основное» на месте",
+      $$(".hlv-tab").some((t) => (t.textContent || "").trim().indexOf("основное") === 0),
       $$(".hlv-tab").map((t) => (t.textContent || "").trim()).join(" | "));
 
     let made = null;
@@ -1846,7 +1854,7 @@ const TEST_ASSIGNEE = "default";
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             title: "hlv-prochee-" + Date.now(),
-            body: "временная карточка для проверки вкладки «прочее»",
+            body: "временная карточка для проверки вкладки «основное»",
             // `triage: true` because CreateTaskBody has NO `status` field: the
             // card is born `ready`, i.e. dispatchable, and the dispatcher could
             // claim it and start a real worker. Landing in triage keeps it out
@@ -1885,12 +1893,36 @@ const TEST_ASSIGNEE = "default";
         sel.click();
         await sleep(800);
       }
-      click(findButton("прочее"));
+      click(findButton("основное"));
       await sleep(1500);
 
-      const pane = $(".hlv-other");
-      check("панель «прочее» открылась", !!pane,
-        pane ? "ok" : "нет .hlv-other");
+      // The pane must be selected by its OWN class. `.hlv-main` is the layout
+      // wrapper (left column + right pane), so querying it here matched the
+      // wrapper and passed even when the pane was missing — a false positive
+      // that hid a class-name collision in the stylesheet.
+      const pane = $(".hlv-card");
+      check("панель «основное» открылась", !!pane,
+        pane ? "ok" : "нет .hlv-card");
+
+      // --- The pane must NOT share a class with the layout wrapper ---------
+      // The pane and the wrapper (`.hlv-main`, the left column + right pane)
+      // used to carry the same class. The wrapper's rule sets `display: flex`
+      // with a row direction, so the pane's children landed side by side in
+      // one line and the whole card became unreadable. The check is on the
+      // CLASS LIST, not on a computed style: jsdom does not lay out, so the
+      // collision is invisible to a rendering assertion here — but a shared
+      // class name is the root cause and is fully checkable.
+      const wrapper = $(".hlv-main");
+      check("обёртка макета на месте", !!wrapper,
+        wrapper ? "ok" : "нет .hlv-main");
+      const paneClasses = pane ? (pane.className || "").split(/\s+/) : [];
+      const wrapperClasses = wrapper ? (wrapper.className || "").split(/\s+/) : [];
+      const shared = paneClasses.filter((c) => wrapperClasses.indexOf(c) !== -1);
+      check("панель не делит класс с обёрткой макета", shared.length === 0,
+        shared.length ? "общий класс: " + shared.join(", ") : "панель=" + paneClasses.join("+"));
+      check("панель не использует класс обёртки hlv-main",
+        paneClasses.indexOf("hlv-main") === -1,
+        paneClasses.join("+"));
 
       // Priority: the value must be READ from the task, not invented.
       const shown = $(".hlv-prio-value");
@@ -1902,17 +1934,34 @@ const TEST_ASSIGNEE = "default";
         shown ? "в панели " + shown.textContent + ", на доске " + serverBefore.priority
               : "нет .hlv-prio-value");
 
-      // Round-trip a priority through the editor.
+      // Round-trip a priority through the pencil next to the value.
+      //
+      // The pencil is the ONLY way into the field now (there is no
+      // "править приоритет" button any more), so the test drives the same
+      // control the user does: click ✎, type, click ✓.
       const WANT = 42;
-      if (findButton("править приоритет")) {
-        click(findButton("править приоритет"));
+      const prioPencil = $$(".hlv-pencil").find((b) => {
+        const row = b.closest(".hlv-field-row");
+        return row && /приоритет/.test(row.textContent || "");
+      });
+      check("карандаш у приоритета есть", !!prioPencil,
+        prioPencil ? "найден" : "нет .hlv-pencil рядом с «приоритет»");
+      if (prioPencil) {
+        click(prioPencil);
         await sleep(400);
         const input = $(".hlv-prio-input");
         check("поле приоритета открылось", !!input);
         if (input) {
           setInputValue(input, String(WANT));
           await sleep(200);
-          click(findButton("сохранить"));
+          // The pencil turned into the save button (✓).
+          const savePencil = $$(".hlv-pencil").find((b) => (b.textContent || "").trim() === "✓");
+          check("карандаш превратился в кнопку сохранения", !!savePencil);
+          if (savePencil) {
+            click(savePencil);
+          } else {
+            click(findButton("сохранить"));
+          }
           await sleep(2000);
           const after = (await fetchJSON(
             "/api/plugins/kanban/tasks/" + encodeURIComponent(made.id) +
@@ -1924,19 +1973,94 @@ const TEST_ASSIGNEE = "default";
             !!$(".hlv-prio-value") && Number($(".hlv-prio-value").textContent) === WANT,
             $(".hlv-prio-value") ? $(".hlv-prio-value").textContent : "нет значения");
         }
-      } else {
-        check("кнопка «править приоритет» есть", false, "не найдена");
+      }
+
+      // --- Title: the pencil next to the title -----------------------------
+      // The title is edited IN PLACE: the pencil opens an input next to the
+      // title, the save writes it, and the card's own title on the server
+      // must change. An empty title must be refused — the route answers 400
+      // ("title cannot be empty"), and the pane has to show that refusal.
+      const titlePencil = $$(".hlv-pencil").find((b) => {
+        const row = b.closest(".hlv-main-title-row");
+        return !!row;
+      });
+      check("карандаш у заголовка есть", !!titlePencil,
+        titlePencil ? "найден" : "нет .hlv-pencil рядом с заголовком");
+      const WANT_TITLE = "hlv-заголовок-" + Date.now();
+      if (titlePencil) {
+        click(titlePencil);
+        await sleep(400);
+        const tInput = $(".hlv-title-input");
+        check("поле заголовка открылось", !!tInput);
+        if (tInput) {
+          setInputValue(tInput, WANT_TITLE);
+          await sleep(200);
+          const saveT = $$(".hlv-pencil").find((b) => (b.textContent || "").trim() === "✓");
+          check("у заголовка тоже есть кнопка сохранения", !!saveT);
+          if (saveT) {
+            click(saveT);
+            await sleep(2000);
+            const afterT = (await fetchJSON(
+              "/api/plugins/kanban/tasks/" + encodeURIComponent(made.id) +
+              "?board=" + encodeURIComponent(defaultBoard.slug))).task;
+            check("заголовок сохранился через bundled PATCH",
+              afterT && afterT.title === WANT_TITLE,
+              afterT ? "на доске «" + afterT.title + "»" : "нет задачи");
+            check("заголовок обновился в панели",
+              !!$(".hlv-desc-title") &&
+              ($(".hlv-desc-title").textContent || "") === WANT_TITLE,
+              $(".hlv-desc-title") ? $(".hlv-desc-title").textContent : "нет заголовка");
+          }
+        }
+      }
+
+      // An empty title must be refused, not written as an empty card title.
+      const titlePencil2 = $$(".hlv-pencil").find((b) => {
+        const row = b.closest(".hlv-main-title-row");
+        return !!row;
+      });
+      if (titlePencil2) {
+        click(titlePencil2);
+        await sleep(400);
+        const tInput2 = $(".hlv-title-input");
+        if (tInput2) {
+          setInputValue(tInput2, "   ");
+          await sleep(200);
+          const saveT2 = $$(".hlv-pencil").find((b) => (b.textContent || "").trim() === "✓");
+          if (saveT2) { click(saveT2); await sleep(1500); }
+          const afterEmpty = (await fetchJSON(
+            "/api/plugins/kanban/tasks/" + encodeURIComponent(made.id) +
+            "?board=" + encodeURIComponent(defaultBoard.slug))).task;
+          check("пустой заголовок не записан",
+            afterEmpty && afterEmpty.title === WANT_TITLE,
+            afterEmpty ? "на доске «" + afterEmpty.title + "»" : "нет задачи");
+          const cancelT = $$(".hlv-pencil").find((b) => (b.textContent || "").trim() === "✕");
+          if (cancelT) { click(cancelT); await sleep(400); }
+        }
       }
 
       // Non-numeric input must be refused, not silently written as 0.
-      if (findButton("править приоритет")) {
-        click(findButton("править приоритет"));
+      //
+      // Same route as the round-trip above: the pencil opens the field, the
+      // pencil saves it. The refusal must be SHOWN — an empty/garbage value
+      // that silently became 0 would overwrite a real priority.
+      const prioPencil2 = $$(".hlv-pencil").find((b) => {
+        const row = b.closest(".hlv-field-row");
+        return row && /приоритет/.test(row.textContent || "");
+      });
+      if (prioPencil2) {
+        click(prioPencil2);
         await sleep(400);
         const input2 = $(".hlv-prio-input");
         if (input2) {
           setInputValue(input2, "не число");
           await sleep(200);
-          click(findButton("сохранить"));
+          const savePencil2 = $$(".hlv-pencil").find((b) => (b.textContent || "").trim() === "✓");
+          if (savePencil2) {
+            click(savePencil2);
+          } else {
+            click(findButton("сохранить"));
+          }
           await sleep(1200);
           const note = $(".hlv-desc-note.err");
           check("нечисловой приоритет отклонён с объяснением",
@@ -1948,8 +2072,13 @@ const TEST_ASSIGNEE = "default";
           check("при отказе значение на доске не изменилось",
             still && still.priority === WANT,
             still ? "priority=" + still.priority : "нет задачи");
-          const cancel = findButton("отмена");
-          if (cancel) { click(cancel); await sleep(400); }
+          // Close the open field: the cancel pencil (✕).
+          const cancelPencil = $$(".hlv-pencil").find((b) => (b.textContent || "").trim() === "✕");
+          if (cancelPencil) { click(cancelPencil); await sleep(400); }
+          else {
+            const cancel = findButton("отмена");
+            if (cancel) { click(cancel); await sleep(400); }
+          }
         }
       }
 
@@ -1965,7 +2094,7 @@ const TEST_ASSIGNEE = "default";
       // before the priority tests: a stale read would pick a target button that
       // the card may have reached in the meantime, and that button is
       // legitimately disabled — the check would fail for the right behaviour.
-      const cur = ($(".hlv-other .hlv-status") || {}).textContent || "";
+      const cur = ($(".hlv-card .hlv-status") || {}).textContent || "";
       const curLabel = "→ " + cur.trim();
       const curBtn = btns.find((b) => (b.textContent || "").trim() === curLabel);
       check("кнопка текущего состояния неактивна",

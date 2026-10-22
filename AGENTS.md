@@ -50,6 +50,8 @@ with no build step; backend: one Python route file (`dashboard/plugin_api.py`).
 | `node tests/render_test.js` | основной стенд: jsdom + живой дашборд, клики по настоящему UI |
 | `node tests/render_test.js /tmp/served/dist/index.js` | то же против задеплоенной копии |
 | `PLAYWRIGHT_PATH=… CHROME_PATH=… node tests/carousel_test.js` | узкая вёрстка в настоящем Chromium |
+| `PLAYWRIGHT_PATH=… CHROME_PATH=… node tools/pane_layout_check.js` | геометрия вкладки «основное» в настоящем Chromium |
+| `node tools/css_probe.js` | та же проверка без браузера: CSS-движок над настоящей таблицей стилей |
 | `node tools/board_probe.js` / `tools/board_label_fit.js` | пробы селектора досок |
 | `env -u HERMES_HOME python3 tools/anchor_probe.py ff ff-front` | якорь проекта на стороне ядра |
 
@@ -102,6 +104,12 @@ curl -s -c /tmp/hlv.cookies -X POST http://127.0.0.1:9119/auth/password-login \
 - **Никаких `border-radius`** — стиль дашборда прямой; проверка в
   `tests/render_test.js` ищет любое ненулевое значение.
 - **CSS — только через переменные дашборда** (`var(--color-border)` и т. п.).
+- **Класс не должен доставаться двум разным элементам.** Панель «основное» и
+  обёртка макета одно время носили класс `hlv-main`, и правило обёртки
+  (`display: flex` + строка) раскладывало элементы карточки в одну строку.
+  jsdom не верстает, поэтому стенд на нём такой баг **не видит** — проверяй
+  геометрию через `tools/pane_layout_check.js` (Chromium) или `tools/css_probe.js`
+  (CSS-движок).
 - **Большую часть бэкенда своего плагина не иметь.** Списки досок, профили,
   создание задачи, описание и лог берутся из `/api/plugins/kanban/…`: его
   роутер монтируется при старте процесса и потому **всегда живой**, а новый

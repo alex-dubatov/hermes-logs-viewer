@@ -97,8 +97,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   check("search: очистка вернула полный список", s >= 10, s + " строк");
 
   // --- description.png --------------------------------------------------
-  const tab = await page.$('.hlv-pane-tab:has-text("дескрипшен")')
-    || await page.$('button:has-text("дескрипшен")');
+  const tab = await page.$('.hlv-pane-tab:has-text("основное")')
+    || await page.$('button:has-text("основное")');
   check("description: вкладка найдена", !!tab);
   if (tab) {
     await tab.click();
@@ -106,7 +106,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     // `:has-text()` is a Playwright selector and does not exist inside the
     // page, so the edit button is matched over the DOM nodes instead.
     s = await page.evaluate(() => {
-      const pane = document.querySelector(".hlv-desc");
+      const pane = document.querySelector(".hlv-card");
       const edit = Array.from(document.querySelectorAll(".hlv-btn"))
         .find((b) => /редактировать/i.test(b.textContent));
       return { text: (pane ? pane.textContent : "").trim(), edit: !!edit };
