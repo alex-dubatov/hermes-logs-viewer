@@ -151,6 +151,71 @@ const check = (name, ok, extra) => {
       !m.paneClass.split(/\s+/).includes("hlv-main"), m.paneClass);
   }
 
+  // --- Pencil placement -------------------------------------------------
+  // The card is edited IN PLACE: the pencil (✎ → ✓/✕) sits NEXT TO the value
+  // it changes — to the RIGHT of the priority number and to the right of the
+  // title. This is a layout promise, and jsdom does no layout, so it can only
+  // be checked here, in a real browser.
+  //
+  // A pencil that ended up LEFT of the value (or on its own line) would read
+  // as a separate control instead of "this pencil edits this number".
+  const pencils = await page.evaluate(() => {
+    const out = {};
+    const prioRow = Array.from(document.querySelectorAll(".hlv-field-row"))
+      .find((r) => /приоритет/.test(r.textContent || ""));
+    if (prioRow) {
+      const v = prioRow.querySelector(".hlv-prio-value");
+      const p = prioRow.querySelector(".hlv-pencil");
+      if (v && p) {
+        const vr = v.getBoundingClientRect();
+        const pr = p.getBoundingClientRect();
+        out.priority = {
+          value: v.textContent,
+          valueRight: Math.round(vr.right),
+          pencilLeft: Math.round(pr.left),
+          // The pencil must start at or after the value's right edge.
+          rightOf: pr.left >= vr.right - 1,
+          // ...and stay on the SAME line — a pencil that wrapped below would
+          // no longer read as "next to the value".
+          sameLine: Math.abs(pr.top + pr.height / 2 - (vr.top + vr.height / 2)) < 6,
+        };
+      }
+    }
+    const tRow = document.querySelector(".hlv-main-title-row");
+    if (tRow) {
+      const t = tRow.querySelector(".hlv-desc-title");
+      const p = tRow.querySelector(".hlv-pencil");
+      if (t && p) {
+        const tr = t.getBoundingClientRect();
+        const pr = p.getBoundingClientRect();
+        out.title = {
+          valueRight: Math.round(tr.right),
+          pencilLeft: Math.round(pr.left),
+          rightOf: pr.left >= tr.right - 1,
+          sameLine: Math.abs(pr.top + pr.height / 2 - (tr.top + tr.height / 2)) < 6,
+        };
+      }
+    }
+    return out;
+  });
+
+  check("карандаш у приоритета стоит СПРАВА от значения",
+    !!pencils.priority && pencils.priority.rightOf && pencils.priority.sameLine,
+    pencils.priority
+      ? "значение «" + pencils.priority.value + "» до x=" + pencils.priority.valueRight +
+        ", карандаш с x=" + pencils.priority.pencilLeft +
+        (pencils.priority.rightOf ? "" : " — СЛЕВА!") +
+        (pencils.priority.sameLine ? "" : " — на другой строке!")
+      : "не нашлись значение приоритета и карандаш");
+  check("карандаш у заголовка стоит СПРАВА от заголовка",
+    !!pencils.title && pencils.title.rightOf && pencils.title.sameLine,
+    pencils.title
+      ? "заголовок до x=" + pencils.title.valueRight +
+        ", карандаш с x=" + pencils.title.pencilLeft +
+        (pencils.title.rightOf ? "" : " — СЛЕВА!") +
+        (pencils.title.sameLine ? "" : " — на другой строке!")
+      : "не нашлись заголовок и карандаш");
+
   // --- Narrow viewport --------------------------------------------------
   // Below 1023px the layout switches to a column (list on top, pane below).
   // The pane must keep its stacked layout there too — the media query turns
