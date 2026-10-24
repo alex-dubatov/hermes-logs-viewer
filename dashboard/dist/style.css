@@ -639,6 +639,100 @@
   min-height: 0;
 }
 
+/* Live transcript ------------------------------------------------ */
+/* The conversation of the card, read from the owner profile's store:
+   one block per message, role in the heading, body in a <pre>. */
+.hlv-transcript {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.hlv-transcript-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  font-size: 0.68rem;
+  color: var(--color-muted-foreground);
+  font-variant-numeric: tabular-nums;
+}
+
+.hlv-transcript-store {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  word-break: break-all;
+}
+
+.hlv-transcript-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+}
+
+.hlv-transcript-msg {
+  border: 1px solid var(--color-border);
+  border-radius: 0;
+  background: var(--color-card);
+  padding: 8px 10px;
+}
+
+/* The role tints the block's left edge, so a run of tool calls reads as a
+   run of tool calls without reading a single heading. */
+.hlv-role-user {
+  border-left: 3px solid var(--color-ring, var(--color-success));
+}
+
+.hlv-role-assistant {
+  border-left: 3px solid var(--color-border);
+}
+
+.hlv-role-tool {
+  border-left: 3px solid var(--color-muted-foreground);
+}
+
+.hlv-transcript-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 4px;
+  flex-wrap: wrap;
+}
+
+.hlv-transcript-role {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--color-ring, var(--color-success));
+}
+
+.hlv-transcript-time {
+  font-size: 0.68rem;
+  color: var(--color-muted-foreground);
+  font-variant-numeric: tabular-nums;
+}
+
+.hlv-transcript-cut {
+  font-size: 0.66rem;
+  color: var(--color-muted-foreground);
+  border: 1px solid var(--color-border);
+  padding: 0 4px;
+}
+
+.hlv-transcript-text {
+  margin: 0;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 0.75rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--color-card-foreground, var(--foreground));
+}
+
+.hlv-transcript-empty {
+  font-style: italic;
+  color: var(--color-muted-foreground);
+}
+
 /* Comments thread ------------------------------------------------ */
 .hlv-comments-wrap {
   display: flex;

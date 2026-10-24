@@ -299,6 +299,33 @@ const TEST_ASSIGNEE = "default";
     !tabs.some((t) => t.indexOf("дескрипшен") === 0 || t.indexOf("прочее") === 0),
     JSON.stringify(tabs));
 
+  // --- 5a. the "транскрипт" tab exists and opens -------------------------
+  // The transcript is the card's LIVE conversation, read from the owner
+  // profile's store (the card's log file is nearly empty since v0.22.3 — the
+  // worker client only writes one "Session: …" line into it).
+  //
+  // The tab must be there and it must open; whether messages actually come
+  // back depends on which card is selected and whether that card runs in the
+  // new scheme, so the CONTENT is checked by tools/transcript_check.js in a
+  // real browser against a known live card.
+  check("вкладка «транскрипт» присутствует",
+    tabs.some((t) => t.indexOf("транскрипт") === 0), JSON.stringify(tabs));
+  const trTab = $$(".hlv-tab").find((t) => (t.textContent || "").trim().indexOf("транскрипт") === 0);
+  if (trTab) {
+    click(trTab);
+    await sleep(2500);
+    check("панель транскрипта открылась", !!$(".hlv-transcript"),
+      $(".hlv-transcript") ? "есть .hlv-transcript" : "нет .hlv-transcript");
+    // The pane must never be blank: it says "выберите задачу", "загрузка…",
+    // "транскрипта пока нет" or lists messages — but SOMETHING.
+    const trText = ($(".hlv-transcript") || {}).textContent || "";
+    check("панель транскрипта не пустая", trText.trim().length > 0,
+      trText.trim().slice(0, 60));
+    // Back to the log tab, so the rest of the suite sees the pane it expects.
+    const logTab = $$(".hlv-tab").find((t) => (t.textContent || "").trim().indexOf("лог") === 0);
+    if (logTab) { click(logTab); await sleep(600); }
+  }
+
   click(findButton("основное"));
   await sleep(1500);
   const descTitle = $(".hlv-desc-title");

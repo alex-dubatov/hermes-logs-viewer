@@ -47,6 +47,32 @@ Endpoints:
      read: the core anchors every project-linked workspace on ``primary_path``
      (``kanban_db._resolve_project_link``), so extra folders would be data the
      form has no way to honour.
+
+  GET /transcript?board=default&task_id=t_x&after=<msg_id>&limit=<N>
+        -> {"task_id", "board", "session_id", "store", "source", "messages",
+            "next_after", "has_more"}
+     The LIVE transcript of the selected card — the actual conversation between
+     the agent and its tools.
+
+     WHY THIS ROUTE EXISTS: since v0.22.3 the owner gateway of a profile
+     executes a card, and the dispatcher only starts a thin client that waits
+     for a receipt. That client prints ONE line into the card's log file
+     (``Session: local-<sha256>``), so the worker log — which used to be the
+     full transcript — is now almost empty while the card is still running.
+     The transcript itself did not vanish: it lives in the OWNER PROFILE's
+     session store, and the card's board points at it through the
+     ``owner_admitted`` event (payload: ``session_id`` + ``db``).
+
+     ``source`` says where the answer came from:
+       "owner_session" — the store of the owning profile was read;
+       "worker_log"    — no ``owner_admitted`` event: the card was executed by
+                         the OLD worker process, whose stdout IS the transcript
+                         (the bundled ``/tasks/{id}/log`` route serves it);
+       "none"          — nothing to show (no board, no event, no session).
+
+     ``after`` is a cursor over the store's monotonic message ``id``: pass the
+     last id you have and only newer messages come back. ``next_after`` is the
+     cursor to use next, ``has_more`` says whether the limit was hit.
 """
 
 from __future__ import annotations
@@ -559,5 +585,244 @@ async def add_comment(
         finally:
             con.close()
         return {"ok": True, "id": new_id}
+
+    return await asyncio.to_thread(_run)
+
+
+# --- Live transcript (the owner session's own store) ---------------------
+#
+# Since v0.22.3 the owner gateway of a profile executes a card and the
+# dispatcher only starts a thin client that waits for a receipt. That client
+# prints ONE line into the card's log file ("Session: local-<sha256>"), so the
+# worker log — which used to BE the transcript — is now almost empty while the
+# card is still running. The transcript itself is in the owner profile's
+# session store; the card's board points at it through the `owner_admitted`
+# event (payload: `session_id` + `db`).
+
+# A tool result can be tens of kilobytes. One message at a time is rendered
+# in the pane, so a hard cap keeps the response (and the browser) sane — and
+# the cap is reported back, so the UI can say "обрезано" instead of quietly
+# showing a truncated message as if it were whole.
+_TRANSCRIPT_CONTENT_LIMIT = 4000
+# How many messages one poll returns by default, and the ceiling the caller
+# may ask for.
+_TRANSCRIPT_DEFAULT_LIMIT = 200
+_TRANSCRIPT_MAX_LIMIT = 500
+# The one-line digest shown next to the role.
+_TRANSCRIPT_PREVIEW_LIMIT = 240
+
+
+def _owner_admitted(board: str, task_id: str):
+    """``(session_id, store_path, error)`` for the card's owner session.
+
+    The board records the moment the owner gateway took the card in as a
+    ``task_events`` row of kind ``owner_admitted``; its JSON payload names the
+    session and the profile store that holds it. ``tasks.session_id`` is NULL
+    for such cards, so this event is the only place the link exists.
+
+    The store path comes from the payload and is used as-is: it is written by
+    the kernel next to the session it opened, so guessing a profile by name
+    would be a guess. ``None`` for the store means "no owner session".
+    """
+    db_path = _board_db_path(board)
+    if not db_path.exists():
+        return None, None, f"board '{board}' not found (no {db_path})"
+    try:
+        con = _ro_connect(db_path)
+    except sqlite3.Error as e:
+        return None, None, f"cannot open {db_path}: {e}"
+    try:
+        row = con.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'owner_admitted' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    except sqlite3.Error as e:
+        return None, None, f"query failed: {e}"
+    finally:
+        con.close()
+    if not row or not row["payload"]:
+        return None, None, None
+    try:
+        payload = json.loads(row["payload"])
+    except (TypeError, ValueError):
+        return None, None, "owner_admitted payload is not JSON"
+    if not isinstance(payload, dict):
+        return None, None, "owner_admitted payload is not an object"
+    session_id = (payload.get("session_id") or "").strip()
+    store = (payload.get("db") or "").strip()
+    if not session_id:
+        return None, None, "owner_admitted payload has no session_id"
+    return session_id, (store or None), None
+
+
+def _clip(text: Optional[str], limit: int) -> tuple[str, bool]:
+    """``(text, truncated)`` — cut at ``limit`` characters, marking the cut."""
+    if not text:
+        return "", False
+    if len(text) <= limit:
+        return text, False
+    return text[:limit], True
+
+
+def _message_preview(row) -> str:
+    """A one-line digest of a message, for the pane's heading.
+
+    The raw ``content`` of an assistant turn that only calls tools is empty —
+    the calls live in ``tool_calls`` — so without this a pane full of tool
+    calls would show a column of blank rows. Tool results are JSON, and the
+    useful part of them (``output`` / ``content``) is pulled out of the
+    envelope rather than shown as raw JSON.
+    """
+    content = row["content"] or ""
+    if content.strip():
+        text = content
+        stripped = content.lstrip()
+        if stripped.startswith("{"):
+            try:
+                parsed = json.loads(content)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, dict):
+                for key in ("output", "content", "text", "error", "result"):
+                    val = parsed.get(key)
+                    if isinstance(val, str) and val.strip():
+                        text = val
+                        break
+                else:
+                    text = json.dumps(parsed, ensure_ascii=False)
+        return " ".join(text.split())
+    calls = row["tool_calls"]
+    if calls:
+        try:
+            names = [
+                (c.get("function") or {}).get("name") or c.get("name") or "?"
+                for c in json.loads(calls)
+            ]
+        except (TypeError, ValueError):
+            names = []
+        if names:
+            return "вызовы: " + ", ".join(str(n) for n in names)
+    return ""
+
+
+def _transcript_messages(store: str, session_id: str, after: int, limit: int):
+    """``(messages, next_after, has_more, error)`` from the profile store.
+
+    Read-only: the store is a live WAL database of the owner gateway, so it
+    is opened with ``mode=ro`` and never written to.
+    """
+    store_path = Path(store).expanduser()
+    if not store_path.is_absolute():
+        return [], after, False, f"store path is not absolute: {store}"
+    if not store_path.exists():
+        return [], after, False, f"no session store at {store_path}"
+    try:
+        con = _ro_connect(store_path)
+    except sqlite3.Error as e:
+        return [], after, False, f"cannot open {store_path}: {e}"
+    try:
+        rows = con.execute(
+            "SELECT id, role, content, tool_name, tool_call_id, timestamp, "
+            "       tool_calls FROM messages "
+            "WHERE session_id = ? AND id > ? ORDER BY id ASC LIMIT ?",
+            (session_id, after, limit + 1),
+        ).fetchall()
+    except sqlite3.Error as e:
+        return [], after, False, f"query failed: {e}"
+    finally:
+        con.close()
+
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    messages = []
+    for r in rows:
+        text, truncated = _clip(r["content"], _TRANSCRIPT_CONTENT_LIMIT)
+        preview, _ = _clip(_message_preview(r), _TRANSCRIPT_PREVIEW_LIMIT)
+        messages.append({
+            "id": r["id"],
+            "role": r["role"] or "",
+            "content": text,
+            "tool_name": r["tool_name"],
+            "tool_call_id": r["tool_call_id"],
+            "timestamp": r["timestamp"],
+            "preview": preview,
+            "truncated": truncated,
+        })
+    next_after = messages[-1]["id"] if messages else after
+    return messages, next_after, has_more, None
+
+
+@router.get("/transcript")
+async def get_transcript(
+    task_id: str = Query(...),
+    board: str = Query(default="default"),
+    after: int = Query(default=0),
+    limit: int = Query(default=_TRANSCRIPT_DEFAULT_LIMIT),
+):
+    """The live transcript of a card, read from the owner profile's store.
+
+    ``source`` tells the UI where the answer came from:
+      "owner_session" — the owner profile's store was read;
+      "worker_log"    — the card was executed by the OLD worker process, whose
+                        stdout IS the transcript (the bundled
+                        ``/tasks/{id}/log`` route serves it);
+      "none"          — nothing to show.
+
+    Nothing here raises: a missing board, an unreadable store or a card with
+    no owner session all answer 200 with an empty list, because the pane must
+    never take the card view down with it.
+    """
+    def _run():
+        if not _TASK_ID_RE.match(task_id or ""):
+            return JSONResponse({"error": f"bad task id: {task_id!r}"}, status_code=400)
+        try:
+            slug = _normalize_board(board)
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        cursor = max(0, _to_int(after))
+        count = max(1, min(_TRANSCRIPT_MAX_LIMIT, _to_int(limit) or _TRANSCRIPT_DEFAULT_LIMIT))
+
+        session_id, store, err = _owner_admitted(slug, task_id)
+        if err:
+            # The board itself is unreadable — there is nothing to read and no
+            # owner session to point at.
+            return {
+                "task_id": task_id, "board": slug, "session_id": None,
+                "store": None, "source": "none", "messages": [],
+                "next_after": cursor, "has_more": False, "error": err,
+            }
+        if not session_id:
+            # No owner_admitted event: the OLD scheme — the worker process ran
+            # the card and its stdout was written to the card's log file. The
+            # transcript is there, not here.
+            return {
+                "task_id": task_id, "board": slug, "session_id": None,
+                "store": None, "source": "worker_log", "messages": [],
+                "next_after": cursor, "has_more": False,
+            }
+        if not store:
+            return {
+                "task_id": task_id, "board": slug, "session_id": session_id,
+                "store": None, "source": "none", "messages": [],
+                "next_after": cursor, "has_more": False,
+                "error": "owner_admitted payload has no store path",
+            }
+        messages, next_after, has_more, err = _transcript_messages(
+            store, session_id, cursor, count
+        )
+        if err:
+            return {
+                "task_id": task_id, "board": slug, "session_id": session_id,
+                "store": store, "source": "none", "messages": [],
+                "next_after": cursor, "has_more": False, "error": err,
+            }
+        return {
+            "task_id": task_id, "board": slug, "session_id": session_id,
+            "store": store, "source": "owner_session", "messages": messages,
+            "next_after": next_after, "has_more": has_more,
+            "content_limit": _TRANSCRIPT_CONTENT_LIMIT,
+        }
 
     return await asyncio.to_thread(_run)
