@@ -701,22 +701,34 @@ def _readable_dump(value, level: int) -> str:
         lines = []
         for key, item in value.items():
             name = json.dumps(str(key), ensure_ascii=False)
-            lines.append(f"{pad}{name}: {_readable_dump(item, level + 1)}")
+            rendered = _readable_dump(item, level + 1)
+            # A nested object goes on its own lines — putting its first key on
+            # the parent's line and the rest below reads like a mistake.
+            if "\n" in rendered:
+                lines.append(f"{pad}{name}:")
+                lines.append(rendered)
+            else:
+                lines.append(f"{pad}{name}: {rendered}")
         return "\n".join(lines)
     if isinstance(value, list):
         if not value:
             return "[]"
         lines = []
         for item in value:
-            lines.append(f"{pad}- {_readable_dump(item, level + 1)}")
+            rendered = _readable_dump(item, level + 1)
+            if "\n" in rendered:
+                lines.append(f"{pad}-")
+                lines.append(rendered)
+            else:
+                lines.append(f"{pad}- {rendered}")
         return "\n".join(lines)
     if isinstance(value, str):
-        # A multi-line value keeps its real line breaks; the continuation
-        # lines are indented so the surrounding structure stays readable.
+        # A multi-line value keeps its real line breaks, and EVERY line is
+        # indented to the value's own level — so a paragraph inside a field
+        # lines up with its neighbours instead of drifting to the right.
         if "\n" not in value:
             return value
-        cont = "\n" + ("  " * (level + 1))
-        return value.replace("\n", cont)
+        return "\n".join(pad + line if line else line for line in value.split("\n"))
     if value is None:
         return "null"
     if value is True:
