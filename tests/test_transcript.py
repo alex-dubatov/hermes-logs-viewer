@@ -15,6 +15,11 @@ WHAT IS PINNED
     card's worker log, not in a store);
   * a missing board / a broken store answers `source: "none"`, never 500;
   * a huge tool result is clipped, and the clip is REPORTED;
+  * the tool result's JSON envelope is UNWRAPPED: `text` carries the tool's
+    own output with REAL line breaks (the operator asked for "\n" to read as
+    a line break, not as two characters);
+  * the agent's REASONING is returned (the old worker log showed it live);
+  * an assistant turn that only CALLS tools reports those calls;
   * the store is opened read-only — the route must not write to it.
 
 Usage:
@@ -75,6 +80,22 @@ CREATE TABLE messages (
     tool_call_id TEXT,
     tool_calls  TEXT,
     tool_name   TEXT,
+    timestamp   REAL NOT NULL,
+    reasoning   TEXT
+);
+"""
+
+# A store from an older Hermes: no `tool_calls`, no `reasoning`. The route
+# must read it anyway — the columns it cannot use are read as NULL instead of
+# failing the whole query.
+STORE_SCHEMA_LEGACY = """
+CREATE TABLE messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    role        TEXT NOT NULL,
+    content     TEXT,
+    tool_call_id TEXT,
+    tool_name   TEXT,
     timestamp   REAL NOT NULL
 );
 """
@@ -93,15 +114,25 @@ def make_board(path: Path, events):
     con.close()
 
 
-def make_store(path: Path, session_id, messages):
+def make_store(path: Path, session_id, messages, legacy: bool = False):
     con = sqlite3.connect(str(path))
-    con.executescript(STORE_SCHEMA)
-    for role, content, tool_name, tool_calls in messages:
-        con.execute(
-            "INSERT INTO messages (session_id, role, content, tool_call_id, "
-            "tool_calls, tool_name, timestamp) VALUES (?, ?, ?, NULL, ?, ?, ?)",
-            (session_id, role, content, tool_calls, tool_name, 1700000000.5),
-        )
+    con.executescript(STORE_SCHEMA_LEGACY if legacy else STORE_SCHEMA)
+    for row in messages:
+        role, content, tool_name, tool_calls, reasoning = row
+        if legacy:
+            con.execute(
+                "INSERT INTO messages (session_id, role, content, tool_call_id, "
+                "tool_name, timestamp) VALUES (?, ?, ?, NULL, ?, ?)",
+                (session_id, role, content, tool_name, 1700000000.5),
+            )
+        else:
+            con.execute(
+                "INSERT INTO messages (session_id, role, content, tool_call_id, "
+                "tool_calls, tool_name, timestamp, reasoning) "
+                "VALUES (?, ?, ?, NULL, ?, ?, ?, ?)",
+                (session_id, role, content, tool_calls, tool_name,
+                 1700000000.5, reasoning),
+            )
     con.commit()
     con.close()
 
@@ -127,15 +158,23 @@ def main() -> int:
     # (empty content!), a tool result, and a huge tool result.
     big = "X" * 9000
     make_store(store_path, session_id, [
-        ("user", "сделай карточку", None, None),
+        ("user", "сделай карточку", None, None, None),
         ("assistant", "", None, json.dumps([
             {"type": "function", "function": {"name": "terminal", "arguments": "{}"}},
             {"type": "function", "function": {"name": "read_file", "arguments": "{}"}},
-        ])),
-        ("tool", json.dumps({"output": "готово"}), "terminal", None),
-        ("tool", json.dumps({"output": big}), "terminal", None),
-        ("assistant", "вот и всё", None, None),
+        ]), "Разберусь с карточкой: сначала посмотрю файлы."),
+        ("tool", json.dumps({"output": "готово"}), "terminal", None, None),
+        ("tool", json.dumps({"output": big}), "terminal", None, None),
+        ("assistant", "вот и всё", None, None, None),
     ])
+
+    # A store from an older Hermes: no `tool_calls`, no `reasoning`.
+    legacy_store = tmp / "profile-legacy" / "state.db"
+    legacy_store.parent.mkdir(parents=True)
+    make_store(legacy_store, session_id, [
+        ("user", "старая карточка", None, None, None),
+        ("assistant", "ответ", None, None, None),
+    ], legacy=True)
 
     make_board(board_db, [
         # An OLD-style card: no owner_admitted event at all.
@@ -151,6 +190,11 @@ def main() -> int:
         # A card whose event points at a store that is gone.
         ("t_gone0001", "owner_admitted", json.dumps({
             "db": str(tmp / "no-such-store.db"),
+            "session_id": session_id,
+        })),
+        # A card whose store predates the extra columns.
+        ("t_legacy01", "owner_admitted", json.dumps({
+            "db": str(legacy_store),
             "session_id": session_id,
         })),
     ])
@@ -217,6 +261,50 @@ def main() -> int:
           big_msg.get("truncated"))
     check("обрезанное сообщение не помечено как целое",
           msgs[0].get("truncated") is False, msgs[0].get("truncated"))
+
+    # --- 4a. the tool result's JSON envelope is unwrapped ----------------
+    # The store keeps a tool result as {"output": "..."}; rendered verbatim
+    # the reader sees the braces AND the newlines spelled "\n".
+    tool_msg = msgs[2]
+    check("обёртка tool-результата развёрнута в text",
+          tool_msg.get("text") == "готово", tool_msg.get("text"))
+    check("text не содержит JSON-обёртки",
+          "{" not in (tool_msg.get("text") or ""), tool_msg.get("text"))
+    check("исходное содержимое осталось в content",
+          (tool_msg.get("content") or "").startswith("{"),
+          (tool_msg.get("content") or "")[:40])
+    # Real line breaks: a payload with "\n" inside must read as a break.
+    multi = json.dumps({"output": "строка 1\nстрока 2\nстрока 3"})
+    check("реальные переводы строк в text",
+          api._readable_text(multi).count("\n") == 2,
+          repr(api._readable_text(multi)))
+
+    # --- 4b. the agent's reasoning comes along ---------------------------
+    check("рассуждения агента вернулись",
+          msgs[1].get("reasoning") == "Разберусь с карточкой: сначала посмотрю файлы.",
+          msgs[1].get("reasoning"))
+    check("у сообщения без рассуждений поле пустое",
+          msgs[0].get("reasoning") == "", msgs[0].get("reasoning"))
+
+    # --- 4c. an assistant turn that only calls tools ----------------------
+    calls = msgs[1].get("tool_calls") or []
+    check("вызовы инструментов перечислены", len(calls) == 2, len(calls))
+    check("имена вызовов верны",
+          [c["name"] for c in calls] == ["terminal", "read_file"],
+          [c["name"] for c in calls])
+
+    # --- 4d. a store from an older Hermes (fewer columns) ----------------
+    r_legacy = get({"board": "hypercube", "task_id": "t_legacy01"})
+    check("старый store: отвечает 200", r_legacy.status_code == 200,
+          r_legacy.status_code)
+    b_legacy = r_legacy.json()
+    check("старый store: source = owner_session",
+          b_legacy.get("source") == "owner_session", b_legacy.get("source"))
+    check("старый store: сообщения вернулись",
+          len(b_legacy.get("messages") or []) == 2,
+          len(b_legacy.get("messages") or []))
+    check("старый store: вызовов нет", (b_legacy["messages"][0].get("tool_calls") or []) == [],
+          b_legacy["messages"][0].get("tool_calls"))
 
     # --- 5. the old scheme: no owner_admitted -> worker_log, no 500 ------
     r4 = get({"board": "hypercube", "task_id": "t_old00001"})

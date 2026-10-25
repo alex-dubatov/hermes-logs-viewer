@@ -321,9 +321,43 @@ const TEST_ASSIGNEE = "default";
     const trText = ($(".hlv-transcript") || {}).textContent || "";
     check("панель транскрипта не пустая", trText.trim().length > 0,
       trText.trim().slice(0, 60));
+    // If the selected card runs in the NEW scheme, its messages are here —
+    // and then the READABLE form is checkable without a browser: the tool
+    // result's JSON envelope must be unwrapped (no tool message may start
+    // with a JSON object and no tool message may be entirely escaped into
+    // "\n"), and the agent's reasoning must be rendered as its own block.
+    //
+    // ONLY tool messages: the agent's own prose may legitimately contain a
+    // "{" (a Python repr it pasted) or a literal "\n" (it is talking ABOUT
+    // newlines) — that is its text, not an escaping artefact.
+    const trMsgs = $$(".hlv-transcript-msg");
+    if (trMsgs.length) {
+      const trToolTexts = $$(".hlv-role-tool .hlv-transcript-text")
+        .map((t) => t.textContent || "");
+      const envelopes = trToolTexts.filter((s) => s.trim().indexOf('{"') === 0).length;
+      check("JSON-обёртка tool-результата развёрнута", envelopes === 0,
+        "tool-сообщений с обёрткой: " + envelopes);
+      const fullyEscaped = trToolTexts.filter(
+        (s) => s.indexOf("\\n") !== -1 && s.indexOf("\n") === -1).length;
+      check("нет текста, целиком экранированного в \\n", fullyEscaped === 0,
+        "tool-сообщений без настоящих переводов строки: " + fullyEscaped);
+      check("у сообщения-ассистента видны рассуждения или вызовы",
+        $$(".hlv-transcript-reasoning").length + $$(".hlv-transcript-call").length > 0,
+        "рассуждений: " + $$(".hlv-transcript-reasoning").length +
+        ", вызовов: " + $$(".hlv-transcript-call").length);
+    } else {
+      console.log("SKIP карточка без owner-сессии — читаемость проверяется в tools/transcript_readable_check.js");
+    }
     // Back to the log tab, so the rest of the suite sees the pane it expects.
     const logTab = $$(".hlv-tab").find((t) => (t.textContent || "").trim().indexOf("лог") === 0);
     if (logTab) { click(logTab); await sleep(600); }
+    // The transcript is polled ONLY while its pane is open: re-rendering
+    // hundreds of message blocks every 2 s behind another tab would steal the
+    // frame budget from the pane the user is actually reading. With the tab
+    // closed the pane must be gone from the DOM — and the poller must not
+    // keep asking for the store.
+    check("панель транскрипта закрыта вместе со вкладкой",
+      !$(".hlv-transcript"), $(".hlv-transcript") ? "панель осталась в DOM" : "панели нет");
   }
 
   click(findButton("основное"));

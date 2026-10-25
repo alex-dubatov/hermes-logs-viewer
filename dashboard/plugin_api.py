@@ -610,6 +610,9 @@ _TRANSCRIPT_DEFAULT_LIMIT = 200
 _TRANSCRIPT_MAX_LIMIT = 500
 # The one-line digest shown next to the role.
 _TRANSCRIPT_PREVIEW_LIMIT = 240
+# The agent's reasoning (its "thinking") is a separate column of the
+# assistant's row; it gets its own cap because it is long and secondary.
+_TRANSCRIPT_REASONING_LIMIT = 4000
 
 
 def _owner_admitted(board: str, task_id: str):
@@ -666,45 +669,184 @@ def _clip(text: Optional[str], limit: int) -> tuple[str, bool]:
     return text[:limit], True
 
 
-def _message_preview(row) -> str:
-    """A one-line digest of a message, for the pane's heading.
+# The store keeps a TOOL RESULT as a JSON envelope: the tool's own payload
+# under "output" / "content" / …, plus bookkeeping fields around it. The
+# pane shows the payload, not the envelope — an envelope rendered verbatim
+# puts the payload's newlines in front of the reader as the two characters
+# "\n" and buries the text in braces and quotes. Hence the unwrapping below.
+_PAYLOAD_KEYS = (
+    "output", "content", "text", "result", "message", "error",
+    "stdout", "stderr", "matches_text", "body", "data",
+)
 
-    The raw ``content`` of an assistant turn that only calls tools is empty —
-    the calls live in ``tool_calls`` — so without this a pane full of tool
-    calls would show a column of blank rows. Tool results are JSON, and the
-    useful part of them (``output`` / ``content``) is pulled out of the
-    envelope rather than shown as raw JSON.
+
+def _pretty_json(value) -> str:
+    """JSON as readable text.
+
+    NOT ``json.dumps``: that re-escapes every newline inside a string, so a
+    multi-line body comes back as the two characters ``\\n`` — exactly what
+    the reader asked not to see. This renderer keeps the STRUCTURE (one
+    ``key: value`` per line, ``- item`` per list element) and prints string
+    values as they are, with their real line breaks; a continuation line of
+    a multi-line value is indented so the structure stays readable.
     """
-    content = row["content"] or ""
-    if content.strip():
-        text = content
-        stripped = content.lstrip()
-        if stripped.startswith("{"):
-            try:
-                parsed = json.loads(content)
-            except ValueError:
-                parsed = None
-            if isinstance(parsed, dict):
-                for key in ("output", "content", "text", "error", "result"):
-                    val = parsed.get(key)
-                    if isinstance(val, str) and val.strip():
-                        text = val
-                        break
+    return _readable_dump(value, 0)
+
+
+def _readable_dump(value, level: int) -> str:
+    pad = "  " * level
+    if isinstance(value, dict):
+        if not value:
+            return "{}"
+        lines = []
+        for key, item in value.items():
+            name = json.dumps(str(key), ensure_ascii=False)
+            lines.append(f"{pad}{name}: {_readable_dump(item, level + 1)}")
+        return "\n".join(lines)
+    if isinstance(value, list):
+        if not value:
+            return "[]"
+        lines = []
+        for item in value:
+            lines.append(f"{pad}- {_readable_dump(item, level + 1)}")
+        return "\n".join(lines)
+    if isinstance(value, str):
+        # A multi-line value keeps its real line breaks; the continuation
+        # lines are indented so the surrounding structure stays readable.
+        if "\n" not in value:
+            return value
+        cont = "\n" + ("  " * (level + 1))
+        return value.replace("\n", cont)
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _split_json_prefix(text: str):
+    """``(parsed, rest)`` — the leading JSON document and whatever follows it.
+
+    A tool result is not always ONE JSON document: the read_file tool, for
+    example, returns its JSON envelope and then appends the discovered
+    subdirectory's context as plain text. ``json.loads`` rejects that with
+    "Extra data" and the whole readable payload would be lost, so the
+    document is decoded from the front and the tail is kept aside.
+    """
+    stripped = text.lstrip()
+    if not stripped:
+        return None, text
+    try:
+        parsed = json.loads(stripped)
+        return parsed, ""
+    except ValueError:
+        pass
+    try:
+        parsed, end = json.JSONDecoder().raw_decode(stripped)
+    except ValueError:
+        return None, text
+    return parsed, stripped[end:]
+
+
+def _readable_text(raw: Optional[str], depth: int = 0) -> str:
+    """The human-readable body of a stored message.
+
+    * plain text      -> itself;
+    * a JSON envelope -> the payload it carries ("output", "content", …),
+      rendered readably when the payload is itself structured;
+    * a JSON string   -> the string, decoded one level further when it is
+      itself JSON (a tool that returned JSON as a STRING).
+
+    The recursion is bounded (``depth``): a payload that keeps decoding as
+    JSON forever must not spin.
+    """
+    if not raw:
+        return ""
+    stripped = raw.strip()
+    if not stripped:
+        return raw
+    parsed, rest = _split_json_prefix(stripped)
+    if parsed is None:
+        return raw
+    if isinstance(parsed, str):
+        # A JSON string: the payload is one level deeper. Decode again when it
+        # is structured, otherwise it IS the text.
+        if depth < 2 and parsed.strip()[:1] in ("{", "["):
+            inner = _readable_text(parsed, depth + 1)
+            return inner + (("\n" + rest) if rest.strip() else "")
+        return parsed + (("\n" + rest) if rest.strip() else "")
+    if isinstance(parsed, dict):
+        for key in _PAYLOAD_KEYS:
+            value = parsed.get(key)
+            if isinstance(value, str) and value.strip():
+                if depth < 2 and value.strip()[:1] in ("{", "["):
+                    body = _readable_text(value, depth + 1)
                 else:
-                    text = json.dumps(parsed, ensure_ascii=False)
+                    body = value
+                return body + (("\n" + rest) if rest.strip() else "")
+            if isinstance(value, (dict, list)) and value:
+                return _pretty_json(value) + (("\n" + rest) if rest.strip() else "")
+        return _pretty_json(parsed) + (("\n" + rest) if rest.strip() else "")
+    if isinstance(parsed, list):
+        return _pretty_json(parsed) + (("\n" + rest) if rest.strip() else "")
+    return str(parsed) + (("\n" + rest) if rest.strip() else "")
+
+
+def _tool_call_summary(raw_calls) -> List[dict]:
+    """``[{"name": …, "arguments": …}]`` for an assistant turn's tool calls.
+
+    The assistant's ``content`` is EMPTY on a turn that only calls tools — the
+    calls live in ``tool_calls`` — so without this the pane shows a column of
+    blank assistant rows and the reader never learns what the agent did.
+    """
+    if not raw_calls:
+        return []
+    try:
+        calls = json.loads(raw_calls)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(calls, list):
+        return []
+    out: List[dict] = []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") or {}
+        name = fn.get("name") or call.get("name") or "?"
+        args = fn.get("arguments")
+        if not isinstance(args, str):
+            args = "" if args is None else json.dumps(args, ensure_ascii=False)
+        args, _ = _clip(" ".join(args.split()), 300)
+        out.append({"name": str(name), "arguments": args})
+    return out
+
+
+def _message_preview(row) -> str:
+    """A one-line digest of a message, for the pane's heading."""
+    text = _readable_text(row["content"])
+    if text.strip():
         return " ".join(text.split())
-    calls = row["tool_calls"]
+    calls = _tool_call_summary(
+        row["tool_calls"] if "tool_calls" in row.keys() else None
+    )
     if calls:
-        try:
-            names = [
-                (c.get("function") or {}).get("name") or c.get("name") or "?"
-                for c in json.loads(calls)
-            ]
-        except (TypeError, ValueError):
-            names = []
-        if names:
-            return "вызовы: " + ", ".join(str(n) for n in names)
+        return "вызовы: " + ", ".join(c["name"] for c in calls)
     return ""
+
+
+def _message_columns(con: sqlite3.Connection) -> set:
+    """The columns the store's ``messages`` table actually has.
+
+    The table grew over releases (``tool_calls``, ``reasoning``, …), so the
+    SELECT is built from what is there instead of assuming a fixed schema —
+    a store from an older Hermes would otherwise fail the whole query.
+    """
+    try:
+        return {r["name"] for r in con.execute("PRAGMA table_info(messages)")}
+    except sqlite3.Error:
+        return set()
 
 
 def _transcript_messages(store: str, session_id: str, after: int, limit: int):
@@ -723,9 +865,21 @@ def _transcript_messages(store: str, session_id: str, after: int, limit: int):
     except sqlite3.Error as e:
         return [], after, False, f"cannot open {store_path}: {e}"
     try:
+        cols = _message_columns(con)
+        if not cols:
+            return [], after, False, "store has no messages table"
+        wanted = ["id", "role", "content", "tool_name", "tool_call_id", "timestamp"]
+        optional = ["tool_calls", "reasoning", "reasoning_content"]
+        select = []
+        for name in wanted + optional:
+            if name in cols:
+                select.append(name)
+            elif name in wanted:
+                # A column the route cannot do without is read as NULL rather
+                # than failing the query.
+                select.append(f"NULL AS {name}")
         rows = con.execute(
-            "SELECT id, role, content, tool_name, tool_call_id, timestamp, "
-            "       tool_calls FROM messages "
+            "SELECT " + ", ".join(select) + " FROM messages "
             "WHERE session_id = ? AND id > ? ORDER BY id ASC LIMIT ?",
             (session_id, after, limit + 1),
         ).fetchall()
@@ -738,17 +892,31 @@ def _transcript_messages(store: str, session_id: str, after: int, limit: int):
     rows = rows[:limit]
     messages = []
     for r in rows:
-        text, truncated = _clip(r["content"], _TRANSCRIPT_CONTENT_LIMIT)
+        raw = r["content"] or ""
+        text, truncated = _clip(raw, _TRANSCRIPT_CONTENT_LIMIT)
+        readable, readable_cut = _clip(_readable_text(raw), _TRANSCRIPT_CONTENT_LIMIT)
         preview, _ = _clip(_message_preview(r), _TRANSCRIPT_PREVIEW_LIMIT)
+        # The agent's REASONING is what the old worker log showed as it
+        # streamed; in the new scheme it is a column of the assistant's row.
+        reasoning = r["reasoning"] if "reasoning" in r.keys() else None
+        if not reasoning and "reasoning_content" in r.keys():
+            reasoning = r["reasoning_content"]
+        reasoning, reasoning_cut = _clip(reasoning or "", _TRANSCRIPT_REASONING_LIMIT)
         messages.append({
             "id": r["id"],
             "role": r["role"] or "",
             "content": text,
+            "text": readable,
             "tool_name": r["tool_name"],
             "tool_call_id": r["tool_call_id"],
             "timestamp": r["timestamp"],
             "preview": preview,
-            "truncated": truncated,
+            "truncated": truncated or readable_cut,
+            "reasoning": reasoning,
+            "reasoning_truncated": reasoning_cut,
+            "tool_calls": _tool_call_summary(
+                r["tool_calls"] if "tool_calls" in r.keys() else None
+            ),
         })
     next_after = messages[-1]["id"] if messages else after
     return messages, next_after, has_more, None

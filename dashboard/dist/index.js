@@ -348,10 +348,17 @@ function Page() {
     //   "none"          — nothing to show.
     var transcriptState = useState({
       messages: [], source: "", session_id: "", store: "",
-      next_after: 0, loaded: false, error: "", has_more: false,
+      next_after: 0, loaded: false, error: "", has_more: false, gen: 0,
     });
     var transcript = transcriptState[0];
     var setTranscript = transcriptState[1];
+    // Bumped whenever NEW messages arrive. The auto-scroll effect keys on it
+    // instead of the message COUNT: the pane renders at most
+    // TRANSCRIPT_MAX_RENDERED messages, so on a long-running card the count
+    // stops changing while the content keeps growing — and an effect keyed on
+    // the count would stop following the tail exactly when the card gets
+    // interesting.
+    var transcriptGenRef = useRef(0);
     // The transcript of the card that is on screen. Kept next to the log's own
     // cache, so switching cards back and forth does not re-read the store.
     // Value: {messages: [...], cursor: <last message id>}.
@@ -375,6 +382,16 @@ function Page() {
     // closes over would be frozen. The ref always answers for right now.
     var transcriptAtBottomRef = useRef(true);
     transcriptAtBottomRef.current = transcriptAtBottom;
+    // PER-CARD scroll mode, exactly like the log pane's `modeRef`: "bottom"
+    // follows the tail, "fixed" means the reader picked a spot and the pane
+    // stays there.
+    //
+    // Why per card and not one global flag: the flag used to be global, so
+    // scrolling up on one card left it "not at the bottom" for the NEXT card
+    // too — and a card that opens at its first message instead of its last
+    // reads as "autoscroll is broken". Each card now follows its own tail.
+    var transcriptModeRef = useRef(new Map());
+    var transcriptTopRef = useRef(new Map());
 
     // --- Task card: the "основное" tab ------------------------------------
     // Read/written through the bundled plugin's task routes: GET /tasks/{id}
@@ -581,6 +598,11 @@ function Page() {
     var paneState = useState("log");
     var pane = paneState[0];
     var setPane = paneState[1];
+    // The SAME through a ref: the transcript's watchdog runs on a timer that
+    // must not be restarted on every pane switch, so it cannot close over
+    // `pane` (that value would be frozen at mount time).
+    var paneRef = useRef(pane);
+    paneRef.current = pane;
 
     // The DOM element that scrolls.
     var scrollRef = useRef(null);
@@ -984,8 +1006,7 @@ function Page() {
       if (pane !== "transcript") return;
       var el = transcriptScrollRef.current;
       if (!el) return;
-      scrollTranscriptTo(el, el.scrollHeight);
-      setTranscriptAtBottom(true);
+      pinTranscriptToBottom();
     }, [pane]);
 
     // On (re)selection: load the cached log (if any) and queue scroll restore.
@@ -1170,6 +1191,17 @@ function Page() {
       if (el) el.scrollTop = el.scrollHeight;
     }, [pane, comments.length]);
 
+    // The same for the transcript pane — but it must run AFTER the new
+    // messages are PAINTED, not when the response arrives: pinning the
+    // scroll position to the OLD scrollHeight would leave the pane a screen
+    // behind the newest message. The generation counter is the signal that
+    // the content grew (the message COUNT stops changing once the pane hits
+    // its render cap).
+    useEffect(function () {
+      if (pane !== "transcript") return;
+      pinTranscriptToBottom();
+    }, [pane, transcript.gen]);
+
     // --- Live transcript of the selected card ------------------------------
     //
     // Polled every 2 s, the same cadence as the task list. The route answers
@@ -1177,10 +1209,13 @@ function Page() {
     // grows: the ids in the store are monotonic, and the cursor is the last
     // id the pane has shown.
     //
-    // The poll runs for every selected card, not only when the transcript
-    // pane is open: the card can be switched to at any moment, and the store
-    // is the only place the worker's own words are. Reading it is cheap (a
-    // single indexed SELECT) and it is what makes the pane live.
+    // The poll runs ONLY while the transcript pane is open — the same rule the
+    // "основное" pane's detail poll follows. Reading the store is cheap (one
+    // indexed SELECT), but RENDERING it is not: a card that has worked for an
+    // hour has hundreds of messages, and re-rendering that tree every 2 s
+    // while the user reads another tab steals the frame budget from the pane
+    // they are actually looking at. The pane therefore loads when it is
+    // opened and keeps itself fresh while it stays open.
     //
     // The cursor and the messages are cached PER CARD: switching cards must
     // not leave the next card's poll reading from the previous card's cursor
@@ -1188,12 +1223,15 @@ function Page() {
     useEffect(function () {
       if (!selected) {
         transcriptCacheRef.current.clear();
+        transcriptModeRef.current.clear();
+        transcriptTopRef.current.clear();
         setTranscript({
-          messages: [], source: "", session_id: "", store: "",
-          next_after: 0, loaded: false, error: "", has_more: false,
+          task_id: "", messages: [], source: "", session_id: "", store: "",
+          next_after: 0, loaded: false, error: "", has_more: false, gen: 0,
         });
         return;
       }
+      if (pane !== "transcript") return;
       var stop = false;
       var taskId = selected;
 
@@ -1225,7 +1263,12 @@ function Page() {
           // The cursor only ever moves forward.
           var nextAfter = Math.max(after, r.next_after || 0);
           transcriptCacheRef.current.set(taskId, { messages: messages, cursor: nextAfter });
+          // The generation counter moves whenever something NEW arrived — even
+          // when the RENDERED count did not (the pane caps what it renders).
+          // It is what tells the auto-scroll effect that the content grew.
+          if (fresh.length) transcriptGenRef.current += 1;
           setTranscript({
+            task_id: taskId,
             messages: messages,
             source: r.source || "none",
             session_id: r.session_id || "",
@@ -1234,12 +1277,11 @@ function Page() {
             loaded: true,
             error: r.error || "",
             has_more: !!r.has_more,
+            gen: transcriptGenRef.current,
           });
-          // Following the newest message? Stay pinned to it.
-          if (transcriptAtBottomRef.current) {
-            var el = transcriptScrollRef.current;
-            if (el && fresh.length) scrollTranscriptTo(el, el.scrollHeight);
-          }
+          // Following the newest message? Keep pinned. (The effect above
+          // pins AFTER the new content is painted — pinning here would use the
+          // OLD scrollHeight and leave the pane a screen behind.)
         }).catch(function () {
           transcriptBusyRef.current = false;
         });
@@ -1250,7 +1292,19 @@ function Page() {
         stop = true;
         clearInterval(h);
       };
-    }, [selected, api, boardOf]);
+    }, [selected, pane, api, boardOf]);
+
+    // A newly selected card starts at its TAIL, not at its first message —
+    // and it follows the tail from then on. The mode is per card, so a card
+    // the reader scrolled up on stays where they left it when they come back
+    // to it, while a card they have not touched yet opens at the end.
+    useEffect(function () {
+      if (!selected) return;
+      if (!transcriptModeRef.current.has(selected)) {
+        transcriptModeRef.current.set(selected, "bottom");
+      }
+      setTranscriptAtBottom(true);
+    }, [selected]);
 
     // Full detail of the selected task, polled while the "основное" tab is
     // open — it is the only pane that reads the whole card. The route is the
@@ -1592,6 +1646,20 @@ function Page() {
     // container: pinned to the newest message, or held where the user left
     // it. The pane's own scrollTop is tracked so a programmatic jump is not
     // mistaken for the user taking over.
+    //
+    // TWO THINGS THE LOG PANE DOES THAT THE FIRST VERSION OF THIS DID NOT,
+    // and both are why "autoscroll does not work" was reported:
+    //
+    //  1. PER-CARD MODE. The log remembers, per task, whether the reader
+    //     follows the tail ("bottom") or picked a spot ("fixed"). One global
+    //     flag meant that scrolling up on one card left the NEXT card
+    //     unpinned — and a transcript that opens at its first message reads
+    //     as broken autoscroll even though the code is "following".
+    //  2. A WATCHDOG. The log re-pins to the tail every 500 ms, so content
+    //     that grew between two renders (a long line wrapping, an image
+    //     loading, a message that was still being written) is caught. The
+    //     transcript only re-pinned when the message COUNT changed, which
+    //     misses every growth that does not add a message.
 
     function scrollTranscriptTo(el, top) {
       if (!el) return;
@@ -1601,18 +1669,72 @@ function Page() {
 
     function onTranscriptScroll(e) {
       var node = e.target;
-      if (!node) return;
+      var id = selectedRef.current;
+      if (!id) return;
       // Our own jump (and the clamp that follows it) is not the user taking over.
       if (Math.abs(node.scrollTop - selfTranscriptScrollRef.current) < 2) return;
       var gap = node.scrollHeight - node.scrollTop - node.clientHeight;
-      setTranscriptAtBottom(gap < BOTTOM_THRESHOLD);
+      var atBottom = gap < BOTTOM_THRESHOLD;
+      setTranscriptAtBottom(atBottom);
+      if (atBottom) {
+        transcriptModeRef.current.set(id, "bottom");
+        transcriptTopRef.current.delete(id);
+      } else {
+        transcriptModeRef.current.set(id, "fixed");
+        transcriptTopRef.current.set(id, node.scrollTop);
+      }
     }
 
     function jumpTranscriptToBottom() {
       var el = transcriptScrollRef.current;
+      var id = selectedRef.current;
+      if (id) {
+        transcriptModeRef.current.set(id, "bottom");
+        transcriptTopRef.current.delete(id);
+      }
       scrollTranscriptTo(el, el ? el.scrollHeight : 0);
       setTranscriptAtBottom(true);
     }
+
+    // Pin the transcript to the tail of the card on screen, unless the reader
+    // picked a spot on it. Called after the new content is painted.
+    function pinTranscriptToBottom() {
+      var id = selectedRef.current;
+      if (!id) return;
+      var el = transcriptScrollRef.current;
+      if (!el) return;
+      var mode = transcriptModeRef.current.get(id) || "bottom";
+      if (mode !== "bottom") {
+        // The reader is somewhere in the middle: hold that spot.
+        var top = transcriptTopRef.current.get(id);
+        if (top != null) scrollTranscriptTo(el, top);
+        return;
+      }
+      scrollTranscriptTo(el, el.scrollHeight);
+      setTranscriptAtBottom(true);
+    }
+
+    // 0.5 s watchdog — the same cadence as the log pane's. Content grows
+    // between renders for reasons the message count cannot see (a wrapped
+    // line, a still-streaming message), and without this the pane silently
+    // stops following the tail.
+    useEffect(function () {
+      var h = setInterval(function () {
+        if (paneRef.current !== "transcript") return;
+        var id = selectedRef.current;
+        if (!id) return;
+        if ((transcriptModeRef.current.get(id) || "bottom") !== "bottom") return;
+        var el = transcriptScrollRef.current;
+        if (!el) return;
+        var gap = el.scrollHeight - el.scrollTop - el.clientHeight;
+        if (gap > 1 && el.scrollHeight > el.clientHeight) {
+          scrollTranscriptTo(el, el.scrollHeight);
+        }
+      }, FOLLOW_MS);
+      return function () {
+        clearInterval(h);
+      };
+    }, []);
 
     // "развернуть лог" / "свернуть": drop the cached window for this task and
     // restart the poll from byte 0 (expanded) or from the tail. Bumping
@@ -2374,7 +2496,12 @@ function Page() {
     // worker client writes ONE line ("Session: local-…") into it and then
     // waits for the receipt. The transcript lives in the owner profile's
     // store instead, so the log pane says so rather than looking broken.
-    var transcriptIsLive = transcript.loaded && transcript.source === "owner_session";
+    //
+    // The check needs the transcript of THIS card, and the transcript is only
+    // loaded while its pane is open — so the note appears once the reader has
+    // been to that tab, and never claims a wrong card's transcript.
+    var transcriptIsLive = transcript.loaded && transcript.task_id === selected &&
+      transcript.source === "owner_session";
     var logIsStub = transcriptIsLive && log.loaded && log.exists !== false &&
       log.lines.length <= 2;
     var logStubNote = logIsStub ? el("div", { className: "hlv-log-head-note" },
@@ -2417,12 +2544,16 @@ function Page() {
     //                     "лог" tab, so the pane points at it instead of
     //                     pretending to have nothing;
     //   "none"          — nothing to show.
-    var transcriptMessages = transcript.messages || [];
-    var transcriptSource = transcript.source || "";
+    // The transcript belongs to ONE card. When the selection moves, the state
+    // still describes the previous card until the new poll answers — showing
+    // another card's messages would be a lie, so the pane waits instead.
+    var transcriptIsForSelected = transcript.task_id === selected;
+    var transcriptMessages = transcriptIsForSelected ? (transcript.messages || []) : [];
+    var transcriptSource = transcriptIsForSelected ? (transcript.source || "") : "";
     var transcriptBody;
     if (!selected) {
       transcriptBody = el("div", { className: "hlv-empty" }, "выберите задачу слева");
-    } else if (!transcript.loaded) {
+    } else if (!transcript.loaded || !transcriptIsForSelected) {
       transcriptBody = el("div", { className: "hlv-preloader" },
         el("span", { className: "hlv-spinner" }),
         el("span", null, "загрузка транскрипта…"));
@@ -2443,6 +2574,17 @@ function Page() {
           var role = m.role || "";
           var head = "--- " + role + " #" + m.id;
           if (m.tool_name) head += " (" + m.tool_name + ")";
+          // The READABLE body: the route unwrapped the tool result's JSON
+          // envelope, so the reader sees the tool's own output with real
+          // line breaks instead of a brace-wrapped blob whose newlines are
+          // spelled "\n".
+          var body = m.text || m.content || "";
+          // The agent's reasoning — what the old worker log showed while it
+          // streamed. It is a separate column of the assistant's row.
+          var reasoning = m.reasoning || "";
+          // A turn that only CALLS tools has an empty body; the calls live in
+          // their own column, and without this the pane shows a blank row.
+          var calls = m.tool_calls || [];
           return el(
             "div",
             { key: String(m.id), className: "hlv-transcript-msg hlv-role-" + role },
@@ -2459,10 +2601,25 @@ function Page() {
                   }, "обрезано")
                 : null
             ),
-            m.content
-              ? el("pre", { className: "hlv-transcript-text" }, m.content)
+            reasoning
+              ? el("details", { className: "hlv-transcript-reasoning" },
+                  el("summary", null, "рассуждения"),
+                  el("pre", { className: "hlv-transcript-reasoning-text" }, reasoning),
+                  m.reasoning_truncated
+                    ? el("span", { className: "hlv-transcript-cut" }, "обрезано")
+                    : null)
+              : null,
+            calls.length
+              ? el("div", { className: "hlv-transcript-calls" },
+                  calls.map(function (c) {
+                    return el("div", { key: c.name, className: "hlv-transcript-call" },
+                      "→ " + c.name + (c.arguments ? " " + c.arguments : ""));
+                  }))
+              : null,
+            body
+              ? el("pre", { className: "hlv-transcript-text" }, body)
               : el("div", { className: "hlv-transcript-text hlv-transcript-empty" },
-                  m.preview || "(пусто)")
+                  m.preview || (calls.length ? "" : "(пусто)"))
           );
         })
       );
@@ -2471,7 +2628,8 @@ function Page() {
     // The session the transcript belongs to — which profile's store it was
     // read from. Shown in the pane's header so a reader knows whose session
     // they are looking at.
-    var transcriptMeta = transcript.loaded && transcriptSource === "owner_session"
+    var transcriptMeta = transcript.loaded && transcriptIsForSelected &&
+      transcriptSource === "owner_session"
       ? el("div", { className: "hlv-transcript-meta" },
           el("span", null, "сессия: " + (transcript.session_id || "?")),
           transcript.store
@@ -2742,7 +2900,11 @@ function Page() {
     // executed the OLD way (as a worker process) has its transcript in the
     // log file, and the two tabs cover both schemes without either hiding
     // the other.
-    var transcriptCount = (transcript.messages || []).length;
+    // The count on the tab is the number of messages of the SELECTED card —
+    // another card's count would be a lie about what is on screen.
+    var transcriptCount = (transcript.task_id === selected)
+      ? (transcript.messages || []).length
+      : 0;
     var rightPane = el(
       "div",
       { className: "hlv-right" },

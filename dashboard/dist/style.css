@@ -733,6 +733,60 @@
   color: var(--color-muted-foreground);
 }
 
+/* The agent's reasoning ("рассуждения") — the thing the old worker log
+   showed while it streamed. Folded by default so a long deliberation does
+   not bury the messages around it. */
+.hlv-transcript-reasoning {
+  margin: 0 0 6px;
+  border-left: 2px solid var(--color-border);
+  padding-left: 8px;
+}
+
+.hlv-transcript-reasoning > summary {
+  cursor: pointer;
+  font-size: 0.7rem;
+  color: var(--color-muted-foreground);
+  list-style: none;
+}
+
+.hlv-transcript-reasoning > summary::-webkit-details-marker {
+  display: none;
+}
+
+.hlv-transcript-reasoning > summary::before {
+  content: "▸ ";
+}
+
+.hlv-transcript-reasoning[open] > summary::before {
+  content: "▾ ";
+}
+
+.hlv-transcript-reasoning-text {
+  margin: 4px 0 0;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 0.72rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--color-muted-foreground);
+}
+
+/* The tool calls of an assistant turn — its body is empty, the calls are the
+   message. */
+.hlv-transcript-calls {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0 0 6px;
+}
+
+.hlv-transcript-call {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 0.72rem;
+  color: var(--color-ring, var(--color-success));
+  word-break: break-word;
+}
+
 /* Comments thread ------------------------------------------------ */
 .hlv-comments-wrap {
   display: flex;
