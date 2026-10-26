@@ -194,9 +194,28 @@ function fieldByLabel(labelText) {
 //
 // The PROFILE is picked here too: it is a required pick (ТЗ), so a dialog
 // without one cannot be submitted at all — the "создать" button stays
-// disabled and the form refuses on Enter. The profile is set to the one the
-// harness itself runs under, so a card the test creates is never handed to a
-// real worker: the assignee is not dispatchable from this board.
+// disabled and the form refuses on Enter. The profile alone does NOT make a
+// card safe — see the state note below.
+//
+// The STATE is picked here as well, and it MUST be: the form's default is
+// `ready`, which is a dispatch lane. A `ready` card assigned to a live
+// profile is claimed by the dispatcher within one tick (~60 s) and executed
+// FOR REAL — and the harness deletes the card right after creating it, so the
+// worker that got spawned is left holding a card that no longer exists. That
+// is not a hypothetical: it happened on 2026-10-26 twice (cards
+// `t_ead9cb3a` and `t_42cb81f1`, both "hlv-autotest: dir+проект"), each time
+// raising a real worker session that then failed on "task not found".
+//
+// `triage` is the state that cannot be claimed: it is a CREATE-time state
+// (`initial_task_state`), no dispatch lane reads it (`_lane_rows` is only
+// called for `ready` and `review`), and `recompute_ready` leaves it alone
+// (that pass only looks at `todo`/`blocked`). Every card this harness
+// creates therefore lands in `triage` and waits there for the DELETE.
+//
+// This is set HERE, in the one place every create goes through, rather than
+// at each call site: a per-call-site fix is what let the 2026-10-25 patch
+// close ONE of the ten create paths while the other nine kept spawning
+// workers.
 async function openDialog(boardSlug, assignee) {
   click(findButton("+ Новая задача"));
   await sleep(500);
@@ -207,8 +226,21 @@ async function openDialog(boardSlug, assignee) {
     setSelectValue(fieldByLabel("Профиль").querySelector("select"), who);
     await sleep(250);
   }
+  // The state goes last: the board pick resets the workspace, and the
+  // status select must be read AFTER the dialog has settled.
+  const stSel = fieldByLabel("Состояние").querySelector("select");
+  setSelectValue(stSel, SAFE_CARD_STATE);
+  await sleep(250);
   return $(".hlv-modal");
 }
+
+// The state every card this harness creates is born in.
+//
+// `triage` is the only state that is both create-time (no POST/PATCH race
+// with the dispatcher) and invisible to every dispatch lane. `todo` is NOT
+// safe: the form creates the card `ready` and PATCHes it to `todo`
+// afterwards, so the dispatcher's tick can land in that window and claim it.
+const SAFE_CARD_STATE = "triage";
 
 // The profile the harness assigns to the cards it creates.
 //
