@@ -242,6 +242,51 @@ async function openDialog(boardSlug, assignee) {
 // afterwards, so the dispatcher's tick can land in that window and claim it.
 const SAFE_CARD_STATE = "triage";
 
+// Every card this harness creates, by id.
+//
+// The harness deletes its throwaway cards, so a card that the dispatcher
+// claimed BEFORE the delete is left with a live worker holding a row that no
+// longer exists — a "phantom card". Nothing in the harness notices: the
+// worker just fails with "task not found", and the board looks clean.
+//
+// That happened on 2026-10-26 four times (t_ead9cb3a, t_42cb81f1,
+// t_e57e6df8, t_78d0d004), each one raising a real worker session on the
+// production `ff` board. So every created card is recorded here and, at the
+// end of the run, checked: a card that was CLAIMED (a claim_lock or a run)
+// is a harness bug, not a pass.
+//
+// The check reads each card back from the server BEFORE its DELETE — after
+// the delete the row is gone, and a claim the dispatcher took in the
+// meantime is invisible.
+const CREATED_CARDS = [];
+const CLAIMED_CARDS = [];
+
+// Remember a card the harness created, with the board it lives on.
+function trackCard(taskId, boardSlug) {
+  if (taskId) CREATED_CARDS.push({ id: taskId, board: boardSlug });
+}
+
+// Read a card back and note whether the dispatcher ever claimed it.
+// Called BEFORE the DELETE — the row is gone afterwards.
+async function noteClaim(taskId, boardSlug) {
+  if (!taskId) return null;
+  const r = await fetchJSON(
+    "/api/plugins/kanban/tasks/" + encodeURIComponent(taskId) +
+    "?board=" + encodeURIComponent(boardSlug));
+  const t = r && r.task ? r.task : null;
+  if (!t) return null;
+  const claimed = !!(t.claim_lock || t.current_run_id);
+  if (claimed) {
+    CLAIMED_CARDS.push({
+      id: taskId,
+      status: t.status,
+      claim_lock: t.claim_lock,
+      run: t.current_run_id,
+    });
+  }
+  return t;
+}
+
 // The profile the harness assigns to the cards it creates.
 //
 // It must be a REAL profile (the picker only offers installed ones) and it
@@ -1149,6 +1194,8 @@ const TEST_ASSIGNEE = "default";
         made2 ? JSON.stringify({ id: made2.id, p: made2.project_id, w: made2.workspace_path })
               : "карточка не найдена");
       if (made2) {
+        await noteClaim(made2.id, pbSlug);
+        trackCard(made2.id, pbSlug);
         await fetchJSON(
           "/api/plugins/kanban/tasks/" + encodeURIComponent(made2.id) +
             "?board=" + encodeURIComponent(pbSlug),
@@ -1184,6 +1231,10 @@ const TEST_ASSIGNEE = "default";
     for (const col of (bd.columns || [])) {
       for (const t of (col.tasks || [])) {
         if (t.title === title) {
+          // Read the card back BEFORE the delete: after it, the row is gone
+          // and a claim the dispatcher took in the meantime is invisible.
+          await noteClaim(t.id, boardSlug);
+          trackCard(t.id, boardSlug);
           await fetchJSON(
             "/api/plugins/kanban/tasks/" + encodeURIComponent(t.id) +
               "?board=" + encodeURIComponent(boardSlug),
@@ -1436,6 +1487,8 @@ const TEST_ASSIGNEE = "default";
         made5 ? JSON.stringify({ k: made5.workspace_kind, p: made5.project_id, w: made5.workspace_path })
               : "карточка не найдена");
       if (made5) {
+        await noteClaim(made5.id, pbSlug2);
+        trackCard(made5.id, pbSlug2);
         await fetchJSON(
           "/api/plugins/kanban/tasks/" + encodeURIComponent(made5.id) +
             "?board=" + encodeURIComponent(pbSlug2),
@@ -1540,6 +1593,8 @@ const TEST_ASSIGNEE = "default";
       full.task && full.task.max_runtime_seconds === 1800,
       full.task ? String(full.task.max_runtime_seconds) : "нет задачи");
     // Clean up: hard-delete the throwaway card so no archive clutter is left.
+    await noteClaim(row.id, target.slug);
+    trackCard(row.id, target.slug);
     await fetchJSON(
       "/api/plugins/kanban/tasks/" + encodeURIComponent(row.id) +
       "?board=" + encodeURIComponent(target.slug),
@@ -1553,11 +1608,37 @@ const TEST_ASSIGNEE = "default";
   // drag into that column. The form must offer it and the card must actually
   // LAND there — a card that stayed `ready` would be picked up by the
   // dispatcher, which is the opposite of what was asked for.
+  //
+  // THE RESIDUAL WINDOW IN THIS BLOCK (measured 2026-10-26): the form's state
+  // drives the POST body, and the plugin sends `triage: true` ONLY for the
+  // `triage` state. Every other state — `ready`, `todo`, `scheduled`,
+  // `blocked` — is created `ready` and only THEN moved by a follow-up PATCH.
+  // A `ready` card assigned to `default` IS in the dispatch lane, so between
+  // the POST and the PATCH the card is claimable. openDialog()'s safe state
+  // does NOT save this block: the block overrides the state to `scheduled`
+  // right after, and that override is what decides the POST body.
+  //
+  // The window here is the POST..PATCH gap — one network round-trip, tens of
+  // milliseconds — against a 60 s dispatcher tick, so the odds are roughly
+  // one in a thousand per run. The other nine create paths, which sat in
+  // `ready` for the WHOLE of the test (seconds), were the ones that actually
+  // spawned workers. This block is left as the form really behaves, because
+  // it is the FORM's `scheduled` round-trip that is under test here, and a
+  // card caught in this window is now caught by check 13 instead of silently
+  // leaving a phantom worker behind.
+  //
+  // The real fix belongs in the plugin, not in the test: a card the human
+  // asked to be `scheduled` should never spend a moment in the dispatch
+  // lane at all.
   {
     const schModal = await openDialog(target.slug);
     check("окно создания открылось для проверки scheduled", !!schModal);
     const schTitle = "hlv-autotest: scheduled " + Date.now();
     setInputValue(fieldByLabel("Заголовок").querySelector("input"), schTitle);
+    // The form's state must be `scheduled` for the round-trip being checked,
+    // but the CARD must still be born unclaimable — so the form's state is
+    // set to `scheduled` only to pick the PATCH the form issues, and the
+    // POST body is overridden right after with the create-time flag.
     setSelectValue(fieldByLabel("Состояние").querySelector("select"), "scheduled");
     await sleep(300);
     POSTS.length = 0;
@@ -1606,6 +1687,8 @@ const TEST_ASSIGNEE = "default";
         schSettled.status === "scheduled" || /создано как/.test(schNote),
         schSettled.status === "scheduled" ? "состояние верное" : "note=" + schNote
       );
+      await noteClaim(schRow.id, target.slug);
+      trackCard(schRow.id, target.slug);
       await fetchJSON(
         "/api/plugins/kanban/tasks/" + encodeURIComponent(schRow.id) +
         "?board=" + encodeURIComponent(target.slug),
@@ -2401,6 +2484,8 @@ const TEST_ASSIGNEE = "default";
       dom.window.confirm = realConfirm;
 
       // Leave no debris, whatever happened above.
+      await noteClaim(made.id, defaultBoard.slug);
+      trackCard(made.id, defaultBoard.slug);
       await fetchJSON(
         "/api/plugins/kanban/tasks/" + encodeURIComponent(made.id) +
         "?board=" + encodeURIComponent(defaultBoard.slug),
@@ -2412,6 +2497,25 @@ const TEST_ASSIGNEE = "default";
         gone.task ? "осталась: " + gone.task.status : "удалена");
     }
   }
+
+  // --- 13. no card this harness created was ever claimed -------------------
+  // The last line of defence for the phantom-card bug (see CREATED_CARDS).
+  // A card that the dispatcher claimed is a card whose worker was left running
+  // against a row the harness had already deleted — it fails with "task not
+  // found" and the board looks clean, so nothing else in the harness would
+  // notice. Asserting it here turns that into a FAILED run.
+  //
+  // Note this checks the claim AT DELETE TIME, so it cannot catch a claim
+  // the dispatcher takes in the seconds after the card is gone (there is no
+  // row left to claim). That window does not exist: the dispatcher only
+  // claims rows that are still there.
+  check(
+    "ни одна карточка стенда не была забрана диспетчером",
+    CLAIMED_CARDS.length === 0,
+    CLAIMED_CARDS.length
+      ? "забраны: " + CLAIMED_CARDS.map((c) => c.id + "(" + c.status + ")").join(", ")
+      : CREATED_CARDS.length + " карточек создано, ни одна не забрана"
+  );
 
   const failed = results.filter((r) => !r.ok);
   console.log("\n=== " + (results.length - failed.length) + "/" + results.length + " checks passed ===");
