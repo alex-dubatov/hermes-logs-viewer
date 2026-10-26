@@ -2483,6 +2483,65 @@ const TEST_ASSIGNEE = "default";
         errNote ? errNote.textContent : "нет сообщения об ошибке");
       dom.window.confirm = realConfirm;
 
+      // --- 12-bis. sending a comment (the write the operator lost) -------
+      // 2026-10-26: comment SENDING stopped working while the thread kept
+      // rendering. Root cause was the plugin's own POST route answering
+      // `200 null` (its async wrapper had lost `return await
+      // asyncio.to_thread(_run)`), and the UI posted to it blindly. The
+      // composer now posts through the bundled kanban route, which is live
+      // without a dashboard restart, and re-reads the thread on success.
+      // These checks drive the real textarea + send button and read the
+      // comment back off the BOARD, not out of the UI's own state.
+      const commentsTab = $$(".hlv-tab").find((b) =>
+        (b.textContent || "").trim().indexOf("комментарии") === 0);
+      check("вкладка «комментарии» есть", !!commentsTab);
+      if (commentsTab) {
+        click(commentsTab);
+        await sleep(800);
+        const input = $(".hlv-composer-input");
+        const sendBtn = $(".hlv-composer-send");
+        check("поле ввода комментария на месте", !!input);
+        check("кнопка «отправить» на месте", !!sendBtn);
+        const text = "стенд: комментарий " + Date.now();
+        if (input && sendBtn) {
+          POSTS.length = 0;
+          setInputValue(input, text);
+          await sleep(200);
+          click(sendBtn);
+          // Well under the 5 s poll: what appears here came from the
+          // refetch that runs on a successful post.
+          await sleep(1500);
+
+          const posted = POSTS.find((p) =>
+            p.path.indexOf("/api/plugins/kanban/tasks/" + made.id + "/comments") !== -1);
+          check("комментарий отправлен bundled-маршрутом", !!posted,
+            POSTS.map((p) => p.path).join(", ") || "POST-ов нет");
+          check("в теле ушёл текст комментария",
+            !!posted && (posted.body || {}).body === text,
+            posted ? JSON.stringify(posted.body) : "нет");
+
+          const thread = await fetchJSON(
+            "/api/plugins/hermes-logs-viewer/tasks/" + encodeURIComponent(made.id) +
+            "/comments?board=" + encodeURIComponent(defaultBoard.slug));
+          const onBoard = (thread.comments || []).filter((c) => c.body === text);
+          check("комментарий записан на доске", onBoard.length === 1,
+            (thread.comments || []).length + " в ленте");
+          // One row, not two: the old code appended optimistically AND the
+          // poll re-read the same comment, which is how a duplicate could
+          // appear once the post worked again.
+          check("дубля строки нет", onBoard.length <= 1, onBoard.length);
+
+          const shown = $$(".hlv-comment-body").map((n) => (n.textContent || ""));
+          check("комментарий виден в ленте без ожидания опроса",
+            shown.some((b) => b === text), shown.slice(-2).join(" | "));
+          check("поле ввода очищено после отправки",
+            ($(".hlv-composer-input") || {}).value === "",
+            JSON.stringify(($(".hlv-composer-input") || {}).value));
+        }
+        click(findButton("основное"));
+        await sleep(600);
+      }
+
       // Leave no debris, whatever happened above.
       await noteClaim(made.id, defaultBoard.slug);
       trackCard(made.id, defaultBoard.slug);

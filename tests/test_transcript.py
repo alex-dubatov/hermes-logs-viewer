@@ -595,6 +595,73 @@ def main() -> int:
           edited and "max_runtime_seconds" in (edited[-1][1] or ""),
           edited[-1][1] if edited else None)
 
+    # --- 14. comments: the OTHER write path ------------------------------
+    # 2026-10-26: sending a comment silently stopped working. The route's
+    # async wrapper had lost its `return await asyncio.to_thread(_run)` (the
+    # runtime block was inserted right where that line sat), so the handler
+    # fell off the end and FastAPI answered `200 null` — the UI's draft
+    # cleared, nothing was written, and the thread (a GET, still wired
+    # correctly) kept looking fine. These checks pin the whole contract, and
+    # the first one is the regression itself: a 200 must carry `ok`+`id`.
+    con = sqlite3.connect(str(board_db))
+    con.execute("CREATE TABLE IF NOT EXISTS task_comments ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, "
+                "author TEXT, body TEXT, created_at INTEGER)")
+    con.commit()
+    con.close()
+
+    r_c = client.post("/tasks/t_new00001/comments", params={"board": "hypercube"},
+                       json={"body": "  проверка отправки  "})
+    c_body = r_c.json()
+    check("комментарий: 200 и не null", r_c.status_code == 200 and isinstance(c_body, dict),
+          (r_c.status_code, c_body))
+    check("комментарий: ok в ответе", c_body.get("ok") is True, c_body)
+    check("комментарий: id в ответе", isinstance(c_body.get("id"), int) and c_body["id"] > 0,
+          c_body.get("id"))
+
+    con = sqlite3.connect(str(board_db))
+    rows = con.execute("SELECT author, body FROM task_comments WHERE task_id = ? "
+                       "ORDER BY id", ("t_new00001",)).fetchall()
+    con.close()
+    check("комментарий: строка в БД одна", len(rows) == 1, rows)
+    check("комментарий: текст сохранён без пробелов по краям",
+          rows and rows[0][1] == "проверка отправки", rows)
+    check("комментарий: автор по умолчанию dashboard",
+          rows and rows[0][0] == "dashboard", rows)
+
+    # The thread reads it back — the display side of the same write.
+    r_cl = client.get("/tasks/t_new00001/comments", params={"board": "hypercube"})
+    check("комментарий: виден в ленте", r_cl.status_code == 200
+          and any(c["body"] == "проверка отправки" for c in r_cl.json().get("comments") or []),
+          r_cl.json())
+
+    # The built-in Kanban tab's activity feed reads events, not comments.
+    con = sqlite3.connect(str(board_db))
+    evs = con.execute("SELECT payload FROM task_events WHERE task_id = ? "
+                       "AND kind = 'commented'", ("t_new00001",)).fetchall()
+    con.close()
+    check("комментарий: событие 'commented' записано", len(evs) == 1, len(evs))
+    check("комментарий: в событии автор и длина",
+          evs and '"len": 17' in (evs[0][0] or ""), evs[0][0] if evs else None)
+
+    # Refusals must be honest, not another `200 null`.
+    r_empty = client.post("/tasks/t_new00001/comments", params={"board": "hypercube"},
+                           json={"body": "   "})
+    check("комментарий: пустой текст -> 400", r_empty.status_code == 400,
+          (r_empty.status_code, r_empty.json()))
+    r_unknown = client.post("/tasks/t_nosuch01/comments", params={"board": "hypercube"},
+                             json={"body": "x"})
+    check("комментарий: неизвестная задача -> 404", r_unknown.status_code == 404,
+          r_unknown.status_code)
+    r_bad = client.post("/tasks/не id/comments", params={"board": "hypercube"},
+                         json={"body": "x"})
+    check("комментарий: плохой task id -> 400", r_bad.status_code == 400, r_bad.status_code)
+    con = sqlite3.connect(str(board_db))
+    n_after = con.execute("SELECT COUNT(*) FROM task_comments WHERE task_id = ?",
+                           ("t_new00001",)).fetchone()[0]
+    con.close()
+    check("комментарий: отказы ничего не записали", n_after == 1, n_after)
+
     failed = [n for n, ok in RESULTS if not ok]
     print("\n=== %d/%d checks passed ===" % (len(RESULTS) - len(failed), len(RESULTS)))
     if failed:

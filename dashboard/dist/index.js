@@ -700,6 +700,9 @@ function Page() {
     var selfScrollTopRef = useRef(0);
     // The comments thread scroll container (auto-follow the newest comment).
     var commentsScrollRef = useRef(null);
+    // Re-reads the thread now (set by the poller's effect). Used after a
+    // successful POST so the new comment appears without waiting a tick.
+    var commentsReloadRef = useRef(null);
     // scrollTop this plugin last set on the LOG pane. A scroll event landing on
     // it is ours — including the browser's clamp-to-0 when the pane's content
     // is swapped for a shorter window — and must not be read as "the user took
@@ -1244,6 +1247,7 @@ function Page() {
       if (!selected) {
         setComments([]);
         setCommentNote({ kind: "", text: "" });
+        commentsReloadRef.current = null;
         return;
       }
       var stop = false;
@@ -1255,10 +1259,15 @@ function Page() {
           setComments(r.comments || []);
         });
       }
+      // The composer posts through the bundled route and then asks the thread
+      // to re-read itself, so a fresh comment shows up at once instead of on
+      // the next tick.
+      commentsReloadRef.current = load;
       load();
       var h = setInterval(load, COMMENT_POLL_MS);
       return function () {
         stop = true;
+        commentsReloadRef.current = null;
         clearInterval(h);
       };
     }, [selected, api, boardOf]);
@@ -1742,6 +1751,20 @@ function Page() {
     // Append a comment (the one write the plugin performs). Called from the
     // send button and from onDraftKeyDown (Ctrl/Cmd+Enter). The draft lives in
     // `draft` state, not in the event, so a stale/absent event is harmless.
+    //
+    // The POST goes to the BUNDLED kanban plugin's route, not to this plugin's
+    // own `POST /tasks/{id}/comments`. Both write the same two rows (the
+    // comment and the `commented` event), but the bundled router is mounted at
+    // process start, so it is live without a dashboard restart — the same
+    // reason the task list, the log tail and the task edits all go through
+    // `KANBAN_API`. (2026-10-26: this plugin's own route answered `200 null`
+    // and wrote nothing — its async wrapper had lost its `return await
+    // asyncio.to_thread(_run)`; the UI kept "working" against the route that
+    // stayed live.)
+    //
+    // The reply carries no comment id, so the thread is REFETCHED right after
+    // a successful post instead of being appended to optimistically: the poll
+    // owns the list, and re-reading it cannot render a duplicate row.
     function submitComment() {
       var id = selectedRef.current;
       if (!id || commentBusy) return;
@@ -1753,34 +1776,27 @@ function Page() {
       setCommentBusy(true);
       setCommentNote({ kind: "", text: "" });
       setDraft("");
-      api("/tasks/" + encodeURIComponent(id) + "/comments?board=" +
+      fetchJSON(KANBAN_API + "/tasks/" + encodeURIComponent(id) + "/comments?board=" +
         encodeURIComponent(boardOf(id)), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ body: text }),
+        }).catch(function (e) {
+          return { __error: String((e && e.message) || e) };
         }).then(function (r) {
           setCommentBusy(false);
-          if (r.__error) {
+          var failed = r.__error || r.error || r.detail || r.ok === false;
+          if (failed) {
             // restore the draft on failure so nothing is lost
             setDraft(text);
-            setCommentNote({ kind: "err", text: r.__error });
+            setCommentNote({
+              kind: "err",
+              text: r.__error || r.detail || r.error || "не удалось отправить",
+            });
             return;
           }
           setCommentNote({ kind: "ok", text: "комментарий добавлен" });
-          // Optimistic append so the thread updates without waiting a poll tick.
-          // Dedupe by id: a poll can commit the server copy first (or the POST
-          // resolves after one already did), which would otherwise render two
-          // rows for the same comment id.
-          setComments(function (prev) {
-            var postedId = r.id || 0;
-            if (prev.some(function (c) { return c.id === postedId; })) return prev;
-            return prev.concat([{
-              id: (r.id || 0),
-              author: "dashboard",
-              body: text,
-              created_at: Math.floor(Date.now() / 1000),
-            }]);
-          });
+          if (commentsReloadRef.current) commentsReloadRef.current();
           // Clear the success note after a beat.
           setTimeout(function () {
             setCommentNote(function (n) {

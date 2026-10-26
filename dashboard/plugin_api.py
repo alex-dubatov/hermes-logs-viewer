@@ -613,6 +613,8 @@ async def add_comment(
             con.close()
         return {"ok": True, "id": new_id}
 
+    return await asyncio.to_thread(_run)
+
 
 # --- The execution-time cap (the second write path) -----------------------
 
