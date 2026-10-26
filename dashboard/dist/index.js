@@ -140,6 +140,28 @@
     }
   }
 
+  // The execution-time cap in MINUTES, for the card pane's field. The column
+  // behind it speaks seconds; the field speaks minutes — what a human plans
+  // in, the same unit the create dialog uses. Both conversions live here, so
+  // the two places that show the cap cannot drift apart.
+  //
+  // A cap that is not a whole number of minutes (the CLI takes seconds) is
+  // shown as the exact minute value with a fraction, so nothing is silently
+  // rounded on the way in.
+  function runtimeMinutes(seconds) {
+    var s = Number(seconds) || 0;
+    if (!s) return 0;
+    var m = s / 60;
+    return Number.isInteger(m) ? m : Math.round(m * 100) / 100;
+  }
+
+  // The same cap as the field shows it: "∞" for no cap, else the minutes.
+  function runtimeLabel(seconds) {
+    var s = Number(seconds) || 0;
+    if (!s) return "∞";
+    return runtimeMinutes(s) + " мин";
+  }
+
   function storeBoard(value) {
     try {
       window.localStorage.setItem(BOARD_KEY, value || ALL_BOARDS);
@@ -349,9 +371,26 @@ function Page() {
     var transcriptState = useState({
       messages: [], source: "", session_id: "", store: "",
       next_after: 0, loaded: false, error: "", has_more: false, gen: 0,
+      live: {}, events: [],
     });
     var transcript = transcriptState[0];
     var setTranscript = transcriptState[1];
+    // The LIVE layer on top of the transcript: what the agent is doing right
+    // now (its activity stamp and counters) and the run's trail of model
+    // calls and tools.
+    //
+    // WHY IT IS NEEDED: the transcript itself is a HISTORY — a message row
+    // appears when the model call that produced it ENDS, so between two
+    // messages (a long call can take minutes) the pane looks frozen even
+    // though the agent is working. The owner session's activity stamp and
+    // the profile's log answer "is it alive and what is it doing" without
+    // pretending the reasoning itself streams.
+    //
+    // The events are keyed by their position in the list, so the poll
+    // REPLACES them wholesale: the route returns the newest N, and a
+    // shrinking trail (rotation) must not leave stale lines behind.
+    var transcriptLive = transcript.live || {};
+    var transcriptEvents = transcript.events || [];
     // Bumped whenever NEW messages arrive. The auto-scroll effect keys on it
     // instead of the message COUNT: the pane renders at most
     // TRANSCRIPT_MAX_RENDERED messages, so on a long-running card the count
@@ -392,6 +431,32 @@ function Page() {
     // reads as "autoscroll is broken". Each card now follows its own tail.
     var transcriptModeRef = useRef(new Map());
     var transcriptTopRef = useRef(new Map());
+    // The events box of the live strip: a short, scrolling window on the
+    // run's trail. It is pinned to its NEWEST line — the trail reads top
+    // down, and the line that matters is the last one.
+    var transcriptEventsRef = useRef(null);
+    // Whether the reader scrolled the trail AWAY from its bottom. The box
+    // re-pins itself only while they have not; once they pick a spot, it
+    // stays there instead of yanking them back on every poll.
+    var transcriptEventsPinnedRef = useRef(true);
+    // scrollTop this plugin last set on the trail: a scroll event landing
+    // on it is ours and must not read as "the reader took over".
+    var selfEventsScrollRef = useRef(0);
+    // The reasoning of a message opens ITSELF.
+    //
+    // The operator asked for the reasoning blocks to be expanded by default
+    // ("блок рассуждений всегда должен быть по умолчанию развернут"), so
+    // EVERY reasoning block opens, not only the newest one.
+    //
+    // The open is done in a MOUNT callback, not an ``open`` prop: the pane
+    // re-renders on every poll, and a prop would be re-applied each time —
+    // quietly re-opening a block the reader had just folded away. The mount
+    // callback fires once, when the block appears; after that the reader is
+    // in charge of it.
+    var autoOpenReasoning = useCallback(function (node) {
+      if (!node) return;
+      node.open = true;
+    }, []);
 
     // --- Task card: the "основное" tab ------------------------------------
     // Read/written through the bundled plugin's task routes: GET /tasks/{id}
@@ -461,6 +526,21 @@ function Page() {
     var metaDraftState = useState("0");
     var metaDraft = metaDraftState[0];
     var setMetaDraft = metaDraftState[1];
+
+    // --- Runtime (the execution-time cap) --------------------------------
+    // The cap is NOT editable through the bundled plugin: its PATCH body has
+    // no such field, so this plugin writes the column through its own route
+    // (PATCH /tasks/{id}/runtime). The field speaks MINUTES — what a human
+    // plans in, the same unit as the create dialog — and the route speaks
+    // seconds, so the conversion happens here, once.
+    var runtimeEditState = useState(false);
+    var runtimeEdit = runtimeEditState[0];
+    var setRuntimeEdit = runtimeEditState[1];
+    var runtimeEditRef = useRef(false);
+    runtimeEditRef.current = runtimeEdit;
+    var runtimeDraftState = useState("0");
+    var runtimeDraft = runtimeDraftState[0];
+    var setRuntimeDraft = runtimeDraftState[1];
 
     var showArchivedState = useState(false);
     var showArchived = showArchivedState[0];
@@ -1202,6 +1282,31 @@ function Page() {
       pinTranscriptToBottom();
     }, [pane, transcript.gen]);
 
+    // The live strip's event trail follows its own tail: it is a short
+    // scrolling window (the newest lines are the ones that matter), and
+    // the newest line arrives at the BOTTOM of the box. Without this the
+    // window sits on its oldest entry and the reader sees a stale trail.
+    //
+    // A reader who scrolled UP in the trail keeps their place: the box is
+    // re-pinned only while it was already following the tail.
+    useEffect(function () {
+      var box = transcriptEventsRef.current;
+      if (!box) return;
+      if (!transcriptEventsPinnedRef.current) return;
+      box.scrollTop = box.scrollHeight;
+      selfEventsScrollRef.current = box.scrollTop;
+    }, [pane, transcript.events]);
+
+    // The reader scrolled the trail. Our own scroll (the pin above) must
+    // not read as "they took over" — otherwise the very act of following
+    // the tail would switch the pin off and freeze the box.
+    function onTranscriptEventsScroll(e) {
+      var node = e.target;
+      if (Math.abs(node.scrollTop - selfEventsScrollRef.current) < 2) return;
+      var gap = node.scrollHeight - node.scrollTop - node.clientHeight;
+      transcriptEventsPinnedRef.current = gap < 24;
+    }
+
     // --- Live transcript of the selected card ------------------------------
     //
     // Polled every 2 s, the same cadence as the task list. The route answers
@@ -1225,9 +1330,12 @@ function Page() {
         transcriptCacheRef.current.clear();
         transcriptModeRef.current.clear();
         transcriptTopRef.current.clear();
+        // A new card gets a fresh trail that follows its own tail.
+        transcriptEventsPinnedRef.current = true;
         setTranscript({
           task_id: "", messages: [], source: "", session_id: "", store: "",
           next_after: 0, loaded: false, error: "", has_more: false, gen: 0,
+          live: {}, events: [],
         });
         return;
       }
@@ -1277,6 +1385,8 @@ function Page() {
             loaded: true,
             error: r.error || "",
             has_more: !!r.has_more,
+            live: r.live || {},
+            events: r.events || [],
             gen: transcriptGenRef.current,
           });
           // Following the newest message? Keep pinned. (The effect above
@@ -1346,6 +1456,11 @@ function Page() {
           // keeps what is typed until it is saved or cancelled.
           if (!titleEditRef.current) setTitleDraft(r.task.title || "");
           if (!metaEditRef.current) setMetaDraft(String(r.task.priority || 0));
+          // The runtime field follows the same rule as the others: an open
+          // editor keeps what is typed until it is saved or cancelled.
+          if (!runtimeEditRef.current) {
+            setRuntimeDraft(String(runtimeMinutes(r.task.max_runtime_seconds || 0)));
+          }
         }).catch(function () {});
       }
       load();
@@ -1549,6 +1664,78 @@ function Page() {
       if (e.key === "Escape") {
         e.preventDefault();
         cancelMetaEdit();
+      }
+    }
+
+    // --- Runtime: the pencil next to the execution-time cap ---------------
+    //
+    // The write goes to THIS plugin's route, not the bundled one: the
+    // bundled PATCH body has no `max_runtime_seconds` field, so the cap of
+    // an existing card can only be changed through a route that writes the
+    // column itself.
+    function startRuntimeEdit() {
+      if (!desc) return;
+      setRuntimeDraft(String(runtimeMinutes(desc.runtime || 0)));
+      setNote({ kind: "", text: "" });
+      setRuntimeEdit(true);
+    }
+
+    function cancelRuntimeEdit() {
+      setRuntimeEdit(false);
+      setRuntimeDraft(desc ? String(runtimeMinutes(desc.runtime || 0)) : "0");
+      setNote({ kind: "", text: "" });
+    }
+
+    function saveRuntime() {
+      var raw = (runtimeDraft || "").trim();
+      // An empty / non-numeric field would send NaN, and `Number("")||0` would
+      // silently write "no cap" over a real limit. Refuse it and say why.
+      if (!/^\d+(\.\d+)?$/.test(raw)) {
+        setNote({ kind: "err", text: "время выполнения — число минут (0 — без ограничения)" });
+        return;
+      }
+      var minutes = parseFloat(raw);
+      var seconds = Math.round(minutes * 60);
+      var id = selectedRef.current;
+      if (!id || cardBusy) return;
+      setCardBusy(true);
+      setNote({ kind: "", text: "" });
+      api("/tasks/" + encodeURIComponent(id) + "/runtime?board=" +
+          encodeURIComponent(boardOf(id)),
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ max_runtime_seconds: seconds }),
+        }
+      ).then(function (r) {
+        setCardBusy(false);
+        if (r.__error || r.error) {
+          setNote({ kind: "err", text: r.error || r.__error || "не удалось изменить время выполнения" });
+          return;
+        }
+        setNote({ kind: "ok", text: "время выполнения: " + runtimeLabel(seconds) });
+        setDescField("runtime", seconds);
+        setRuntimeEdit(false);
+        setTimeout(function () {
+          setNote(function (n) {
+            return n.kind === "ok" ? { kind: "", text: "" } : n;
+          });
+        }, 2500);
+      }).catch(function (e) {
+        setCardBusy(false);
+        setNote({ kind: "err", text: String((e && e.message) || e) });
+      });
+    }
+
+    function onRuntimeKeyDown(e) {
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        saveRuntime();
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        cancelRuntimeEdit();
       }
     }
 
@@ -2585,41 +2772,85 @@ function Page() {
           // A turn that only CALLS tools has an empty body; the calls live in
           // their own column, and without this the pane shows a blank row.
           var calls = m.tool_calls || [];
+          // Only the AGENT's own steps are open by default. Everything else
+          // — the user's turn, a tool's answer — is folded: the operator
+          // asked for "все что не assistant шаги" to be collapsed, and a
+          // transcript is mostly tool output that would drown the reasoning
+          // if every block were open.
+          //
+          // The fold is a `<details>` WITHOUT an `open` prop on purpose:
+          // React would re-apply the prop on every poll and slam the block
+          // shut again the moment the reader opened it. Uncontrolled, the
+          // browser keeps whatever the reader did.
+          var isAgentStep = role === "assistant";
+          var bodyNode = body
+            ? el("pre", { className: "hlv-transcript-text" }, body)
+            : el("div", { className: "hlv-transcript-text hlv-transcript-empty" },
+                m.preview || (calls.length ? "" : "(пусто)"));
+          var inner = isAgentStep
+            ? el("div", { className: "hlv-transcript-inner" },
+                reasoning
+                  ? el("details", {
+                      className: "hlv-transcript-reasoning",
+                      // The reasoning opens itself (see autoOpenReasoning):
+                      // the operator asked for the reasoning blocks to be
+                      // expanded by default.
+                      ref: autoOpenReasoning,
+                      "data-msg-id": String(m.id),
+                    },
+                      el("summary", null, "рассуждения"),
+                      el("pre", { className: "hlv-transcript-reasoning-text" }, reasoning),
+                      m.reasoning_truncated
+                        ? el("span", { className: "hlv-transcript-cut" }, "обрезано")
+                        : null)
+                  : null,
+                calls.length
+                  ? el("div", { className: "hlv-transcript-calls" },
+                      calls.map(function (c) {
+                        return el("div", { key: c.name, className: "hlv-transcript-call" },
+                          "→ " + c.name + (c.arguments ? " " + c.arguments : ""));
+                      }))
+                  : null,
+                bodyNode)
+            : el("details", { className: "hlv-transcript-fold" },
+                el("summary", { className: "hlv-transcript-fold-summary" },
+                  el("span", { className: "hlv-transcript-role" }, head),
+                  m.timestamp
+                    ? el("span", { className: "hlv-transcript-time" },
+                        new Date(m.timestamp * 1000).toLocaleTimeString())
+                    : null,
+                  m.truncated
+                    ? el("span", {
+                        className: "hlv-transcript-cut",
+                        title: "сообщение длиннее лимита — показана только его часть",
+                      }, "обрезано")
+                    : null,
+                  // A one-line digest of what the step said, so the folded
+                  // row still says something. The route already computes it
+                  // (``preview``); CSS truncates it to one line.
+                  m.preview
+                    ? el("span", { className: "hlv-transcript-fold-preview" }, m.preview)
+                    : null,
+                  el("span", { className: "hlv-transcript-fold-hint" }, "развернуть")),
+                bodyNode);
           return el(
             "div",
             { key: String(m.id), className: "hlv-transcript-msg hlv-role-" + role },
-            el("div", { className: "hlv-transcript-head" },
-              el("span", { className: "hlv-transcript-role" }, head),
-              m.timestamp
-                ? el("span", { className: "hlv-transcript-time" },
-                    new Date(m.timestamp * 1000).toLocaleTimeString())
-                : null,
-              m.truncated
-                ? el("span", {
-                    className: "hlv-transcript-cut",
-                    title: "сообщение длиннее лимита — показана только его часть",
-                  }, "обрезано")
-                : null
-            ),
-            reasoning
-              ? el("details", { className: "hlv-transcript-reasoning" },
-                  el("summary", null, "рассуждения"),
-                  el("pre", { className: "hlv-transcript-reasoning-text" }, reasoning),
-                  m.reasoning_truncated
-                    ? el("span", { className: "hlv-transcript-cut" }, "обрезано")
+            isAgentStep
+              ? el("div", { className: "hlv-transcript-head" },
+                  el("span", { className: "hlv-transcript-role" }, head),
+                  m.timestamp
+                    ? el("span", { className: "hlv-transcript-time" },
+                        new Date(m.timestamp * 1000).toLocaleTimeString())
+                    : null,
+                  m.truncated
+                    ? el("span", {
+                        className: "hlv-transcript-cut",
+                        title: "сообщение длиннее лимита — показана только его часть",
+                      }, "обрезано")
                     : null)
               : null,
-            calls.length
-              ? el("div", { className: "hlv-transcript-calls" },
-                  calls.map(function (c) {
-                    return el("div", { key: c.name, className: "hlv-transcript-call" },
-                      "→ " + c.name + (c.arguments ? " " + c.arguments : ""));
-                  }))
-              : null,
-            body
-              ? el("pre", { className: "hlv-transcript-text" }, body)
-              : el("div", { className: "hlv-transcript-text hlv-transcript-empty" },
-                  m.preview || (calls.length ? "" : "(пусто)"))
+            inner
           );
         })
       );
@@ -2637,6 +2868,64 @@ function Page() {
             : null)
       : null;
 
+    // --- The live strip ---------------------------------------------------
+    //
+    // What the agent is doing RIGHT NOW, and the run's trail of model calls
+    // and tools. The transcript itself only grows when a model call ENDS, so
+    // without this the pane looks dead during a long call even though the
+    // agent is working hard.
+    //
+    // The activity description comes from the runtime ("receiving stream
+    // response", "terminal command running (40s elapsed)", …). It is shown
+    // as it is — the plugin does not translate the runtime's own words, and
+    // an untranslated string is still readable where a wrong translation
+    // would not be.
+    var liveActivity = transcriptLive.last_activity_description || "";
+    var liveAge = transcriptLive.activity_age;
+    var transcriptLiveStrip = null;
+    if (transcript.loaded && transcriptIsForSelected && transcriptSource === "owner_session") {
+      var liveBits = [];
+      if (liveActivity) liveBits.push(liveActivity);
+      if (transcriptLive.model) liveBits.push(transcriptLive.model);
+      if (transcriptLive.api_call_count != null) {
+        liveBits.push("вызовов: " + transcriptLive.api_call_count);
+      }
+      if (transcriptLive.tool_call_count != null) {
+        liveBits.push("инструментов: " + transcriptLive.tool_call_count);
+      }
+      if (liveAge != null) {
+        liveBits.push("активность " + Math.round(liveAge) + " с назад");
+      }
+      if (transcriptLive.ended_at) {
+        liveBits.push("сессия завершена");
+      }
+      transcriptLiveStrip = el(
+        "div",
+        { className: "hlv-transcript-live" + (transcriptLive.running ? " hlv-live-on" : "") },
+        el("div", { className: "hlv-transcript-live-head" },
+          el("span", { className: "hlv-live-dot" }),
+          el("span", null, liveBits.length ? liveBits.join(" · ") : "сессия без активности")),
+        transcriptEvents.length
+          ? el("div", {
+              className: "hlv-transcript-events",
+              ref: transcriptEventsRef,
+              onScroll: onTranscriptEventsScroll,
+            },
+              transcriptEvents.map(function (ev, i) {
+                return el(
+                  "div",
+                  {
+                    key: String(i),
+                    className: "hlv-transcript-event hlv-ev-" + (ev.kind || "info"),
+                  },
+                  el("span", { className: "hlv-transcript-event-time" }, ev.time || ""),
+                  el("span", { className: "hlv-transcript-event-text" }, ev.short || ev.text || "")
+                );
+              }))
+          : null
+      );
+    }
+
     var transcriptPane = el(
       "div",
       {
@@ -2644,6 +2933,7 @@ function Page() {
         ref: transcriptScrollRef,
         onScroll: onTranscriptScroll,
       },
+      transcriptLiveStrip,
       transcriptMeta,
       transcriptBody,
       selected && transcript.loaded && transcriptMessages.length &&
@@ -2796,10 +3086,7 @@ function Page() {
             el("span", { className: statusClass(curStatus) },
               STATUS_LABEL[curStatus] || curStatus),
             desc.assignee ? el("span", null, "@" + desc.assignee) : null,
-            el("span", null, "воркспейс: " + desc.workspace),
-            el("span", {
-              title: "лимит времени воркера; 0 = бесконечно",
-            }, "время: " + (desc.runtime ? desc.runtime + " с" : "∞"))
+            el("span", null, "воркспейс: " + desc.workspace)
           )
         ),
         el("div", { className: "hlv-field-row" },
@@ -2826,6 +3113,32 @@ function Page() {
           ),
           el("span", { className: "hlv-field-hint" },
             "чем выше, тем раньше воркер возьмёт задачу; порядок ready — как в диспетчере")
+        ),
+        el("div", { className: "hlv-field-row" },
+          el("span", { className: "hlv-field-label" }, "время выполнения"),
+          runtimeEdit
+            ? el("input", {
+                className: "hlv-input hlv-runtime-input",
+                type: "number",
+                step: "1",
+                min: "0",
+                value: runtimeDraft,
+                autoFocus: true,
+                "aria-label": "время выполнения задачи, минут",
+                onChange: function (e) { setRuntimeDraft(e.target.value); },
+                onKeyDown: onRuntimeKeyDown,
+              })
+            : el("span", { className: "hlv-runtime-value" },
+                runtimeLabel(desc.runtime || 0)),
+          pencilBtn(
+            runtimeEdit,
+            startRuntimeEdit,
+            saveRuntime,
+            cancelRuntimeEdit,
+            "править время выполнения (Ctrl+Enter — сохранить, Esc — отмена)"
+          ),
+          el("span", { className: "hlv-field-hint" },
+            "через сколько минут воркер будет прерван; 0 — без ограничения. Понижение лимита у уже идущей задачи останавливает воркер")
         ),
         el("div", { className: "hlv-field-row" },
           el("span", { className: "hlv-field-label" }, "состояние"),

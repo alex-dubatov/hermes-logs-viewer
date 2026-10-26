@@ -100,6 +100,23 @@ CREATE TABLE messages (
 );
 """
 
+# The sessions table of a current Hermes: the LIVE state of the session
+# (the activity stamp the owner gateway writes mid-turn, and the counters).
+STORE_SESSIONS_SCHEMA = """
+CREATE TABLE sessions (
+    id                      TEXT PRIMARY KEY,
+    last_activity_at        REAL,
+    last_activity_description TEXT,
+    api_call_count          INTEGER,
+    tool_call_count         INTEGER,
+    input_tokens            INTEGER,
+    output_tokens           INTEGER,
+    ended_at                REAL,
+    end_reason              TEXT,
+    model                   TEXT
+);
+"""
+
 
 def make_board(path: Path, events):
     con = sqlite3.connect(str(path))
@@ -114,9 +131,30 @@ def make_board(path: Path, events):
     con.close()
 
 
-def make_store(path: Path, session_id, messages, legacy: bool = False):
+def add_board_event(path: Path, task_id: str, kind: str, payload):
+    """Add one event to a board db that already exists."""
+    con = sqlite3.connect(str(path))
+    con.execute(
+        "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+        "VALUES (?, NULL, ?, ?, 1700000000)",
+        (task_id, kind, payload),
+    )
+    con.commit()
+    con.close()
+
+
+def make_store(path: Path, session_id, messages, legacy: bool = False,
+               session_row=None, log_lines=None):
     con = sqlite3.connect(str(path))
     con.executescript(STORE_SCHEMA_LEGACY if legacy else STORE_SCHEMA)
+    if not legacy and session_row is not None:
+        con.executescript(STORE_SESSIONS_SCHEMA)
+        con.execute(
+            "INSERT INTO sessions (id, last_activity_at, last_activity_description, "
+            "api_call_count, tool_call_count, input_tokens, output_tokens, "
+            "ended_at, end_reason, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            session_row,
+        )
     for row in messages:
         role, content, tool_name, tool_calls, reasoning = row
         if legacy:
@@ -135,6 +173,26 @@ def make_store(path: Path, session_id, messages, legacy: bool = False):
             )
     con.commit()
     con.close()
+    # The owner profile's agent log — the trail of the run (model calls,
+    # tools). It lives next to the store: <profile home>/logs/agent.log.
+    if log_lines is not None:
+        logs = path.parent / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        (logs / "agent.log").write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+
+
+# A few lines of a real owner agent log, in the format the core writes:
+#   <ts> <LEVEL> [<session id>] <logger>: <text>
+LOG_LINES = [
+    "2026-10-25 12:00:00,100 INFO [local-abc123] agent.turn_context: conversation turn: session=local-abc123 model=qwen3.8-27b-q6kl-262k provider=rig",
+    "2026-10-25 12:00:01,200 INFO [local-abc123] agent.conversation_loop: API call #7: model=qwen3.8-27b-q6kl-262k provider=rig in=1000 out=180 total=1180 latency=12.5s cache=900/1000 (90%) id=chatcmpl-abc",
+    "2026-10-25 12:00:02,300 INFO [local-abc123] agent.tool_executor: tool terminal completed (0.42s, 975 chars)",
+    "2026-10-25 12:00:03,400 INFO [local-abc123] agent.conversation_loop: Re-anchored stale current_turn_user_idx 0 -> 0 (session=local-abc123)",
+    "2026-10-25 12:00:04,500 WARNING [local-abc123] agent.tool_executor: Tool patch returned error (0.14s): {\"success\": false}",
+    "2026-10-25 12:00:05,600 INFO [local-abc123] agent.conversation_compression: context compression started: session=local-abc123",
+    "2026-10-25 12:00:09,700 INFO [local-abc123] agent.conversation_loop: Turn ended: reason=text_response(finish_reason=stop) model=qwen3.8-27b-q6kl-262k api_calls=7/9223372036854775807 budget=7/9223372036854775807 tool_turns=3 last_msg_role=assistant response_len=2399 session=local-abc123",
+    "2026-10-25 12:00:10,800 INFO [other-session] agent.conversation_loop: API call #99: model=x provider=y in=1 out=2 total=3 latency=1.0s",
+]
 
 
 # --- the test ------------------------------------------------------------
@@ -166,7 +224,10 @@ def main() -> int:
         ("tool", json.dumps({"output": "готово"}), "terminal", None, None),
         ("tool", json.dumps({"output": big}), "terminal", None, None),
         ("assistant", "вот и всё", None, None, None),
-    ])
+    ], session_row=(
+        session_id, 1700000100.0, "receiving stream response",
+        7, 3, 1000, 180, None, None, "qwen3.8-27b-q6kl-262k",
+    ), log_lines=LOG_LINES)
 
     # A store from an older Hermes: no `tool_calls`, no `reasoning`.
     legacy_store = tmp / "profile-legacy" / "state.db"
@@ -342,6 +403,197 @@ def main() -> int:
     after = store_path.read_bytes()
     check("store не изменён (только чтение)", before == after,
           "размер %d → %d" % (len(before), len(after)))
+
+    # --- 10. the LIVE block: what the agent is doing RIGHT NOW -----------
+    #
+    # The transcript is a HISTORY: a message row appears when the model call
+    # that produced it ENDS. These two parts answer "is it alive and what is
+    # it doing" in the meantime — the session's own activity stamp (written
+    # by the owner gateway mid-turn) and the run's trail of model calls and
+    # tools (the owner profile's agent log).
+    live = body.get("live") or {}
+    check("live: описание активности на месте",
+          live.get("last_activity_description") == "receiving stream response",
+          live.get("last_activity_description"))
+    check("live: счётчики вызовов на месте", live.get("api_call_count") == 7,
+          live.get("api_call_count"))
+    check("live: счётчик инструментов на месте", live.get("tool_call_count") == 3,
+          live.get("tool_call_count"))
+    check("live: модель на месте", live.get("model") == "qwen3.8-27b-q6kl-262k",
+          live.get("model"))
+    check("live: возраст активности считается", live.get("activity_age") is not None,
+          live.get("activity_age"))
+    check("live: сессия без ended_at — значит работает", live.get("running") is True,
+          live.get("running"))
+
+    events = body.get("events") or []
+    kinds = [e.get("kind") for e in events]
+    check("events: строки лога пришли", len(events) > 0, len(events))
+    check("events: чужой сессии в trails нет",
+          all("other-session" not in (e.get("text") or "") for e in events))
+    check("events: вызов модели распознан", "api" in kinds, kinds)
+    check("events: вызов инструмента распознан", "tool" in kinds, kinds)
+    check("events: ошибка инструмента распознана", "error" in kinds, kinds)
+    check("events: завершение хода распознано", "turn" in kinds, kinds)
+    check("events: сжатие контекста распознано", "compress" in kinds, kinds)
+    check("events: служебные строки отфильтрованы",
+          not any("Re-anchored" in (e.get("short") or "") for e in events))
+    api_ev = [e for e in events if e.get("kind") == "api"]
+    check("events: у вызова модели есть краткая сводка",
+          api_ev and "вызов модели #7" in api_ev[0].get("short", ""),
+          api_ev[0].get("short") if api_ev else None)
+
+    # --- 11. a store WITHOUT a sessions table -> no live, no 500 --------
+    r_live = get({"board": "hypercube", "task_id": "t_legacy01"})
+    b_live = r_live.json()
+    check("старый store: live пустой, ответ 200", r_live.status_code == 200
+          and not (b_live.get("live") or {}), b_live.get("live"))
+    check("старый store: events пустые, ответ 200", r_live.status_code == 200
+          and not (b_live.get("events") or []), len(b_live.get("events") or []))
+
+    # --- 12. the reasoning is NOT clipped --------------------------------
+    # The operator: "Блоки рассуждений ИИ обрезать не надо!" — a reasoning
+    # cut in the middle says something the model did not think. The CONTENT
+    # of a message (a tool's output) is still capped — that is a different
+    # thing, and it is reported as such.
+    #
+    # A SEPARATE store: the one above already has the messages the other
+    # checks read, and it is not rewritten underneath them.
+    long_store = tmp / "profile-long" / "state.db"
+    long_store.parent.mkdir(parents=True, exist_ok=True)
+    long_reasoning = "Р" * 9000
+    long_content = "Я" * 9000
+    make_store(long_store, session_id, [
+        ("user", "задача", None, None, None),
+        ("assistant", long_content, None, None, long_reasoning),
+    ], session_row=(session_id, 1700000100.0, "receiving stream response",
+                    1, 0, 10, 10, None, None, "m"))
+    # The card points at the long store instead of the original one.
+    add_board_event(board_db, "t_long0001", "owner_admitted", json.dumps({
+        "db": str(long_store),
+        "session_id": session_id,
+        "request_id": 'kanban:["hypercube","t_long0001",8]',
+        "pid": 43,
+    }))
+    r_long = get({"board": "hypercube", "task_id": "t_long0001"})
+    long_msgs = r_long.json().get("messages") or []
+    long_reasoning_out = next(
+        (m for m in long_msgs if m.get("reasoning")), {})
+    check("длинное рассуждение вернулось целиком",
+          long_reasoning_out.get("reasoning") == long_reasoning,
+          "длина %d" % len(long_reasoning_out.get("reasoning") or ""))
+    check("длинное рассуждение не помечено обрезанным",
+          long_reasoning_out.get("reasoning_truncated") is False,
+          long_reasoning_out.get("reasoning_truncated"))
+    # The message CONTENT is still capped — and says so.
+    check("содержимое сообщения по-прежнему обрезается",
+          len(long_msgs[1].get("content") or "") <= 4000,
+          len(long_msgs[1].get("content") or ""))
+    check("обрезка содержимого помечена",
+          long_msgs[1].get("truncated") is True, long_msgs[1].get("truncated"))
+
+    # --- 13. the runtime cap: the card's own write path -----------------
+    # The bundled plugin cannot change the cap of an existing card (its
+    # PATCH body has no such field), so this plugin writes the column
+    # itself. These checks pin the contract of that route.
+    board_db = boards_root / "kanban" / "boards" / "hypercube" / "kanban.db"
+    con = sqlite3.connect(str(board_db))
+    con.execute("CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, "
+                 "title TEXT, max_runtime_seconds INTEGER)")
+    con.execute("INSERT OR REPLACE INTO tasks (id, title, max_runtime_seconds) "
+                 "VALUES ('t_new00001', 'карточка', NULL)")
+    con.commit()
+    con.close()
+
+    r_rt = client.patch("/tasks/t_new00001/runtime",
+                         params={"board": "hypercube"},
+                         json={"max_runtime_seconds": 1800})
+    check("runtime: отвечает 200", r_rt.status_code == 200, r_rt.status_code)
+    rt_body = r_rt.json()
+    check("runtime: ok", rt_body.get("ok") is True, rt_body)
+    check("runtime: значение вернулось", rt_body.get("max_runtime_seconds") == 1800,
+          rt_body.get("max_runtime_seconds"))
+
+    def read_runtime():
+        con = sqlite3.connect(str(board_db))
+        row = con.execute("SELECT max_runtime_seconds FROM tasks WHERE id = ?",
+                           ("t_new00001",)).fetchone()
+        con.close()
+        return row[0] if row else None
+
+    check("runtime: колонка записалась", read_runtime() == 1800, read_runtime())
+
+    # 0 means "no cap" — the column goes NULL (that is how the dispatcher
+    # reads "unlimited"; a stored 0 would kill the worker the instant it
+    # started).
+    r_rt0 = client.patch("/tasks/t_new00001/runtime",
+                          params={"board": "hypercube"},
+                          json={"max_runtime_seconds": 0})
+    check("runtime: 0 = без ограничения", r_rt0.status_code == 200
+          and r_rt0.json().get("max_runtime_seconds") is None,
+          r_rt0.json())
+    check("runtime: в БД NULL, а не 0", read_runtime() is None, read_runtime())
+
+    r_rtn = client.patch("/tasks/t_new00001/runtime",
+                          params={"board": "hypercube"},
+                          json={"max_runtime_seconds": 600})
+    check("runtime: cap снова ставится", read_runtime() == 600, read_runtime())
+
+    r_rt_bad = client.patch("/tasks/t_new00001/runtime",
+                             params={"board": "hypercube"},
+                             json={"max_runtime_seconds": -5})
+    check("runtime: отрицательное значение -> 400", r_rt_bad.status_code == 400,
+          r_rt_bad.status_code)
+    check("runtime: после отказа значение не изменилось", read_runtime() == 600,
+          read_runtime())
+
+    # An explicit null clears the cap (same as 0); an ABSENT field is a
+    # malformed request. Pydantic gives both the same None, so the route
+    # reads the set of fields the client actually sent.
+    r_rt_null = client.patch("/tasks/t_new00001/runtime",
+                              params={"board": "hypercube"},
+                              json={"max_runtime_seconds": None})
+    check("runtime: null = без ограничения", r_rt_null.status_code == 200
+          and r_rt_null.json().get("max_runtime_seconds") is None,
+          (r_rt_null.status_code, r_rt_null.json()))
+    check("runtime: null пишет NULL в БД", read_runtime() is None, read_runtime())
+
+    r_rt_absent = client.patch("/tasks/t_new00001/runtime",
+                                params={"board": "hypercube"}, json={})
+    check("runtime: без поля -> 400", r_rt_absent.status_code == 400,
+          r_rt_absent.status_code)
+    check("runtime: без поля значение не изменилось", read_runtime() is None,
+          read_runtime())
+
+    r_rt_404 = client.patch("/tasks/t_nosuch01/runtime",
+                             params={"board": "hypercube"},
+                             json={"max_runtime_seconds": 600})
+    check("runtime: неизвестная задача -> 404", r_rt_404.status_code == 404,
+          r_rt_404.status_code)
+
+    r_rt_bad_id = client.patch("/tasks/не id/runtime",
+                                params={"board": "hypercube"},
+                                json={"max_runtime_seconds": 600})
+    check("runtime: плохой task id -> 400", r_rt_bad_id.status_code == 400,
+          r_rt_bad_id.status_code)
+
+    r_rt_bad_board = client.patch("/tasks/t_new00001/runtime",
+                                  params={"board": "../etc"},
+                                  json={"max_runtime_seconds": 600})
+    check("runtime: плохой slug доски -> 400", r_rt_bad_board.status_code == 400,
+          r_rt_bad_board.status_code)
+
+    # The change leaves an event behind, so the built-in Kanban tab's
+    # activity feed shows it.
+    con = sqlite3.connect(str(board_db))
+    evs = con.execute("SELECT kind, payload FROM task_events "
+                       "WHERE task_id = 't_new00001' ORDER BY id").fetchall()
+    con.close()
+    edited = [e for e in evs if e[0] == "edited"]
+    check("runtime: событие 'edited' записано", len(edited) >= 3, len(edited))
+    check("runtime: в событии названо поле",
+          edited and "max_runtime_seconds" in (edited[-1][1] or ""),
+          edited[-1][1] if edited else None)
 
     failed = [n for n, ok in RESULTS if not ok]
     print("\n=== %d/%d checks passed ===" % (len(RESULTS) - len(failed), len(RESULTS)))

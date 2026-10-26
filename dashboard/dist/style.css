@@ -705,6 +705,70 @@
   color: var(--color-ring, var(--color-success));
 }
 
+/* A folded step — everything that is not the agent's own turn (the user's
+   prompt, a tool's answer). The operator asked for those to be collapsed
+   by default: a transcript is mostly tool output, and open blocks bury the
+   reasoning that matters.
+
+   The summary is a one-line row: who spoke, when, a digest of what they
+   said, and the hint that the block opens on click. */
+.hlv-transcript-fold {
+  margin: 0;
+}
+
+.hlv-transcript-fold > summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 0;
+}
+
+.hlv-transcript-fold > summary::-webkit-details-marker {
+  display: none;
+}
+
+.hlv-transcript-fold > summary::before {
+  content: "▸ ";
+  color: var(--color-muted-foreground);
+}
+
+.hlv-transcript-fold[open] > summary::before {
+  content: "▾ ";
+}
+
+/* The digest of the step's content. One line, cut with an ellipsis — the
+   full text is one click away. */
+.hlv-transcript-fold-preview {
+  flex: 1 1 200px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.68rem;
+  color: var(--color-muted-foreground);
+}
+
+.hlv-transcript-fold-hint {
+  margin-left: auto;
+  font-size: 0.66rem;
+  color: var(--color-muted-foreground);
+}
+
+/* The folded block's body sits under its summary row. */
+.hlv-transcript-fold > .hlv-transcript-text {
+  margin-top: 6px;
+}
+
+/* The agent's own step: the head row, then the reasoning, the calls and the
+   text, stacked. */
+.hlv-transcript-inner {
+  display: flex;
+  flex-direction: column;
+}
+
 .hlv-transcript-time {
   font-size: 0.68rem;
   color: var(--color-muted-foreground);
@@ -785,6 +849,99 @@
   font-size: 0.72rem;
   color: var(--color-ring, var(--color-success));
   word-break: break-word;
+}
+
+/* The live strip ------------------------------------------------- */
+/* What the agent is doing RIGHT NOW, plus the run's trail of model
+   calls and tools. The transcript itself only grows when a model call
+   ENDS, so without this the pane looks dead during a long call even
+   though the agent is working.
+
+   STICKY: the strip is the pane's first child, and the pane is scrolled
+   to its tail — without this the strip sits tens of thousands of pixels
+   above the viewport and the reader never sees it. It must stay pinned
+   to the top while the transcript scrolls under it. */
+.hlv-transcript-live {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  border: 1px solid var(--color-border);
+  border-radius: 0;
+  background: var(--color-card);
+  padding: 6px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.hlv-transcript-live-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 0.7rem;
+  color: var(--color-muted-foreground);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The dot is the "the agent is working" marker. It is dim when the
+   session has no fresh activity and lit while it runs. */
+.hlv-live-dot {
+  width: 7px;
+  height: 7px;
+  flex-shrink: 0;
+  border-radius: 0;
+  background: var(--color-border);
+  transform: rotate(45deg);
+}
+
+.hlv-live-on .hlv-live-dot {
+  background: var(--color-ring, var(--color-success));
+}
+
+.hlv-transcript-events {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  /* A window on the trail, not the whole trail: the strip must not eat
+     the transcript it sits above. */
+  max-height: 88px;
+  overflow-y: auto;
+}
+
+.hlv-transcript-event {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 0.68rem;
+  line-height: 1.35;
+  color: var(--color-muted-foreground);
+}
+
+.hlv-transcript-event-time {
+  flex-shrink: 0;
+  opacity: 0.75;
+}
+
+/* The trail is read at a glance: a model call is the normal beat, a
+   tool is the agent's action, an error and a compression are the beats
+   that need a colour of their own. */
+.hlv-ev-api {
+  color: var(--color-muted-foreground);
+}
+
+.hlv-ev-tool {
+  color: var(--color-ring, var(--color-success));
+}
+
+.hlv-ev-error,
+.hlv-ev-warn {
+  color: var(--color-destructive, #e5534b);
+}
+
+.hlv-ev-turn,
+.hlv-ev-compress {
+  color: var(--color-foreground, var(--foreground));
 }
 
 /* Comments thread ------------------------------------------------ */
@@ -1120,6 +1277,18 @@
 }
 
 .hlv-prio-input {
+  width: 90px;
+}
+
+/* The execution-time cap: the same value/input pair as the priority, one
+   row below it. */
+.hlv-runtime-value {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--color-card-foreground, var(--foreground));
+}
+
+.hlv-runtime-input {
   width: 90px;
 }
 

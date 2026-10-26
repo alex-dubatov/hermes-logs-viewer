@@ -215,8 +215,18 @@ async function openDialog(boardSlug, assignee) {
 // It must be a REAL profile (the picker only offers installed ones) and it
 // must not be one a worker is running under: a `ready` card assigned to a
 // live profile is picked up by the dispatcher within a minute and executed for
-// real. `default` is used because it is installed on every host and no worker
-// runs under it — the dispatcher has no `default` profile to claim from here.
+// real.
+//
+// `default` is used because it is installed on every host.
+//
+// NOTE (2026-10-25): the old comment here said "no worker runs under it —
+// the dispatcher has no `default` profile to claim from here". That stopped
+// being true with v0.22.3: EVERY profile now has a gateway, and the
+// dispatcher claims `default`-assigned cards as well. A throwaway card of
+// this harness was picked up and really executed (it then called
+// `kanban_show` on a card the harness had already deleted). The harness now
+// creates its cards in `triage`, which no lane claims — see the create
+// round-trip below.
 const TEST_ASSIGNEE = "default";
 
 (async () => {
@@ -345,6 +355,46 @@ const TEST_ASSIGNEE = "default";
         $$(".hlv-transcript-reasoning").length + $$(".hlv-transcript-call").length > 0,
         "рассуждений: " + $$(".hlv-transcript-reasoning").length +
         ", вызовов: " + $$(".hlv-transcript-call").length);
+      // EVERY reasoning block opens itself: the operator asked for the
+      // reasoning to be expanded by default ("блок рассуждений всегда
+      // должен быть по умолчанию развернут"), not only the newest one.
+      const reasoningBlocks = $$(".hlv-transcript-reasoning");
+      const openedReasoning = reasoningBlocks.filter((d) => d.open);
+      check("все блоки рассуждений раскрыты по умолчанию",
+        reasoningBlocks.length > 0 && openedReasoning.length === reasoningBlocks.length,
+        "раскрыто: " + openedReasoning.length + " из " + reasoningBlocks.length);
+      // Everything that is NOT the agent's own step is folded: the user's
+      // turn and the tool answers. The operator asked for exactly that
+      // ("все что не assistant шаги" — свёрнутым, с возможностью
+      // развернуть).
+      const folds = $$(".hlv-transcript-fold");
+      const openedFolds = folds.filter((d) => d.open);
+      check("не-assistant шаги свёрнуты по умолчанию",
+        folds.length > 0 && openedFolds.length === 0,
+        "свёрнутых: " + (folds.length - openedFolds.length) + " из " + folds.length);
+      // ...and they ARE expandable: the fold is a real <details>, so the
+      // reader opens it with a click.
+      if (folds.length) {
+        const fold = folds[0];
+        const summary = fold.querySelector("summary");
+        check("у свёрнутого шага есть раскрывающая строка", !!summary);
+        if (summary) {
+          summary.dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true }));
+          check("свёрнутый шаг раскрывается по клику", fold.open === true);
+          // Fold it back, so the pane is left as it was found.
+          summary.dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true }));
+        }
+      }
+      // The live strip: what the agent is doing RIGHT NOW. Without it the
+      // pane looks frozen between two messages — a message row only lands
+      // when the model call that produced it ENDS.
+      const liveStrip = $(".hlv-transcript-live");
+      check("живая полоса есть", !!liveStrip, liveStrip ? "есть" : "нет");
+      if (liveStrip) {
+        const liveText = (liveStrip.textContent || "").trim();
+        check("живая полоса не пустая", liveText.length > 0,
+          liveText.slice(0, 60));
+      }
     } else {
       console.log("SKIP карточка без owner-сессии — читаемость проверяется в tools/transcript_readable_check.js");
     }
@@ -831,7 +881,11 @@ const TEST_ASSIGNEE = "default";
   // post-seed list too, and it runs in a different `if` scope.
   let liveProjects = allProjects;
   const seedUnbound = () => {
-    if (allProjects.some((p) => p.slug === UNBOUND_SLUG)) return;
+    // A row left behind by an interrupted run is REUSED, not skipped: the old
+    // early return left `seededProj` null, so the cross-board check below had
+    // no candidate and every later run failed on a leftover of its own. The
+    // row is the harness's own fixture (a fixed slug), so taking it over is
+    // safe — and `dropUnbound()` removes it again at the end.
     const { DatabaseSync } = require("node:sqlite");
     const db = new DatabaseSync(PROJECTS_DB);
     db.prepare(
@@ -1393,8 +1447,22 @@ const TEST_ASSIGNEE = "default";
   // speaks minutes, the API speaks seconds, and the conversion is the
   // plugin's job. An unconverted 30 would read as a 30-second cap.
   setInputValue(rtInput2, "30");
+  // TRIAGE, not todo: the state the card is born in decides whether a
+  // dispatcher can take it. `triage` is a create-time state that no lane
+  // claims, so the throwaway card stays put and the check below sees what
+  // the dialog asked for.
+  //
+  // `todo` cannot be used for this: the dialog POSTs the card as `ready` and
+  // then PATCHes it to `todo`, and the dispatcher's tick can land in that
+  // window. The card is then claimed, starts a REAL worker, and the PATCH is
+  // refused — the check reads `running` and fails for a reason that has
+  // nothing to do with the dialog. That is not hypothetical: the `default`
+  // profile HAS a running gateway since v0.22.3, so the "no worker runs
+  // under `default`" assumption above no longer holds, and the harness's
+  // throwaway card was picked up and executed for real (it then ran
+  // `kanban_show` on a card that no longer existed).
   const stSel2 = fieldByLabel("Состояние").querySelector("select");
-  setSelectValue(stSel2, "todo");
+  setSelectValue(stSel2, "triage");
   await sleep(200);
   click(findButton("создать"));
   await sleep(3500);
@@ -1413,28 +1481,26 @@ const TEST_ASSIGNEE = "default";
   check("задача создалась на выбранной доске", !!row,
     row ? row.id + " / " + row.status : "не найдена");
   if (row) {
-    // The dialog POSTs the card as `ready` and then PATCHes it to the chosen
-    // state, so the status is not there the instant the card appears. Poll
-    // until it settles instead of sampling once at a fixed delay — under load
-    // the PATCH can land after that delay, which read as a real failure.
+    // `triage` is a create-time state: the card is born in it, so it is
+    // there the instant the card appears. Poll anyway — the dialog's note and
+    // the board row must agree, and under load the row can land a beat later.
     let settled = row;
-    for (let i = 0; i < 20 && settled.status !== "todo"; i++) {
+    for (let i = 0; i < 20 && settled.status !== "triage"; i++) {
       await sleep(500);
       const r = await fetchJSON(
         "/api/plugins/kanban/tasks/" + encodeURIComponent(row.id) +
         "?board=" + encodeURIComponent(target.slug));
       if (r.task) settled = r.task;
     }
-    check("состояние todo применено", settled.status === "todo", "status=" + settled.status);
+    check("состояние triage применено", settled.status === "triage", "status=" + settled.status);
     // The dialog must never report a plain "создано" while the card sits in the
     // wrong column — the retry covers a dropped PATCH, and the note covers the
     // case where both attempts were refused.
     const createNoteText = (($(".hlv-create-flash") || {}).textContent) || "";
     check(
       "результат создания не врёт про состояние",
-      settled.status === "todo" || /создано как/.test(createNoteText),
-      settled.status === "todo" ? "состояние верное" : "note=" + createNoteText
-    );
+      settled.status === "triage" || /создано как/.test(createNoteText),
+      settled.status === "triage" ? "состояние верное" : "note=" + createNoteText);
     const full = await fetchJSON(
       "/api/plugins/kanban/tasks/" + encodeURIComponent(row.id) +
       "?board=" + encodeURIComponent(target.slug));
@@ -2033,6 +2099,75 @@ const TEST_ASSIGNEE = "default";
           check("приоритет обновился в панели",
             !!$(".hlv-prio-value") && Number($(".hlv-prio-value").textContent) === WANT,
             $(".hlv-prio-value") ? $(".hlv-prio-value").textContent : "нет значения");
+        }
+      }
+
+      // --- Runtime: the execution-time cap ---------------------------------
+      // The cap is edited IN PLACE like the priority, but it is NOT part of
+      // the bundled plugin's PATCH body — the plugin writes the column
+      // through its own route. The field speaks MINUTES (what a human plans
+      // in); the column speaks seconds.
+      const runtimePencil = $$(".hlv-pencil").find((b) => {
+        const row = b.closest(".hlv-field-row");
+        return row && /время выполнения/.test(row.textContent || "");
+      });
+      check("карандаш у времени выполнения есть", !!runtimePencil,
+        runtimePencil ? "найден" : "нет .hlv-pencil рядом с «время выполнения»");
+      const WANT_MIN = 7;
+      if (runtimePencil) {
+        click(runtimePencil);
+        await sleep(400);
+        const rtInput = $(".hlv-runtime-input");
+        check("поле времени выполнения открылось", !!rtInput);
+        if (rtInput) {
+          setInputValue(rtInput, String(WANT_MIN));
+          await sleep(200);
+          const saveRt = $$(".hlv-pencil").find((b) => (b.textContent || "").trim() === "✓");
+          check("у времени выполнения есть кнопка сохранения", !!saveRt);
+          if (saveRt) {
+            click(saveRt);
+            await sleep(2000);
+            const afterRt = (await fetchJSON(
+              "/api/plugins/kanban/tasks/" + encodeURIComponent(made.id) +
+              "?board=" + encodeURIComponent(defaultBoard.slug))).task;
+            // 7 minutes must land as 420 SECONDS in the column.
+            check("время выполнения сохранилось (7 мин = 420 с)",
+              afterRt && afterRt.max_runtime_seconds === WANT_MIN * 60,
+              afterRt ? "на доске max_runtime_seconds=" + afterRt.max_runtime_seconds
+                      : "нет задачи");
+            check("время выполнения обновилось в панели",
+              !!$(".hlv-runtime-value") &&
+              ($(".hlv-runtime-value").textContent || "").indexOf("7 мин") !== -1,
+              $(".hlv-runtime-value") ? $(".hlv-runtime-value").textContent
+                                       : "нет значения");
+          }
+          // 0 means "no cap" — the column goes NULL, which is how the
+          // dispatcher reads "unlimited". Leave the card that way.
+          const rtPencil2 = $$(".hlv-pencil").find((b) => {
+            const row = b.closest(".hlv-field-row");
+            return row && /время выполнения/.test(row.textContent || "");
+          });
+          if (rtPencil2) {
+            click(rtPencil2);
+            await sleep(400);
+            const rtInput2 = $(".hlv-runtime-input");
+            if (rtInput2) {
+              setInputValue(rtInput2, "0");
+              await sleep(200);
+              const saveRt2 = $$(".hlv-pencil").find((b) => (b.textContent || "").trim() === "✓");
+              if (saveRt2) {
+                click(saveRt2);
+                await sleep(2000);
+                const afterRt2 = (await fetchJSON(
+                  "/api/plugins/kanban/tasks/" + encodeURIComponent(made.id) +
+                  "?board=" + encodeURIComponent(defaultBoard.slug))).task;
+                check("0 минут = без ограничения (колонка NULL)",
+                  afterRt2 && afterRt2.max_runtime_seconds == null,
+                  afterRt2 ? "max_runtime_seconds=" + afterRt2.max_runtime_seconds
+                           : "нет задачи");
+              }
+            }
+          }
         }
       }
 

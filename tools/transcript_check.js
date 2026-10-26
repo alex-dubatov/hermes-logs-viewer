@@ -103,6 +103,17 @@ function check(name, ok, extra) {
       cut: !!m.querySelector(".hlv-transcript-cut"),
     }));
     const pr = p.getBoundingClientRect();
+    // The LIVE strip: what the agent is doing right now, and the run's
+    // trail of model calls and tools. Without it the pane looks frozen
+    // between two messages — a message row lands only when the model call
+    // that produced it ENDS.
+    const live = p.querySelector(".hlv-transcript-live");
+    const liveEvents = live ? live.querySelectorAll(".hlv-transcript-event") : [];
+    // EVERY reasoning block opens itself — the reader asked to see the
+    // reasoning as it arrives, the way the old log tab showed it. Older
+    // blocks stay open too.
+    const reasoningBlocks = Array.from(p.querySelectorAll(".hlv-transcript-reasoning"));
+    const openedReasoning = reasoningBlocks.filter((d) => d.open);
     return {
       found: true,
       display: cs.display,
@@ -116,6 +127,14 @@ function check(name, ok, extra) {
       count: msgs.length,
       msgs,
       meta: (p.querySelector(".hlv-transcript-meta") || {}).textContent || "",
+      liveText: live ? (live.textContent || "").trim() : "",
+      liveEventCount: liveEvents.length,
+      liveEventText: liveEvents.length
+        ? (liveEvents[liveEvents.length - 1].textContent || "").trim() : "",
+      reasoningTotal: reasoningBlocks.length,
+      reasoningOpened: openedReasoning.length,
+      latestReasoningOpen: reasoningBlocks.length
+        ? reasoningBlocks[reasoningBlocks.length - 1].open : false,
     };
   });
 
@@ -141,6 +160,29 @@ function check(name, ok, extra) {
     check("панель прижата к последнему сообщению",
       pane.scrollHeight - pane.scrollTop - pane.clientHeight < 120,
       "gap " + (pane.scrollHeight - pane.scrollTop - pane.clientHeight) + "px");
+    // The live strip: present, not empty, and carrying the run's trail.
+    check("живая полоса на месте", pane.liveText.length > 0,
+      pane.liveText.slice(0, 70));
+    check("живая полоса показывает активность сессии",
+      /вызовов:|инструментов:|с назад/.test(pane.liveText),
+      pane.liveText.slice(0, 90));
+    check("в живой полосе есть след запуска", pane.liveEventCount > 0,
+      pane.liveEventCount + " событий");
+    if (pane.liveEventCount) {
+      check("событие живой полосы читаемо",
+        pane.liveEventText.length > 0, pane.liveEventText.slice(0, 70));
+    }
+    // Every reasoning block opens itself — the reader asked to see the
+    // reasoning as it arrives, the way the old log tab showed it.
+    if (pane.reasoningTotal) {
+      check("все рассуждения раскрыты сами",
+        pane.reasoningOpened === pane.reasoningTotal,
+        "раскрыто " + pane.reasoningOpened + " из " + pane.reasoningTotal);
+      check("последний блок рассуждений раскрыт", pane.latestReasoningOpen,
+        "открыт=" + pane.latestReasoningOpen);
+    } else {
+      console.log("SKIP у карточки нет рассуждений — блок нечего раскрывать");
+    }
   }
 
   // --- the old scheme: the pane points at the log ------------------------

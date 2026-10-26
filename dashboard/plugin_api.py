@@ -48,6 +48,25 @@ Endpoints:
      (``kanban_db._resolve_project_link``), so extra folders would be data the
      form has no way to honour.
 
+  PATCH /tasks/{task_id}/runtime?board=default
+        body: {"max_runtime_seconds": <int>}
+        -> {"ok": true, "task_id": ..., "max_runtime_seconds": <int|null>}
+     Change the card's execution-time cap (``tasks.max_runtime_seconds``).
+     The value is in SECONDS — the column's own unit — and 0 means "no cap"
+     (the column goes NULL, which is how the dispatcher reads "unlimited";
+     a stored 0 would kill the worker the instant it started).
+
+     WHY THIS ROUTE EXISTS: the bundled Kanban plugin cannot change the cap
+     of an existing card. Its ``PATCH /tasks/{id}`` accepts status,
+     assignee, priority, title, body, result, block_reason, summary, metadata
+     and the model overrides — ``max_runtime_seconds`` is only settable at
+     CREATION time (``POST /tasks``). The card pane needs to change the limit
+     of a card that already exists, so it writes the column itself.
+
+     The write goes through the same read-write connection the comment
+     thread uses, in one transaction, and it leaves an ``edited`` event behind
+     so the built-in Kanban tab's activity feed shows the change.
+
   GET /transcript?board=default&task_id=t_x&after=<msg_id>&limit=<N>
         -> {"task_id", "board", "session_id", "store", "source", "messages",
             "next_after", "has_more"}
@@ -73,6 +92,14 @@ Endpoints:
      ``after`` is a cursor over the store's monotonic message ``id``: pass the
      last id you have and only newer messages come back. ``next_after`` is the
      cursor to use next, ``has_more`` says whether the limit was hit.
+
+     ``live`` is what the agent is doing RIGHT NOW: the owner session's
+     activity stamp ("receiving stream response"), its call counters and
+     the model it runs. ``events`` is the run's own trail — the owner
+     profile's log lines for this session (model calls with their latency,
+     tools that finished, context compressions). Both are empty rather than
+     fatal when the store has no ``sessions`` table or the profile has no
+     log.
 """
 
 from __future__ import annotations
@@ -586,6 +613,99 @@ async def add_comment(
             con.close()
         return {"ok": True, "id": new_id}
 
+
+# --- The execution-time cap (the second write path) -----------------------
+
+class RuntimeBody(BaseModel):
+    max_runtime_seconds: Optional[int] = None
+
+
+@router.patch("/tasks/{task_id}/runtime")
+async def set_task_runtime(
+    task_id: str,
+    payload: RuntimeBody,
+    board: str = Query(default="default"),
+):
+    """Change the card's execution-time cap.
+
+    ``max_runtime_seconds`` is the column's own unit (seconds). Zero means
+    "no cap": the column goes NULL, which is how the dispatcher reads
+    "unlimited" (``max_runtime_seconds IS NOT NULL`` guards the kill check).
+    A stored 0 would be a cap of zero seconds — the worker would be killed
+    the moment it started — so 0 and NULL mean the same thing here and both
+    are stored as NULL. An explicit ``null`` clears the cap the same way; an
+    ABSENT field is a malformed request and is rejected.
+
+    The bundled Kanban plugin has no route for this: its
+    ``PATCH /tasks/{id}`` does not carry the field, and the value is only
+    settable when the card is CREATED. Writing the column directly is the
+    same thing the core's own ``kanban_db`` would do, minus the dependency
+    on the CLI package.
+
+    A RUNNING card is affected at once: the dispatcher reads the limit from
+    this very column (``enforce_max_runtime`` selects
+    ``t.max_runtime_seconds``), so LOWERING it can stop the worker that is
+    running right now. The UI says so next to the field.
+    """
+    def _run():
+        if not _TASK_ID_RE.match(task_id):
+            return JSONResponse({"error": f"bad task id: {task_id!r}"}, status_code=400)
+        slug, err = _resolve_board_slug(board)
+        if err is not None:
+            return err
+        if slug is None:
+            # Unreachable in practice — the helper returns a slug whenever it
+            # returns no error — but spelled out so a bad slug is a 400 and
+            # never a NULL reaching the path builder.
+            return JSONResponse({"error": f"bad board slug: {board!r}"}, status_code=400)
+        seconds = payload.max_runtime_seconds
+        # An ABSENT field is a malformed request; an explicit null is a value
+        # ("no cap"). Pydantic gives both the same `None`, so the distinction
+        # comes from the set of fields the client actually sent.
+        if "max_runtime_seconds" not in payload.model_fields_set:
+            return JSONResponse(
+                {"error": "max_runtime_seconds is required"}, status_code=400
+            )
+        if seconds is not None and seconds < 0:
+            return JSONResponse(
+                {"error": "max_runtime_seconds must be a non-negative integer"}, status_code=400
+            )
+        db_path = _board_db_path(slug)
+        if not db_path.exists():
+            return JSONResponse({"error": f"board '{slug}' not found"}, status_code=404)
+        try:
+            con = _rw_connect(db_path)
+        except sqlite3.Error as e:
+            return JSONResponse({"error": f"cannot open {db_path}: {e}"}, status_code=500)
+        try:
+            with con:  # single transaction, rolled back on any error
+                if not con.execute(
+                    "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone():
+                    return JSONResponse({"error": f"unknown task {task_id}"}, status_code=404)
+                # NULL is "no cap" — see the docstring.
+                value = seconds if (seconds or 0) > 0 else None
+                con.execute(
+                    "UPDATE tasks SET max_runtime_seconds = ? WHERE id = ?",
+                    (value, task_id),
+                )
+                # Mirror kanban_db.edit_task's event so the built-in Kanban
+                # tab's activity feed shows the change.
+                con.execute(
+                    "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                    "VALUES (?, NULL, 'edited', ?, ?)",
+                    (
+                        task_id,
+                        json.dumps({"fields": ["max_runtime_seconds"], "max_runtime_seconds": value}),
+                        int(time.time()),
+                    ),
+                )
+        except sqlite3.Error as e:
+            return JSONResponse({"error": f"write failed: {e}"}, status_code=500)
+        finally:
+            con.close()
+        return {"ok": True, "task_id": task_id, "max_runtime_seconds": value}
+
     return await asyncio.to_thread(_run)
 
 
@@ -611,8 +731,13 @@ _TRANSCRIPT_MAX_LIMIT = 500
 # The one-line digest shown next to the role.
 _TRANSCRIPT_PREVIEW_LIMIT = 240
 # The agent's reasoning (its "thinking") is a separate column of the
-# assistant's row; it gets its own cap because it is long and secondary.
-_TRANSCRIPT_REASONING_LIMIT = 4000
+# assistant's row. It is NOT clipped: the operator asked for the reasoning
+# blocks uncut ("Блоки рассуждений ИИ обрезать не надо!"), and a reasoning
+# block cut in the middle says something different from what the model
+# thought. The column holds at most a few tens of kilobytes per message
+# (the largest one in a real store is ~83 KB), which is what the pane
+# renders anyway.
+_TRANSCRIPT_REASONING_LIMIT = None
 
 
 def _owner_admitted(board: str, task_id: str):
@@ -660,11 +785,16 @@ def _owner_admitted(board: str, task_id: str):
     return session_id, (store or None), None
 
 
-def _clip(text: Optional[str], limit: int) -> tuple[str, bool]:
-    """``(text, truncated)`` — cut at ``limit`` characters, marking the cut."""
+def _clip(text: Optional[str], limit: Optional[int]) -> tuple[str, bool]:
+    """``(text, truncated)`` — cut at ``limit`` characters, marking the cut.
+
+    ``limit=None`` means "do not cut": the text comes back whole and the
+    cut flag stays False. That is what the reasoning column needs (the
+    operator asked for the reasoning blocks uncut).
+    """
     if not text:
         return "", False
-    if len(text) <= limit:
+    if limit is None or len(text) <= limit:
         return text, False
     return text[:limit], True
 
@@ -861,6 +991,219 @@ def _message_columns(con: sqlite3.Connection) -> set:
         return set()
 
 
+# --- The live state of the owner session ---------------------------------
+#
+# The transcript above is a HISTORY: a message row appears when the model
+# call that produced it ENDS. The owner session's own ``sessions`` row, on
+# the other hand, is written by the owner gateway WHILE the turn runs — it
+# carries the runtime's activity stamp ("receiving stream response",
+# "terminal command running (140s elapsed)", "context compression in
+# progress") and the call counters. That is the one genuinely live signal
+# in the store, and it is what tells the reader whether the card is
+# working right now or has stalled.
+_SESSION_LIVE_COLUMNS = (
+    "last_activity_at",
+    "last_activity_description",
+    "api_call_count",
+    "tool_call_count",
+    "input_tokens",
+    "output_tokens",
+    "ended_at",
+    "end_reason",
+    "model",
+)
+
+
+def _session_live(store: str, session_id: str):
+    """``(live, error)`` — the owner session's live state from the store.
+
+    Read-only, like everything else here. A store without a ``sessions``
+    table (an older Hermes) answers ``(None, None)`` — the caller then
+    simply shows no live strip rather than failing the pane.
+    """
+    store_path = Path(store).expanduser()
+    if not store_path.exists():
+        return None, None
+    try:
+        con = _ro_connect(store_path)
+    except sqlite3.Error as e:
+        return None, f"cannot open {store_path}: {e}"
+    try:
+        cols = {r["name"] for r in con.execute("PRAGMA table_info(sessions)")}
+        if not cols:
+            return None, None
+        picked = [c for c in _SESSION_LIVE_COLUMNS if c in cols]
+        if not picked:
+            return None, None
+        row = con.execute(
+            "SELECT " + ", ".join(picked) + " FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+    except sqlite3.Error as e:
+        return None, f"query failed: {e}"
+    finally:
+        con.close()
+    if row is None:
+        return None, None
+    live = {k: row[k] for k in row.keys()}
+    # ``last_activity_at`` is an epoch; the UI shows the age of it.
+    try:
+        live["activity_age"] = max(0.0, time.time() - float(live.get("last_activity_at") or 0)) if live.get("last_activity_at") else None
+    except (TypeError, ValueError):
+        live["activity_age"] = None
+    live["running"] = bool(live.get("last_activity_at")) and not live.get("ended_at")
+    return live, None
+
+
+# The owner profile writes its own agent log next to the store, and that log
+# carries the session's line-by-line trail of the RUN: every model call
+# (with its latency and token counts), every tool that finished, the
+# context compressions. The old worker log showed the same trail as the
+# worker's stdout; here the stdout is gone (the owner gateway runs the
+# agent), but the trail survives in the profile's log.
+#
+# The log is read by TAIL, never whole: it grows to megabytes and is
+# rotated, and only the newest lines are of any use to a live pane.
+_LOG_TAIL_BYTES = 128 * 1024
+_LOG_EVENT_LIMIT = 40
+# One line of the agent log:
+#   2026-10-25 12:49:12,462 INFO [local-abc…] agent.tool_executor: tool patch completed (0.01s, 2241 chars)
+# The session id is in the brackets for the session-scoped lines; a few
+# (context compression) carry it as ``session=<id>`` in the text instead.
+_LOG_LINE_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2} (?P<time>\d{2}:\d{2}:\d{2})[,\.]\d+)\s+"
+    r"(?P<level>[A-Z]+)\s+(?:\[(?P<sid>[^\]]+)\]\s+)?"
+    r"(?P<logger>[\w.]+):\s*(?P<text>.*)$"
+)
+
+
+def _owner_log_path(store: str) -> Path:
+    """The owner profile's agent log, derived from the store path.
+
+    ``state.db`` lives at the profile home's root and the logs live in
+    ``<profile home>/logs/``. The profile home is NOT guessed: the
+    ``owner_admitted`` payload names the store, and the log directory is
+    the well-known layout inside the directory that payload named.
+    """
+    return Path(store).expanduser().parent / "logs" / "agent.log"
+
+
+def _log_tail_lines(path: Path) -> List[str]:
+    """The last chunk of a log file, as text lines (empty if unreadable)."""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            if size > _LOG_TAIL_BYTES:
+                fh.seek(size - _LOG_TAIL_BYTES)
+                # The first line of a tail is usually a fragment.
+                fh.readline()
+            data = fh.read()
+    except OSError:
+        return []
+    return data.decode("utf-8", "replace").splitlines()
+
+
+def _log_events(log_path: Path, session_id: str, limit: int = _LOG_EVENT_LIMIT):
+    """``(events, error)`` — the session's newest lines from the owner log.
+
+    Every event is ``{"time", "level", "kind", "short", "text"}``. A
+    rotated log (``agent.log.1``) is consulted only when the live one
+    holds nothing for this session — the trail of a long-running session
+    can have rotated out of the current file, and an empty pane would
+    claim the card is silent when it is not.
+    """
+    for candidate in (log_path, log_path.with_name(log_path.name + ".1")):
+        events = []
+        for line in _log_tail_lines(candidate):
+            if session_id not in line:
+                continue
+            m = _LOG_LINE_RE.match(line)
+            if not m:
+                continue
+            text = m.group("text")
+            kind, short = _summarize_event(m.group("logger"), text)
+            if kind is None:
+                continue
+            events.append({
+                "time": m.group("time"),
+                "level": m.group("level"),
+                "kind": kind,
+                "short": short,
+                "text": text,
+            })
+        if events:
+            return events[-limit:], None
+    return [], None
+
+
+# The agent log is written for operators, so its lines are long and full of
+# ids and counters. The live strip needs the gist of each line, not the
+# whole thing: "вызов модели #74 · 49.2 с · 180 токенов" instead of a
+# 300-character line with a completion id in it.
+#
+# ``(kind, short)``; ``kind`` None means "not worth showing" — the log also
+# carries the agent's internal bookkeeping ("Re-anchored stale …"), which
+# would drown the trail.
+_EV_API_RE = re.compile(
+    r"^API call #(?P<n>\d+): model=(?P<model>\S+) provider=(?P<provider>\S+) "
+    r"in=(?P<in>\d+) out=(?P<out>\d+) total=(?P<total>\d+) latency=(?P<lat>[\d.]+)s"
+)
+_EV_TOOL_RE = re.compile(r"^tool (?P<name>\S+) completed \((?P<sec>[\d.]+)s, (?P<chars>\d+) chars\)")
+_EV_TOOL_ERR_RE = re.compile(r"^Tool (?P<name>\S+) returned error \((?P<sec>[\d.]+)s\): (?P<err>.*)$")
+_EV_TURN_RE = re.compile(
+    r"^Turn ended: reason=(?P<reason>\S+).*?api_calls=(?P<calls>\d+)/(?P<max>\d+).*?"
+    r"tool_turns=(?P<tools>\d+) last_msg_role=(?P<role>\S+) response_len=(?P<len>\d+)"
+)
+_EV_COMPRESS_RE = re.compile(r"^context compression (?P<phase>started|done)")
+_EV_CONV_RE = re.compile(r"^conversation turn: .*?model=(?P<model>\S+) provider=(?P<provider>\S+)")
+
+# Lines the log writes for the agent's own bookkeeping — shown in the log
+# tab, noise in a live strip.
+_EV_NOISE = (
+    "Re-anchored stale",
+    "Shared OpenAI client retired",
+    "OpenAI client closed",
+)
+
+
+def _summarize_event(logger: str, text: str):
+    """``(kind, short)`` — the gist of one agent-log line, or ``(None, "")``."""
+    if any(text.startswith(prefix) for prefix in _EV_NOISE):
+        return None, ""
+    m = _EV_API_RE.match(text)
+    if m:
+        return "api", (
+            "вызов модели #%s · %s · %s с · %s токенов"
+            % (m.group("n"), m.group("model"), m.group("lat"), m.group("out"))
+        )
+    m = _EV_TOOL_RE.match(text)
+    if m:
+        return "tool", "инструмент %s · %s с" % (m.group("name"), m.group("sec"))
+    m = _EV_TOOL_ERR_RE.match(text)
+    if m:
+        err = " ".join(m.group("err").split())[:120]
+        return "error", "инструмент %s — ошибка: %s" % (m.group("name"), err)
+    m = _EV_TURN_RE.match(text)
+    if m:
+        return "turn", (
+            "ход завершён (%s) · вызовов %s · инструментов %s"
+            % (m.group("reason"), m.group("calls"), m.group("tools"))
+        )
+    m = _EV_COMPRESS_RE.match(text)
+    if m:
+        return "compress", (
+            "сжатие контекста началось" if m.group("phase") == "started"
+            else "сжатие контекста завершено"
+        )
+    m = _EV_CONV_RE.match(text)
+    if m:
+        return "start", "ход начат · %s" % m.group("model")
+    # A warning or an error the agent logged about itself: worth a line.
+    if logger.startswith("agent.") and ("error" in text.lower() or "failed" in text.lower()):
+        return "warn", " ".join(text.split())[:160]
+    return None, ""
+
+
 def _transcript_messages(store: str, session_id: str, after: int, limit: int):
     """``(messages, next_after, has_more, error)`` from the profile store.
 
@@ -998,11 +1341,25 @@ async def get_transcript(
                 "store": store, "source": "none", "messages": [],
                 "next_after": cursor, "has_more": False, "error": err,
             }
-        return {
+        # The LIVE layer on top of the history: what the agent is doing
+        # RIGHT NOW (the session's activity stamp and call counters) and the
+        # run's own trail of model calls and tools (the owner profile's log).
+        # Neither is required — a store without a ``sessions`` table or a
+        # profile without a log simply answers with an empty live block.
+        live, live_err = _session_live(store, session_id)
+        events, log_err = _log_events(_owner_log_path(store), session_id)
+        payload = {
             "task_id": task_id, "board": slug, "session_id": session_id,
             "store": store, "source": "owner_session", "messages": messages,
             "next_after": next_after, "has_more": has_more,
             "content_limit": _TRANSCRIPT_CONTENT_LIMIT,
+            "live": live or {},
+            "events": events,
         }
+        if live_err:
+            payload["live_error"] = live_err
+        if log_err:
+            payload["events_error"] = log_err
+        return payload
 
     return await asyncio.to_thread(_run)
