@@ -1,0 +1,14 @@
+{
+  "name": "hermes-logs-viewer",
+  "label": "Kanban Logs",
+  "description": "Kanban task list with a live log, the card's transcript and body, its run history and its attachments (upload / download / delete).",
+  "icon": "FileText",
+  "version": "1.2.0",
+  "tab": {
+    "path": "/hermes-logs-viewer",
+    "position": "end"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}

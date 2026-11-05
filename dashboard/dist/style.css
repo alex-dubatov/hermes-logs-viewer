@@ -199,6 +199,33 @@
   color: var(--color-muted-foreground);
 }
 
+/* Вторая строка объявления задачи: id и момент создания. Отдельной строкой, а
+   не ещё одним чипом в мете: id читают и копируют целиком (по нему ссылаются
+   на карточку везде), а дата с секундами в общей строке вытесняла бы статус. */
+.hlv-row-sub {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 0.66rem;
+  color: var(--color-muted-foreground);
+  font-variant-numeric: tabular-nums;
+}
+
+.hlv-row-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Дата создания прижата к правому краю: так её значения стоят в одном столбце
+   у всех строк, и «что создано раньше» читается глазами без сравнения слов. */
+.hlv-row-created {
+  margin-left: auto;
+  white-space: nowrap;
+}
+
 .hlv-row-board {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -405,8 +432,29 @@
 .hlv-tabs {
   display: flex;
   gap: 4px;
+  align-items: stretch;
+  min-width: 0;
   flex-shrink: 0;
   border-bottom: 1px solid var(--color-border);
+}
+
+/* Six tabs («лог», «транскрипт», «комментарии», «запуски», «файлы»,
+   «основное») do not fit a phone, and certainly not a 360px carousel frame.
+   The strip scrolls sideways instead of pushing the pane wider or wrapping
+   into a second row: the header keeps its height, and the right-hand block
+   (log size + «развернуть») stays reachable because it sits OUTSIDE this box. */
+.hlv-tabs-list {
+  display: flex;
+  gap: 4px;
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+}
+
+.hlv-tabs-list::-webkit-scrollbar {
+  height: 2px;
 }
 
 .hlv-tab {
@@ -419,6 +467,9 @@
   font-size: 0.8rem;
   padding: 6px 12px;
   cursor: pointer;
+  /* A tab never shrinks to fit: half a word is unclickable and unreadable. */
+  flex: 0 0 auto;
+  white-space: nowrap;
   margin-bottom: -1px; /* sit the active underline on the tab border */
 }
 
@@ -432,13 +483,16 @@
 }
 
 /* Right end of the tab row: log size in bytes + "развернуть лог".
-   Same level as the лог/комментарии tabs, pushed to the right edge. */
+   Same level as the лог/комментарии tabs, pushed to the right edge. It sits
+   outside the scrolling strip, so it never scrolls out of reach; flex-shrink
+   keeps its buttons whole while the tabs take the remaining width. */
 .hlv-tabs-right {
   margin-left: auto;
   display: flex;
   align-items: center;
   gap: 10px;
   padding-right: 4px;
+  flex: 0 0 auto;
   /* the tabs' own padding would otherwise drop the row 1px below the border */
   margin-bottom: -1px;
 }
@@ -1000,6 +1054,43 @@
   color: var(--color-card-foreground, var(--foreground));
 }
 
+/* Delivery state of one comment + its delete button. The chip sits at the
+   right end of the head line and is the reason the row can be deleted at all:
+   "не доставлен" means the worker has not read it yet. */
+.hlv-comment-delivery {
+  margin-left: auto;
+  padding: 0 5px;
+  border: 1px solid var(--color-border);
+  font-size: 0.66rem;
+  line-height: 1.5;
+  white-space: nowrap;
+  color: var(--color-muted-foreground);
+}
+
+.hlv-comment-delivery.pending {
+  border-color: var(--color-warning);
+  color: var(--color-warning);
+}
+
+.hlv-comment-delivery.delivered {
+  border-color: transparent;
+  color: var(--color-muted-foreground);
+}
+
+.hlv-comment-del {
+  border: 0;
+  background: transparent;
+  padding: 0 2px;
+  cursor: pointer;
+  font-size: 0.78rem;
+  line-height: 1;
+  color: var(--color-muted-foreground);
+}
+
+.hlv-comment-del:hover {
+  color: var(--color-destructive);
+}
+
 /* Composer (textarea + send) pinned under the thread ------------- */
 .hlv-composer {
   flex-shrink: 0;
@@ -1074,6 +1165,223 @@
   border-radius: 0;
   padding: 0 4px;
   white-space: nowrap;
+}
+
+/* ------------------------------------------------------------------ */
+/* «запуски» pane: one row per attempt at the card                      */
+/* ------------------------------------------------------------------ */
+.hlv-run-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 2px;
+}
+
+.hlv-run {
+  border: 1px solid var(--color-border);
+  border-left-width: 3px;
+  border-radius: 0;
+  background: var(--color-card);
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+/* The left edge carries the outcome at a glance; the word itself is on the
+   row, so colour is a second signal, never the only one. */
+.hlv-run-ok { border-left-color: var(--color-success); }
+.hlv-run-warn { border-left-color: var(--color-warning); }
+.hlv-run-err { border-left-color: var(--color-destructive); }
+.hlv-run-active { border-left-color: var(--color-ring, var(--color-success)); }
+.hlv-run-muted { border-left-color: var(--color-border); }
+
+.hlv-run-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.hlv-run-outcome {
+  font-size: 0.74rem;
+  font-weight: 700;
+  color: var(--color-card-foreground, var(--foreground));
+}
+
+.hlv-run-ok .hlv-run-outcome { color: var(--color-success); }
+.hlv-run-warn .hlv-run-outcome { color: var(--color-warning); }
+.hlv-run-err .hlv-run-outcome { color: var(--color-destructive); }
+.hlv-run-active .hlv-run-outcome { color: var(--color-ring, var(--color-success)); }
+
+.hlv-run-profile {
+  font-size: 0.72rem;
+  color: var(--color-ring, var(--color-success));
+}
+
+.hlv-run-elapsed {
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-card-foreground, var(--foreground));
+}
+
+.hlv-run-when {
+  margin-left: auto;
+  font-size: 0.68rem;
+  color: var(--color-muted-foreground);
+}
+
+.hlv-run-facts {
+  font-size: 0.68rem;
+  color: var(--color-muted-foreground);
+}
+
+.hlv-run-summary {
+  font-size: 0.78rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--color-card-foreground, var(--foreground));
+}
+
+.hlv-run-error {
+  font-size: 0.74rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--color-destructive);
+}
+
+.hlv-run-meta-block {
+  font-size: 0.7rem;
+}
+
+.hlv-run-meta-label {
+  cursor: pointer;
+  color: var(--color-muted-foreground);
+}
+
+.hlv-run-meta {
+  display: block;
+  margin-top: 4px;
+  padding: 6px 8px;
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--color-popover, var(--color-card));
+  border: 1px solid var(--color-border);
+  border-radius: 0;
+  color: var(--color-card-foreground, var(--foreground));
+}
+
+/* ------------------------------------------------------------------ */
+/* «файлы» pane: upload bar + one row per attachment                    */
+/* ------------------------------------------------------------------ */
+.hlv-files-wrap {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.hlv-files-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+/* The real picker is hidden; the button clicks it. A native file input cannot
+   be styled to match the dashboard's buttons, and it would sit in the row as a
+   second, redundant control. */
+.hlv-files-input {
+  display: none;
+}
+
+.hlv-files-note {
+  font-size: 0.72rem;
+  flex-shrink: 0;
+}
+
+.hlv-files-note.ok { color: var(--color-success); }
+.hlv-files-note.err { color: var(--color-warning); }
+
+.hlv-file-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.hlv-file {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 0;
+  background: var(--color-card);
+  padding: 6px 10px;
+}
+
+/* The filename is the download control: the thing you click is the thing you
+   get, instead of a separate "скачать" button per row. */
+.hlv-file-name {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  font: inherit;
+  font-size: 0.78rem;
+  color: var(--color-ring, var(--color-success));
+  cursor: pointer;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.hlv-file-name:hover {
+  text-decoration: underline;
+}
+
+.hlv-file-size {
+  font-size: 0.7rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-muted-foreground);
+  white-space: nowrap;
+}
+
+.hlv-file-meta {
+  margin-left: auto;
+  font-size: 0.68rem;
+  color: var(--color-muted-foreground);
+  white-space: nowrap;
+}
+
+.hlv-file-del {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  padding: 0 2px;
+  font: inherit;
+  font-size: 0.75rem;
+  color: var(--color-muted-foreground);
+  cursor: pointer;
+}
+
+.hlv-file-del:hover {
+  color: var(--color-destructive);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1208,7 +1516,12 @@
   width: 100%;
   box-sizing: border-box;
   flex: 1;
-  min-height: 180px;
+  /* The description is the one field people actually write paragraphs into,
+     so the box opens TALL by default instead of the old 180px sliver that
+     showed four lines above the fold. `resize: vertical` still lets the
+     reader stretch it further, and the pane scrolls when it grows past the
+     window. */
+  min-height: 360px;
   resize: vertical;
   background: var(--color-popover, var(--color-card));
   color: var(--color-card-foreground, var(--foreground));
@@ -1290,6 +1603,22 @@
 
 .hlv-runtime-input {
   width: 90px;
+}
+
+/* The executor: a profile name can be long ("executor-cloud — …"), so the
+   closed value is normal weight (a bold name reads as an error) and the
+   combobox sizes to a readable width instead of the 180px board-select cap.
+   It may still shrink inside the field row — the hint next to it wraps. */
+.hlv-assignee-value {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--color-card-foreground, var(--foreground));
+}
+
+.hlv-assignee-select {
+  width: 280px;
+  max-width: 100%;
+  flex: 0 1 280px;
 }
 
 /* The status buttons wrap as a group; `flex-basis` is what makes them break
@@ -1403,4 +1732,310 @@
     scroll-snap-align: start;
     justify-content: center;
   }
+}
+
+/* --- Свёрнутая верхняя полоса вкладки «транскрипт» -----------------------
+   Полоса занимает верх панели, и когда читают транскрипт, она мешает. Кнопка
+   в её шапке сворачивает её до одной строки: что делает агент и жив ли поток.
+   Настройка запоминается в localStorage, поэтому сворачивать её на каждой
+   карточке не нужно. */
+.hlv-live-head-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hlv-live-toggle {
+  margin-left: auto;
+  flex-shrink: 0;
+  font: inherit;
+  font-size: 0.66rem;
+  line-height: 1.4;
+  color: var(--color-muted-foreground);
+  background: transparent;
+  border: 1px solid var(--color-border);
+  border-radius: 0;
+  padding: 0 6px;
+  cursor: pointer;
+}
+
+.hlv-live-toggle:hover {
+  color: var(--color-foreground, inherit);
+  border-color: var(--color-ring, var(--color-border));
+}
+
+/* Свёрнутая полоса — одна строка, без следа запуска под ней. */
+.hlv-live-collapsed {
+  padding: 4px 10px;
+}
+
+/* --- Живой поток модели: последний блок списка, обновляется в эфире ------
+   Транскрипт выше — история (строка ассистента появляется на границе вызова
+   модели). Этот блок показывает токены ТЕКУЩЕГО вызова, поэтому он и стоит
+   последним: глаз уже там, где идёт работа. */
+.hlv-live-msg {
+  border-left: 2px solid var(--color-ring, var(--color-border));
+  padding-left: 8px;
+}
+
+.hlv-live-msg-state {
+  font-size: 0.68rem;
+  color: var(--color-muted-foreground);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Рассуждение в потоке — не <details>: его не сворачивают, за ним следят.
+   Слева та же линия, что у блока рассуждений в истории, чтобы это читалось
+   как одно и то же. */
+.hlv-live-reasoning {
+  margin: 0 0 6px;
+  border-left: 2px solid var(--color-border);
+  padding-left: 8px;
+}
+
+.hlv-live-reasoning-label {
+  font-size: 0.7rem;
+  color: var(--color-muted-foreground);
+  margin-bottom: 2px;
+}
+
+/* Пояснение, почему рассуждений нет или почему поток прервался. */
+.hlv-live-hint {
+  font-size: 0.68rem;
+  color: var(--color-muted-foreground);
+  border: 1px solid var(--color-border);
+  padding: 2px 6px;
+  margin-top: 4px;
+}
+
+/* --- Живые воркеры -------------------------------------------------------
+   Число ПРОЦЕССОВ, а не карточек в running: они расходятся, и расхождение —
+   то, что читатель хочет увидеть. Бейдж стоит сразу за «N running · …» и
+   сам является кнопкой: клик открывает список «кто именно работает»
+   (на телефоне наведения нет, поэтому детали живут за кликом). */
+.hlv-workers {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  font: inherit;
+  font-size: 0.72rem;
+  line-height: 1.5;
+  color: var(--color-muted-foreground);
+  background: transparent;
+  border: 1px solid var(--color-border);
+  border-radius: 0;
+  padding: 1px 8px;
+  cursor: pointer;
+  max-width: 100%;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.hlv-workers:hover {
+  color: var(--color-card-foreground, var(--foreground));
+  border-color: var(--color-ring, var(--color-border));
+}
+
+/* Есть расхождение с доской: воркер доделывает карточку вне running или
+   карточка в running осталась без процесса. Это предупреждение, а не
+   украшение — цветом оно должно читаться раньше чисел. */
+.hlv-workers-alert {
+  color: var(--color-warning);
+  border-color: var(--color-warning);
+}
+
+.hlv-workers-idle {
+  opacity: 0.72;
+}
+
+.hlv-workers-flag {
+  color: var(--color-warning);
+}
+
+/* Гейтвей в шапке: состояние + две кнопки (▶ запустить / ⏹ остановить).
+   Кнопки стоят рядом с состоянием, потому что вопрос «он жив?» и действие над
+   ним — одно и то же решение; разносить их по разным углам панели незачем. */
+.hlv-gateway {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.72rem;
+  line-height: 1.5;
+  color: var(--color-muted-foreground);
+  border: 1px solid var(--color-border);
+  border-radius: 0;
+  padding: 1px 6px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Запущенный гейтвей — норма, остановленный — внимание: молчащий мессенджер
+   выглядит как «сообщения отправлены», поэтому цвет обязан отличаться. */
+.hlv-gateway.on {
+  color: var(--color-success, var(--color-card-foreground, var(--foreground)));
+  border-color: color-mix(in srgb, var(--color-success, var(--color-border)) 45%,
+    var(--color-border));
+}
+
+.hlv-gateway.off {
+  color: var(--color-warning);
+  border-color: color-mix(in srgb, var(--color-warning) 45%, var(--color-border));
+}
+
+.hlv-gateway-face {
+  text-transform: lowercase;
+  letter-spacing: 0.02em;
+}
+
+.hlv-gateway-btn {
+  font: inherit;
+  line-height: 1;
+  padding: 1px 5px;
+  border: 1px solid var(--color-border);
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.hlv-gateway-btn:hover:not(:disabled) {
+  border-color: var(--color-ring, var(--color-border));
+}
+
+.hlv-gateway-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.hlv-gateway-note.ok {
+  color: var(--color-success, inherit);
+}
+
+.hlv-gateway-note.err {
+  color: var(--color-destructive, #d14a4a);
+}
+
+/* Две формы числа задач: длинная («на 2 задачах») на десктопе и короткая
+   («· 2 задачи») на узком экране, где шапка складывается в несколько строк.
+   Переключаются в media-query ниже — без JS, чтобы не зависеть от ресайза. */
+.hlv-workers-tasks-compact {
+  display: none;
+}
+
+/* Метка на строке списка: у карточки есть живой процесс, о котором её статус
+   ничего не говорит. */
+.hlv-row-worker {
+  font-size: 0.62rem;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  border: 1px solid var(--color-warning);
+  border-radius: 0;
+  padding: 0 4px;
+  color: var(--color-warning);
+  white-space: nowrap;
+}
+
+.hlv-row-worker.stale {
+  border-color: var(--color-destructive, var(--color-warning));
+  color: var(--color-destructive, var(--color-warning));
+}
+
+/* Панель «кто именно работает». */
+.hlv-workers-modal {
+  max-width: 680px;
+}
+
+.hlv-workers-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 52vh;
+  overflow-y: auto;
+  border: 1px solid var(--color-border);
+  background: var(--color-card);
+  padding: 4px;
+}
+
+.hlv-worker-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  border-left: 2px solid transparent;
+  border-radius: 0;
+  padding: 5px 8px;
+  cursor: pointer;
+}
+
+.hlv-worker-row:hover {
+  background: var(--color-accent, var(--color-muted));
+}
+
+.hlv-worker-row.after {
+  border-left-color: var(--color-warning);
+}
+
+.hlv-worker-row.stale {
+  border-left-color: var(--color-destructive, var(--color-warning));
+}
+
+.hlv-worker-title {
+  font-size: 0.82rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hlv-worker-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 0.68rem;
+  color: var(--color-muted-foreground);
+  font-variant-numeric: tabular-nums;
+}
+
+.hlv-worker-phase {
+  color: var(--color-card-foreground, var(--foreground));
+}
+
+.hlv-worker-phase.after,
+.hlv-worker-phase.stale {
+  color: var(--color-warning);
+}
+
+.hlv-worker-note {
+  color: var(--color-warning);
+}
+
+@media (max-width: 1023px) {
+  /* Шапка на узком экране складывается в строки; от числа задач остаётся
+     короткая форма, чтобы бейдж не выталкивал кнопку «+ Новая задача». */
+  .hlv-workers-tasks-wide {
+    display: none;
+  }
+  .hlv-workers-tasks-compact {
+    display: inline;
+  }
+  .hlv-workers {
+    font-size: 0.7rem;
+    padding: 1px 6px;
+  }
+  .hlv-workers-modal {
+    max-width: 100%;
+  }
+}
+
+/* Пояснение к разнице между счётчиком «N running» и числом процессов: в
+   счётчик слева попадают и запланированные карточки. */
+.hlv-workers-sched {
+  font-size: 0.68rem;
+  color: var(--color-muted-foreground);
+  border-left: 2px solid var(--color-border);
+  padding-left: 8px;
 }

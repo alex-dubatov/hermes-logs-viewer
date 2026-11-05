@@ -1,0 +1,27 @@
+manifest_version: 2
+name: hermes-logs-viewer
+label: Kanban Logs
+version: 1.2.0
+description: >-
+  Дашборд-плагин «Kanban Logs»: список задач всех досок и живой транскрипт
+  карточки. Кроме своей вкладки плагин подписывается на поток модели
+  (on_stream_start / on_stream_delta / on_stream_end) и складывает токены
+  текущего вызова в plugin-data, чтобы вкладка «транскрипт» показывала
+  рассуждения агента В ПОТОКЕ, а не только готовую строку после вызова.
+  Рассуждения приходят только при включённом plugins.stream_reasoning_deltas.
+author: local
+provides_hooks:
+  - on_stream_start
+  - on_stream_delta
+  - on_stream_end
+listens:
+  - on_stream_start
+  - on_stream_delta
+  - on_stream_end
+config_schema:
+  capture:
+    type: bool
+    default: true
+    description: >-
+      Писать токены модели в plugin-data, чтобы вкладка «транскрипт» показывала
+      рассуждения в потоке. false снимает подписку: панель скажет, что потока нет.

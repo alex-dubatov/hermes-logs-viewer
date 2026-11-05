@@ -13,6 +13,15 @@
   var useRef = hooks.useRef;
   var useCallback = hooks.useCallback;
   var fetchJSON = SDK.fetchJSON;
+  // Raw authenticated fetch for the files tab: an upload has to be sent as
+  // multipart (the browser owns the boundary, so fetchJSON's JSON encoding
+  // cannot be used) and a download has to be read as a blob. The host's
+  // authedFetch is the only way to carry the dashboard's auth in BOTH modes
+  // (loopback token / gated cookie). The fallback keeps an older dashboard
+  // from taking the whole tab down: `window.fetch` at least carries the cookie.
+  var authedFetch = SDK.authedFetch || function (p, opts) {
+    return window.fetch(p, opts);
+  };
 
   var API = "/api/plugins/hermes-logs-viewer";
   // Boards, profiles, task creation and the log itself are served by the
@@ -31,7 +40,19 @@
   var TASK_POLL_MS = 2000;
   var LOG_POLL_MS = 1200;
   var TRANSCRIPT_POLL_MS = 2000;  // the live transcript pane, same cadence as the list
+  // The model's own tokens (the live reasoning block). Polled faster than the
+  // transcript: this is the one thing on the pane that changes every token,
+  // and a 2 s beat would make a live stream look like a slideshow.
+  var LIVE_POLL_MS = 1000;
+  // Persisted "the live strip is collapsed" flag (per browser, not per card:
+  // it is a reading preference, like the board filter).
+  var LIVE_COLLAPSED_KEY = "hlv.liveCollapsed";
   var BOARDS_POLL_MS = 15000;   // the board list changes rarely
+  // The gateway can be stopped/started from a shell, a timer or a crash, so its
+  // badge is polled on its own short beat — slower than the task list (nothing
+  // changes second to second) and faster than the board list (an operator who
+  // just clicked "стоп" expects to see it land).
+  var GATEWAY_POLL_MS = 5000;
   var PROFILES_POLL_MS = 30000; // installed profiles change even more rarely
   var FOLLOW_MS = 500;          // autoscroll watchdog cadence
   var BOTTOM_THRESHOLD = 80; // px from the bottom that still counts as "at bottom"
@@ -57,6 +78,31 @@
     todo: "todo",
     done: "done",
     archived: "archived",
+  };
+
+  // What the per-comment delivery chip says. The state is computed by the
+  // backend (`_comment_delivery`), which looks for the comment's TEXT in the
+  // card's own transcript: the worker's spawn prompt carries the thread, and
+  // the mid-run bridge steers new notes in — so "not found" means no worker has
+  // read it yet, and deleting it before the next poll genuinely cancels the
+  // delivery.
+  var COMMENT_DELIVERY = {
+    pending: {
+      text: "не доставлен",
+      title: "воркер ещё не получил этот комментарий — удаление отменит доставку",
+    },
+    delivered: {
+      text: "агент видел",
+      title: "комментарий уже в контексте воркера (стартовое задание или заметка в ходе работы) — удаление уберёт только запись",
+    },
+    own: {
+      text: "от воркера",
+      title: "это комментарий самого воркера, а не сообщение оператора",
+    },
+    unknown: {
+      text: "доставка ?",
+      title: "транскрипт карточки прочитать не удалось — проверить доставку нельзя",
+    },
   };
 
   // Every status gets its own class so each badge is tinted — the colours live
@@ -102,6 +148,91 @@
     if (n < 1024) return n + " Б";
     if (n < 1024 * 1024) return (n / 1024).toFixed(n < 10240 ? 1 : 0) + " КБ";
     return (n / 1048576).toFixed(n < 10485760 ? 2 : 1) + " МБ";
+  }
+
+  // A duration in seconds as one short token: `42s`, `7m`, `2.4h`. Used by the
+  // run history, where the useful question is "how long did that attempt
+  // take", not an exact second count.
+  function fmtDuration(secs) {
+    var s = Math.max(0, Math.floor(Number(secs) || 0));
+    if (s < 60) return s + "s";
+    if (s < 3600) return Math.round(s / 60) + "m";
+    return (s / 3600).toFixed(1) + "h";
+  }
+
+  // Русская форма числа: 1 воркер / 2 воркера / 5 воркеров. Правила у всех
+  // таких слов (воркер, задача) совпадают — различаются только окончания,
+  // поэтому одна функция на все. 11–14 — исключение: «11 воркеров».
+  function plural(n, one, few, many) {
+    var abs = Math.abs(Math.floor(Number(n) || 0)) % 100;
+    if (abs >= 11 && abs <= 14) return many;
+    switch (abs % 10) {
+      case 1: return one;
+      case 2: case 3: case 4: return few;
+      default: return many;
+    }
+  }
+
+  // Фазы живой записи (см. `_worker_rows` в plugin_api.py): процесс работает
+  // по своей карточке, процесс доделывает карточку, ушедшую из running, или
+  // карточка числится running, а процесса уже нет.
+  var WORKER_PHASE_LABEL = {
+    running: "работает",
+    after: "доделывает",
+    stale: "без воркера",
+  };
+
+  // An epoch-second timestamp as a local `дд.мм чч:мм`. The run list is read
+  // next to a relative age, and "2d" alone cannot say WHICH day an attempt ran.
+  function fmtDateTime(ts) {
+    var t = Number(ts) || 0;
+    if (!t) return "";
+    var d = new Date(t * 1000);
+    function p2(n) { return (n < 10 ? "0" : "") + n; }
+    return p2(d.getDate()) + "." + p2(d.getMonth() + 1) + " " +
+      p2(d.getHours()) + ":" + p2(d.getMinutes());
+  }
+
+  // An epoch-second timestamp as a local `дд.мм.гггг чч:мм:сс`. The task list
+  // must show WHEN a card was created, and a day without hours/minutes/seconds
+  // cannot separate two cards made in the same minute — which is exactly the
+  // case when a burst of cards is created by one dispatch.
+  function fmtDateTimeFull(ts) {
+    var t = Number(ts) || 0;
+    if (!t) return "";
+    var d = new Date(t * 1000);
+    function p2(n) { return (n < 10 ? "0" : "") + n; }
+    return p2(d.getDate()) + "." + p2(d.getMonth() + 1) + "." + d.getFullYear() +
+      " " + p2(d.getHours()) + ":" + p2(d.getMinutes()) + ":" + p2(d.getSeconds());
+  }
+
+  // The colour class of a finished run, by the outcome the dispatcher wrote.
+  // Three buckets rather than one per word: what a reader needs is "it worked",
+  // "it stopped and asked for something" or "it died", and the exact word is
+  // printed on the row anyway.
+  function runOutcomeClass(name) {
+    switch (name) {
+      case "completed":
+      case "success":
+      case "done":
+        return "ok";
+      case "blocked":
+      case "review_requested":
+      case "changes_requested":
+      case "scheduled":
+        return "warn";
+      case "crashed":
+      case "timed_out":
+      case "gave_up":
+      case "failed":
+      case "spawn_failed":
+      case "refused":
+      case "interrupted":
+      case "reclaimed":
+        return "err";
+      default:
+        return "muted";
+    }
   }
 
   // UTF-8 byte length of a string. The log route reports the file size in
@@ -232,10 +363,25 @@
     return { priority: t.priority || 0, completed_at: t.completed_at || 0 };
   }
 
+  // Board slug as a LATE tiebreak for the merged "все доски" list. It sorts
+  // after the card's own keys, so the merged view obeys the single-board rule
+  // (status group, then priority / completion) and only falls back to the board
+  // when two cards are genuinely equal — which keeps their relative order
+  // stable instead of letting the sort shuffle them on every poll. `default`
+  // first, then alphabetical: the selector's own order.
+  function boardRank(t) {
+    var slug = boardSlug(t);
+    return [slug === "default" ? 0 : 1, slug];
+  }
+
   function taskSortKey(t) {
     var closed = !!CLOSED_STATUSES[t.status];
     var inp = sortInputs(t);
     var group = STATUS_ORDER[t.status] == null ? 99 : STATUS_ORDER[t.status];
+    // `group` is FIRST — status groups are the rule on a single board and stay
+    // the rule on "все доски", so a running card from the last board still sits
+    // above a done card from the first. Boards do not get a block of their own
+    // any more: they only break ties (see boardRank).
     // The `ready` group is the dispatch queue, so it is ordered by the
     // dispatcher's OWN rule — `ORDER BY priority DESC, created_at ASC`
     // (kanban_db_dispatch._lane_rows). The generic keys below tie-break equal
@@ -244,33 +390,27 @@
     // not honour. Mirroring it exactly means the first ready row really is the
     // card that goes in-progress next.
     if (t.status === "ready") {
-      return [
-        group,
+      return [group,
         -(inp.priority || 0),  // priority DESC
         t.created_at || 0,     // created_at ASC (oldest first)
-        t.board || "", t.id || "",
-      ];
+      ].concat(boardRank(t), [t.id || ""]);
     }
     // A RUNNING card must not move because its worker spoke. The generic keys
     // below tie-break on last_heartbeat_at, which changes on every heartbeat —
     // two equally-prioritised running cards used to swap places whenever either
     // one reported in, reshuffling the list under the cursor. Started-at is
-    // stable for the whole run and still meaningful: longest-running first.
+    // stable for the whole run and still meaningful (longest-running first).
     if (t.status === "running") {
-      return [
-        group,
+      return [group,
         -(inp.priority || 0),
         t.started_at || t.created_at || 0,   // ASC, and never negated
-        t.board || "", t.id || "",
-      ];
+      ].concat(boardRank(t), [t.id || ""]);
     }
-    return [
-      group,
+    return [group,
       // negated so the array sorts ascending = "highest first"
       closed ? -(inp.completed_at || 0) : -(inp.priority || 0),
       -(t.last_heartbeat_at || 0), -(t.started_at || 0), -(t.created_at || 0),
-      t.board || "", t.id || "",
-    ];
+    ].concat(boardRank(t), [t.id || ""]);
   }
 
   function compareTasks(a, b) {
@@ -319,6 +459,37 @@ function Page() {
     var tasksErrorState = useState("");
     var tasksError = tasksErrorState[0];
     var setTasksError = tasksErrorState[1];
+
+    // Живые процессы-воркеры из `/tasks/all` (см. `_worker_rows` на бэкенде).
+    // Это НЕ карточки в running: процесс может ещё доделывать карточку, которая
+    // уже ушла из running, — ровно тот случай, ради которого бейдж в шапке и
+    // появился. Приходит тем же опросом, что и список задач, отдельного запроса
+    // нет. `null` — маршрут ещё не отдаёт `workers` (старый бэкенд после
+    // обновления фронтенда): бейджа не будет вовсе, потому что «0 воркеров» в
+    // таком случае было бы выдумкой.
+    var workersState = useState(null);
+    var workers = workersState[0];
+    var setWorkers = workersState[1];
+    // Открыта панель «кто именно работает» (клик по бейджу).
+    var workersOpenState = useState(false);
+    var workersOpen = workersOpenState[0];
+    var setWorkersOpen = workersOpenState[1];
+
+    // Гейтвей (messaging gateway): state of the systemd --user unit behind the
+    // header's start/stop buttons, and whether an action is in flight.
+    // `null` means "the backend did not answer" (old build, no systemd) — the
+    // block is then not drawn at all rather than showing buttons that would
+    // promise something the host cannot do.
+    var gatewayState = useState(null);
+    var gateway = gatewayState[0];
+    var setGateway = gatewayState[1];
+    var gatewayBusyState = useState(false);
+    var gatewayBusy = gatewayBusyState[0];
+    var setGatewayBusy = gatewayBusyState[1];
+    // Last answer to a start/stop click, shown next to the buttons.
+    var gatewayNoteState = useState({ kind: "", text: "" });
+    var gatewayNote = gatewayNoteState[0];
+    var setGatewayNote = gatewayNoteState[1];
 
     var selectedState = useState(null);
     var selected = selectedState[0];
@@ -391,6 +562,32 @@ function Page() {
     // shrinking trail (rotation) must not leave stale lines behind.
     var transcriptLive = transcript.live || {};
     var transcriptEvents = transcript.events || [];
+    // Живой поток модели: токены ТЕКУЩЕГО вызова, пока модель их печатает.
+    //
+    // Транскрипт — история: строка ассистента появляется, когда вызов модели
+    // ЗАКОНЧИЛСЯ. Токены при этом уже есть — их отдаёт ядро подписчикам
+    // потока, и плагин один из них (его __init__.py пишет их в plugin-data
+    // профиля-владельца). Роут /tasks/{id}/live собирает этот файл в текст
+    // текущего вызова, а панель рисует его последним блоком списка.
+    var liveStreamState = useState({
+      task_id: "", available: false, streaming: false, reasoning: "", text: "",
+      reason: "", model: "", turn_id: "", iteration: 0, ended: false,
+      age_s: null, error: "", reasoning_enabled: true,
+    });
+    var liveStream = liveStreamState[0];
+    var setLiveStream = liveStreamState[1];
+    // Свёрнута ли верхняя полоса (та, где active activity и след запуска).
+    // Это читательская настройка, а не свойство карточки: состояние живёт в
+    // localStorage, чтобы не разворачивать полосу заново на каждой карточке.
+    var liveCollapsedState = useState(function () {
+      try {
+        return window.localStorage.getItem(LIVE_COLLAPSED_KEY) === "1";
+      } catch (e) {
+        return false;
+      }
+    });
+    var liveCollapsed = liveCollapsedState[0];
+    var setLiveCollapsed = liveCollapsedState[1];
     // Bumped whenever NEW messages arrive. The auto-scroll effect keys on it
     // instead of the message COUNT: the pane renders at most
     // TRANSCRIPT_MAX_RENDERED messages, so on a long-running card the count
@@ -500,6 +697,31 @@ function Page() {
     var note = noteState[0];
     var setNote = noteState[1];
 
+    // --- Run history + attachments (their own tabs) -------------------------
+    // Both lists come from the SAME bundled `GET /tasks/{id}` the card pane
+    // already reads: it returns `runs` and `attachments` alongside the task,
+    // so neither tab needs a route of its own (a route of ours would only go
+    // live after a dashboard restart). The poll below fills them together.
+    var runsState = useState([]);
+    var runs = runsState[0];
+    var setRuns = runsState[1];
+    var attsState = useState([]);
+    var attachments = attsState[0];
+    var setAttachments = attsState[1];
+    // Upload/delete of the files tab: one busy flag and one note line, the same
+    // shape the card pane uses for its writes.
+    var attBusyState = useState(false);
+    var attBusy = attBusyState[0];
+    var setAttBusy = attBusyState[1];
+    var attNoteState = useState({ kind: "", text: "" });
+    var attNote = attNoteState[0];
+    var setAttNote = attNoteState[1];
+    // The hidden <input type="file"> the "загрузить файл" button clicks.
+    var attFileRef = useRef(null);
+    // Re-reads the card detail NOW (set by the poller's effect). Upload and
+    // delete call it so the row appears/disappears without waiting a tick.
+    var detailReloadRef = useRef(null);
+
     // --- Title editing (the pencil next to the title) ----------------------
     // The draft lives apart from `desc`, so the 5 s poll cannot overwrite what
     // is being typed. The pencil opens the field and becomes the save ("✓").
@@ -541,6 +763,22 @@ function Page() {
     var runtimeDraftState = useState("0");
     var runtimeDraft = runtimeDraftState[0];
     var setRuntimeDraft = runtimeDraftState[1];
+
+    // --- Executor (the pencil next to the assignee) -----------------------
+    // Written through the SAME bundled PATCH: its body already carries
+    // `assignee` (an empty string unassigns), so no route of our own is
+    // needed. The editor is a combobox of installed profiles — the same list
+    // the create form offers — rather than a free-text field, because a typo
+    // in a profile name leaves the card in `ready` with nobody to run it.
+    var assigneeEditState = useState(false);
+    var assigneeEdit = assigneeEditState[0];
+    var setAssigneeEdit = assigneeEditState[1];
+    // Same ref trick as the other editors: the poller reads the CURRENT flag.
+    var assigneeEditRef = useRef(false);
+    assigneeEditRef.current = assigneeEdit;
+    var assigneeDraftState = useState("");
+    var assigneeDraft = assigneeDraftState[0];
+    var setAssigneeDraft = assigneeDraftState[1];
 
     var showArchivedState = useState(false);
     var showArchived = showArchivedState[0];
@@ -674,7 +912,9 @@ function Page() {
     var atBottom = atBottomState[0];
     var setAtBottom = atBottomState[1];
 
-    // Which pane the right side shows: "log" (live tail) or "comments" (thread).
+    // Which pane the right side shows: "log" (live tail), "transcript" (the
+    // card's conversation), "comments" (the thread), "runs" (its attempts),
+    // "files" (its attachments) or "main" (the card itself).
     var paneState = useState("log");
     var pane = paneState[0];
     var setPane = paneState[1];
@@ -757,6 +997,7 @@ function Page() {
           }
           setTasksError("");
           setTasks(r.tasks || []);
+          setWorkers(Array.isArray(r.workers) ? r.workers : null);
           if (!selectedRef.current && r.tasks && r.tasks.length) {
             // first selection: the most recently active, non-archived task
             // (restricted to the chosen board, when one is chosen)
@@ -809,6 +1050,61 @@ function Page() {
         clearInterval(h);
       };
     }, []);
+
+    // Состояние гейтвея. Own route (`/gateway`), because the bundled kanban
+    // plugin knows nothing about systemd units. An answer without `state` (an
+    // older backend still running from before this route existed) clears the
+    // value, so the header hides the block instead of drawing dead buttons.
+    useEffect(function () {
+      var stop = false;
+      function tick() {
+        api("/gateway").then(function (r) {
+          if (stop) return;
+          if (r && r.__error) { setGateway(null); return; }
+          if (!r || !r.state) { setGateway(null); return; }
+          setGateway(r);
+        });
+      }
+      tick();
+      var h = setInterval(tick, GATEWAY_POLL_MS);
+      return function () {
+        stop = true;
+        clearInterval(h);
+      };
+    }, [api]);
+
+    // Start / stop the gateway. The answer carries the state read AFTER the
+    // action, so the badge shows what actually happened rather than what was
+    // asked for; a failure keeps systemctl's own words in the note.
+    function controlGateway(action) {
+      if (gatewayBusy) return;
+      setGatewayBusy(true);
+      setGatewayNote({ kind: "", text: "" });
+      api("/gateway/" + action, { method: "POST" }).then(function (r) {
+        setGatewayBusy(false);
+        if (!r || r.__error) {
+          setGatewayNote({ kind: "err", text: (r && r.__error) || "нет ответа" });
+          return;
+        }
+        if (r.state) setGateway(r);
+        if (r.ok === false) {
+          setGatewayNote({
+            kind: "err",
+            text: "не удалось: " + (r.error || r.stderr || r.stdout || "?"),
+          });
+        } else {
+          setGatewayNote({
+            kind: "ok",
+            text: action === "stop" ? "остановлен" : "запущен",
+          });
+        }
+        setTimeout(function () {
+          setGatewayNote(function (n) {
+            return n.kind === "ok" ? { kind: "", text: "" } : n;
+          });
+        }, 2500);
+      });
+    }
 
     // Project list for the create form, on the same slow cadence as boards.
     // Fetched unfiltered (every project at once) and narrowed to the chosen
@@ -1413,6 +1709,69 @@ function Page() {
       };
     }, [selected, pane, api, boardOf]);
 
+    // --- Живой поток модели (токены текущего вызова) ------------------------
+    //
+    // Опрашивается чаще транскрипта и ТОЛЬКО пока открыта вкладка: это
+    // единственное, что на панели меняется с каждым токеном. Роут читает
+    // маленький NDJSON-файл в plugin-data профиля-владельца, а не стор, так
+    // что частый опрос дешёвый.
+    //
+    // Ответ для ЧУЖОЙ карточки не показывается: состояние принадлежит той
+    // карточке, для которой пришёл ответ (`task_id`), и при переключении
+    // панель ждёт следующего опроса, а не рисует поток предыдущей.
+    useEffect(function () {
+      if (!selected) {
+        setLiveStream({
+          task_id: "", available: false, streaming: false, reasoning: "",
+          text: "", reason: "", model: "", turn_id: "", iteration: 0,
+          ended: false, age_s: null, error: "",
+        });
+        return;
+      }
+      if (pane !== "transcript") return;
+      var stop = false;
+      var busy = false;
+      var taskId = selected;
+
+      function tick() {
+        if (busy) return;
+        if (selectedRef.current !== taskId) return;
+        busy = true;
+        api("/tasks/" + encodeURIComponent(taskId) + "/live?board=" +
+          encodeURIComponent(boardOf(taskId))
+        ).then(function (r) {
+          busy = false;
+          if (stop || selectedRef.current !== taskId) return;
+          // Транзиентная ошибка (дашборд перезапускается): оставляем прошлый
+          // ответ как есть, а не гасим блок.
+          if (r.__error) return;
+          setLiveStream({
+            task_id: taskId,
+            available: !!r.available,
+            streaming: !!r.streaming,
+            reasoning: r.reasoning || "",
+            text: r.text || "",
+            reason: r.reason || "",
+            model: r.model || "",
+            turn_id: r.turn_id || "",
+            iteration: r.iteration || 0,
+            ended: !!r.ended,
+            age_s: typeof r.age_s === "number" ? r.age_s : null,
+            error: r.stream_error || "",
+            reasoning_enabled: r.reasoning_enabled !== false,
+          });
+        }).catch(function () {
+          busy = false;
+        });
+      }
+      tick();
+      var h = setInterval(tick, LIVE_POLL_MS);
+      return function () {
+        stop = true;
+        clearInterval(h);
+      };
+    }, [selected, pane, api, boardOf]);
+
     // A newly selected card starts at its TAIL, not at its first message —
     // and it follows the tail from then on. The mode is per card, so a card
     // the reader scrolled up on stays where they left it when they come back
@@ -1425,18 +1784,26 @@ function Page() {
       setTranscriptAtBottom(true);
     }, [selected]);
 
-    // Full detail of the selected task, polled while the "основное" tab is
-    // open — it is the only pane that reads the whole card. The route is the
-    // bundled one (GET /tasks/{id}?board=), which returns the FULL body (the
-    // list route only carries a 200-char preview) plus the title, priority and
-    // status the controls here write.
+    // Full detail of the selected task, polled while a pane that reads the
+    // whole card is open — «основное» and the two lists that come with it
+    // («запуски», «файлы»). The route is the bundled one
+    // (GET /tasks/{id}?board=), which returns the FULL body (the list route
+    // only carries a 200-char preview) plus the title, priority and status the
+    // controls here write, and the card's `runs` and `attachments` arrays.
     var DESC_POLL_MS = 5000;
+    // One read feeds three tabs, so the poll runs while ANY of them is open.
+    // The log and comments panes do not need it and must not pay for it.
+    var DETAIL_PANES = { main: 1, runs: 1, files: 1 };
     useEffect(function () {
-      if (!selected || pane !== "main") {
+      if (!selected || !DETAIL_PANES[pane]) {
         setDesc(null);
+        setRuns([]);
+        setAttachments([]);
         setDescEdit(false);
         setTitleEdit(false);
         setMetaEdit(false);
+        setAssigneeEdit(false);
+        detailReloadRef.current = null;
         return;
       }
       var stop = false;
@@ -1447,6 +1814,11 @@ function Page() {
         ).then(function (r) {
           if (stop || selectedRef.current !== selected) return;
           if (r.__error || !r.task) return;
+          // Runs arrive in START order (kanban_db.list_runs: started_at ASC);
+          // the list is rendered newest-first, so the order is flipped once
+          // here rather than in three places.
+          setRuns((r.runs || []).slice().reverse());
+          setAttachments(r.attachments || []);
           setDesc({
             id: r.task.id,
             title: r.task.title || "",
@@ -1470,12 +1842,19 @@ function Page() {
           if (!runtimeEditRef.current) {
             setRuntimeDraft(String(runtimeMinutes(r.task.max_runtime_seconds || 0)));
           }
+          // The executor picker follows the same rule: an open combobox keeps
+          // what was picked until it is saved or cancelled.
+          if (!assigneeEditRef.current) setAssigneeDraft(r.task.assignee || "");
         }).catch(function () {});
       }
+      // The files tab re-reads the card after an upload/delete without
+      // waiting for the next tick, the same way the comments tab does.
+      detailReloadRef.current = load;
       load();
       var h = setInterval(load, DESC_POLL_MS);
       return function () {
         stop = true;
+        detailReloadRef.current = null;
         clearInterval(h);
       };
       // descEdit / titleEdit / metaEdit are read through refs above; re-running
@@ -1650,6 +2029,123 @@ function Page() {
       });
     }
 
+    // --- Files: upload / download / delete ---------------------------------
+    //
+    // All three go through the BUNDLED kanban routes, for the same reason every
+    // other write here does: they are mounted at process start, so they are
+    // live without a dashboard restart.
+    //
+    // Upload must be multipart — the browser has to own the boundary, so it
+    // cannot go through fetchJSON. Download must be a blob: a plain <a href>
+    // carries no auth in the dashboard's token mode, so the file is fetched
+    // with authedFetch and handed to the browser through an object URL.
+
+    function fileBoard() {
+      var id = selectedRef.current;
+      return id ? boardOf(id) : "default";
+    }
+
+    function fileNote(kind, text) {
+      setAttNote({ kind: kind, text: text });
+    }
+
+    // The route answers a refusal as JSON `{detail}`; read it once, so the note
+    // shows the route's own words instead of a bare status code.
+    function fileResponseOrError(resp) {
+      if (resp && resp.ok) return Promise.resolve(resp);
+      var status = resp && resp.status ? resp.status : 0;
+      var text = function () {
+        return resp && resp.text ? resp.text() : Promise.resolve("");
+      };
+      return text().then(function (body) {
+        var detail = body;
+        try {
+          var parsed = JSON.parse(body);
+          if (parsed && parsed.detail) detail = parsed.detail;
+        } catch (e) { /* not JSON — the body itself is the message */ }
+        throw new Error((detail || "не удалось получить файл") +
+          (status ? " (HTTP " + status + ")" : ""));
+      });
+    }
+
+    function uploadAttachments(fileList) {
+      var id = selectedRef.current;
+      var files = Array.prototype.slice.call(fileList || []);
+      if (!id || !files.length || attBusy) return;
+      setAttBusy(true);
+      fileNote("", "");
+      var url = KANBAN_API + "/tasks/" + encodeURIComponent(id) +
+        "/attachments?board=" + encodeURIComponent(boardOf(id));
+      var done = 0;
+      // One file at a time: a partial failure then names the file it stopped
+      // on, and a big upload does not fight the others for bandwidth.
+      var chain = Promise.resolve();
+      files.forEach(function (f) {
+        chain = chain.then(function () {
+          var fd = new FormData();
+          fd.append("file", f, f.name || "file");
+          return authedFetch(url, { method: "POST", body: fd })
+            .then(fileResponseOrError)
+            .then(function () { done += 1; });
+        });
+      });
+      chain.then(function () {
+        setAttBusy(false);
+        fileNote("ok", done === 1 ? "файл загружен" : "загружено файлов: " + done);
+        if (detailReloadRef.current) detailReloadRef.current();
+      }).catch(function (e) {
+        setAttBusy(false);
+        fileNote("err", String((e && e.message) || e || "не удалось загрузить"));
+      });
+    }
+
+    function downloadAttachment(a) {
+      if (!a || a.id == null) return;
+      fileNote("", "");
+      var url = KANBAN_API + "/attachments/" + encodeURIComponent(a.id) +
+        "?board=" + encodeURIComponent(fileBoard());
+      authedFetch(url)
+        .then(fileResponseOrError)
+        .then(function (resp) { return resp.blob(); })
+        .then(function (blob) {
+          var objUrl = URL.createObjectURL(blob);
+          var link = document.createElement("a");
+          link.href = objUrl;
+          link.download = a.filename || "attachment";
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          // The browser reads the blob after the click; one timer frees it.
+          setTimeout(function () { URL.revokeObjectURL(objUrl); }, 10000);
+        })
+        .catch(function (e) {
+          fileNote("err", String((e && e.message) || e || "не удалось скачать"));
+        });
+    }
+
+    function deleteAttachment(a) {
+      if (!a || a.id == null) return;
+      if (!window.confirm(
+        "Удалить файл «" + a.filename + "»? Он снимается и с диска.")) {
+        return;
+      }
+      fileNote("", "");
+      fetchJSON(
+        KANBAN_API + "/attachments/" + encodeURIComponent(a.id) +
+        "?board=" + encodeURIComponent(fileBoard()),
+        { method: "DELETE" }
+      ).then(function (r) {
+        if (r.__error || r.detail || r.ok === false) {
+          fileNote("err", r.__error || r.detail || "не удалось удалить файл");
+          return;
+        }
+        fileNote("ok", "файл удалён");
+        if (detailReloadRef.current) detailReloadRef.current();
+      }).catch(function (e) {
+        fileNote("err", String((e && e.message) || e || "не удалось удалить файл"));
+      });
+    }
+
     function setStatus(status) {
       // `done` / `archived` / `blocked` release the worker's claim and can
       // promote children — the bundled plugin confirms exactly these three, and
@@ -1665,7 +2161,11 @@ function Page() {
     }
 
     function onMetaKeyDown(e) {
-      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+      // Enter saves, with or without Ctrl/Cmd. The field is one number with
+      // nothing to wrap, so a bare Enter has no other meaning here; requiring
+      // Ctrl made the obvious key silently do nothing. Ctrl+Enter still works,
+      // for muscle memory from the other editors of this pane.
+      if (e.key === "Enter") {
         e.preventDefault();
         saveMeta();
         return;
@@ -1748,6 +2248,57 @@ function Page() {
       }
     }
 
+    // --- Executor: the pencil next to the assignee ------------------------
+    // The value shown is `@profile` (or "не назначен"). The editor is a
+    // <select> of installed profiles plus an explicit "no executor" option:
+    // PATCH accepts `assignee: ""`, and that is how a card is unassigned.
+    function assigneeLabel(name) {
+      return name ? "@" + name : "не назначен";
+    }
+
+    function startAssigneeEdit() {
+      if (!desc) return;
+      setAssigneeDraft(desc.assignee || "");
+      setNote({ kind: "", text: "" });
+      setAssigneeEdit(true);
+    }
+
+    function cancelAssigneeEdit() {
+      setAssigneeEdit(false);
+      setAssigneeDraft(desc ? desc.assignee || "" : "");
+      setNote({ kind: "", text: "" });
+    }
+
+    function saveAssignee() {
+      var next = (assigneeDraft || "").trim();
+      var current = desc ? desc.assignee || "" : "";
+      if (next === current) {
+        // Nothing to write — a PATCH would only add an `edited` event.
+        setAssigneeEdit(false);
+        setNote({ kind: "", text: "" });
+        return;
+      }
+      patchTask({ assignee: next }, "исполнитель: " + assigneeLabel(next), function (task) {
+        setDescField("assignee", task.assignee || "");
+        setAssigneeEdit(false);
+      });
+    }
+
+    function onAssigneeKeyDown(e) {
+      // Enter saves, Esc cancels — the same keys as the other editors of this
+      // pane. A native <select> uses Enter for its own dropdown, so the save
+      // also has the "✓" pencil, which is always reachable.
+      if (e.key === "Enter") {
+        e.preventDefault();
+        saveAssignee();
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        cancelAssigneeEdit();
+      }
+    }
+
     // Append a comment (the one write the plugin performs). Called from the
     // send button and from onDraftKeyDown (Ctrl/Cmd+Enter). The draft lives in
     // `draft` state, not in the event, so a stale/absent event is harmless.
@@ -1812,6 +2363,74 @@ function Page() {
         e.preventDefault();
         submitComment();
       }
+    }
+
+    // Delete one comment. Goes to this plugin's OWN route (the bundled kanban
+    // plugin has no delete at all), which also removes the paired `commented`
+    // activity row.
+    //
+    // The backend refuses (409) a comment the worker has ALREADY seen unless
+    // the caller passes force=1 — deleting such a comment rewrites the history,
+    // it does not take the text out of the agent's context. So the question the
+    // operator is asked depends on the delivery state the thread already
+    // reports: a pending comment is cancelled, a delivered one is only erased
+    // from the record.
+    var COMMENT_DELETE_QUESTION = {
+      pending: "Удалить комментарий? Воркер его ещё не получил — он не будет доставлен.",
+      delivered: "Агент уже видел этот комментарий (он в его контексте). Удалить его только из записи задачи?",
+      own: "Удалить комментарий воркера из записи задачи?",
+      unknown: "Доставку проверить не удалось — агент мог уже видеть этот текст. Удалить?",
+    };
+
+    function deleteComment(c) {
+      var id = selectedRef.current;
+      if (!id || !c || commentBusy) return;
+      if (!window.confirm(COMMENT_DELETE_QUESTION[c.delivery] ||
+        COMMENT_DELETE_QUESTION.unknown)) {
+        return;
+      }
+      postDeleteComment(c, false);
+    }
+
+    function postDeleteComment(c, force) {
+      var id = selectedRef.current;
+      if (!id) return;
+      setCommentBusy(true);
+      fetchJSON(API + "/tasks/" + encodeURIComponent(id) + "/comments/" +
+        encodeURIComponent(c.id) + "?board=" + encodeURIComponent(boardOf(id)) +
+        (force ? "&force=1" : ""),
+        { method: "DELETE" }
+      ).then(function (r) {
+        setCommentBusy(false);
+        if (r && (r.error || r.detail || r.ok === false)) {
+          setCommentNote({
+            kind: "err",
+            text: r.error || r.detail || "не удалось удалить комментарий",
+          });
+          return;
+        }
+        setCommentNote({ kind: "ok", text: "комментарий удалён" });
+        if (commentsReloadRef.current) commentsReloadRef.current();
+        setTimeout(function () {
+          setCommentNote(function (n) {
+            return n.kind === "ok" ? { kind: "", text: "" } : n;
+          });
+        }, 2500);
+      }).catch(function (e) {
+        setCommentBusy(false);
+        // 409: the worker picked the comment up between the poll and the
+        // click. Ask the narrower question once and retry with force.
+        if (e && e.status === 409 && !force && window.confirm(
+          "Воркер уже получил этот комментарий — текст останется в его контексте. " +
+          "Удалить запись?")) {
+          postDeleteComment(c, true);
+          return;
+        }
+        setCommentNote({
+          kind: "err",
+          text: String((e && e.message) || e || "не удалось удалить комментарий"),
+        });
+      });
     }
 
     function onScroll(e) {
@@ -1886,6 +2505,21 @@ function Page() {
         transcriptModeRef.current.set(id, "fixed");
         transcriptTopRef.current.set(id, node.scrollTop);
       }
+    }
+
+    // Свернуть/развернуть верхнюю полосу вкладки «транскрипт». Настройка
+    // читателя, а не карточки, поэтому живёт в localStorage: свернув полосу
+    // один раз, её не приходится сворачивать на каждой карточке заново.
+    function toggleLiveCollapsed() {
+      setLiveCollapsed(function (prev) {
+        var next = !prev;
+        try {
+          window.localStorage.setItem(LIVE_COLLAPSED_KEY, next ? "1" : "0");
+        } catch (e) {
+          // Приватный режим без localStorage: полоса просто не запомнится.
+        }
+        return next;
+      });
     }
 
     function jumpTranscriptToBottom() {
@@ -2360,10 +2994,19 @@ function Page() {
     function visibleTasks() {
       var filter = board === ALL_BOARDS ? null : board;
       var q = (query || "").trim();
+      // De-duplicated by board+id: one board's db can only hold a task once, but
+      // a board whose slug is listed twice (the `boards/default/` directory
+      // next to the legacy `<root>/kanban.db`) made the backend answer with the
+      // same card twice, and a list must never show a card twice no matter what
+      // the payload says.
+      var seen = {};
       return sortedTasks.filter(function (t) {
+        var key = boardSlug(t) + "/" + t.id;
+        if (seen[key]) return false;
         if (filter && boardSlug(t) !== filter) return false;
         if (!showArchived && t.status === "archived") return false;
         if (q && !matchesQuery(t)) return false;
+        seen[key] = true;
         return true;
       });
     }
@@ -2453,14 +3096,155 @@ function Page() {
     }
 
     var c = counts();
+    // The element factory is needed from here on (the header, the worker badge),
+    // not only further down the render body.
+    var el = R.createElement;
+
+    // --- Живые воркеры ---------------------------------------------------
+    //
+    // «N running» выше считает КАРТОЧКИ, а бейдж — ПРОЦЕССЫ. Совпадать они
+    // обязаны не всегда: воркер, который пережил уход своей карточки из
+    // running, продолжает работать (иногда минутами), а карточка без процесса
+    // продолжает числиться running. Оба расхождения видны сразу: первое —
+    // пометкой «доделывает», второе — пометкой «без воркера».
+    function liveWorkers() {
+      return (workers || []).filter(function (w) {
+        return board === ALL_BOARDS || w.board === board;
+      });
+    }
+
+    function workerStats() {
+      var list = liveWorkers();
+      var seen = {};
+      var stats = { n: list.length, tasks: 0, after: 0, stale: 0, remote: 0 };
+      list.forEach(function (w) {
+        seen[w.board + "/" + w.task_id] = true;
+        if (w.phase === "after") stats.after++;
+        else if (w.phase === "stale") stats.stale++;
+        if (w.state === "remote") stats.remote++;
+      });
+      stats.tasks = Object.keys(seen).length;
+      return stats;
+    }
+
+    // Карточки по статусам для той же выборки. Нужны, чтобы объяснить разницу
+    // со счётчиком слева: он кладёт `scheduled` в «running», а запланированную
+    // карточку никто не выполняет — процесса у неё нет и быть не должно.
+    function cardStats() {
+      var s = { running: 0, scheduled: 0 };
+      tasks.forEach(function (t) {
+        if (board !== ALL_BOARDS && boardSlug(t) !== board) return;
+        if (t.status === "running") s.running++;
+        else if (t.status === "scheduled") s.scheduled++;
+      });
+      return s;
+    }
+
+    // Карточку из панели воркеров открываем там, где она действительно есть:
+    // поиск сбрасывается, а доска переключается только если выбранная доска
+    // эту карточку скрывает (в режиме «Все доски» переключать нечего).
+    function openWorkerCard(w) {
+      if (board !== ALL_BOARDS && w.board && w.board !== board) {
+        setBoard(w.board);
+        storeBoard(w.board);
+      }
+      setQuery("");
+      setSelected(w.task_id);
+      setWorkersOpen(false);
+    }
+
+    var ws = workerStats();
+    var cs = cardStats();
+    var wList = liveWorkers();
+    // У одной карточки может оказаться несколько записей (повторные запуски):
+    // на строке списка нужна самая требующая внимания, а не последняя.
+    var workerByTask = {};
+    wList.forEach(function (w) {
+      var key = w.board + "/" + w.task_id;
+      var prev = workerByTask[key];
+      if (!prev || (prev.phase === "running" && w.phase !== "running")) {
+        workerByTask[key] = w;
+      }
+    });
+
+    // Подпись бейджа: «2 воркера на 2 задачах» + пометки расхождений. Число
+    // задач сидит в отдельном спэне, чтобы на узком экране от него осталась
+    // короткая форма («· 2 задачи») — место в шапке там дорогое, а само число
+    // воркеров должно читаться первым.
+    var workerFace = ws.n + " " + plural(ws.n, "воркер", "воркера", "воркеров");
+    // При нуле задач вторая половина не нужна: «0 воркеров на 0 задачах» —
+    // два слова про одно и то же.
+    var workerTasksWide = ws.n ? " на " + ws.tasks + " " +
+      plural(ws.tasks, "задаче", "задачах", "задачах") : "";
+    var workerTasksCompact = ws.n ? " · " + ws.tasks + " " +
+      plural(ws.tasks, "задача", "задачи", "задач") : "";
+    var workerFlags = [];
+    if (ws.after) {
+      workerFlags.push(ws.after + " " +
+        plural(ws.after, "доделывает", "доделывают", "доделывают"));
+    }
+    if (ws.stale) {
+      workerFlags.push(ws.stale + " " + plural(ws.stale, "без воркера", "без воркера", "без воркера"));
+    }
+    var workersTitle =
+      "живых процессов-воркеров: " + ws.n + " · задач: " + ws.tasks +
+      "\nкарточек в running: " + cs.running +
+      (cs.scheduled
+        ? " (ещё " + cs.scheduled + " запланированных — счётчик слева считает и их, " +
+          "но процесса у них нет и быть не должно)"
+        : "") +
+      (ws.after
+        ? "\nдоделывают карточку, которая уже не в running: " + ws.after +
+          " — это и есть «ушёл из in progress, а всё ещё работает»"
+        : "") +
+      (ws.stale
+        ? "\nкарточек в running без живого процесса: " + ws.stale +
+          " (claim протух или reap не успел)"
+        : "") +
+      (ws.remote
+        ? "\nна другой машине (отсюда не проверить): " + ws.remote
+        : "") +
+      "\nнажмите, чтобы посмотреть, кто именно работает";
+
+    // Сводка для панели: одной строкой, что именно показывают числа.
+    var workerSummary = ws.n
+      ? workerFace + workerTasksWide +
+        (ws.after
+          ? " · " + ws.after + " " +
+            plural(ws.after, "доделывает", "доделывают", "доделывают") +
+            " карточку вне running"
+          : "") +
+        (ws.stale ? " · " + ws.stale + " в running без процесса" : "")
+      : "процессов нет: ни одна карточка сейчас никем не выполняется";
+
+    var workersReady = Array.isArray(workers);
+    var workersBadge = !workersReady ? null : el(
+      "button",
+      {
+        type: "button",
+        className: "hlv-workers" +
+          (ws.after || ws.stale ? " hlv-workers-alert" : "") +
+          (ws.n ? "" : " hlv-workers-idle"),
+        title: workersTitle,
+        "aria-label": "живые воркеры: " + workersTitle,
+        onClick: function () { setWorkersOpen(true); },
+        "data-workers": String(ws.n),
+        "data-workers-after": String(ws.after),
+        "data-workers-stale": String(ws.stale),
+      },
+      el("span", { className: "hlv-workers-face" }, workerFace),
+      el("span", { className: "hlv-workers-tasks-wide" }, workerTasksWide),
+      el("span", { className: "hlv-workers-tasks-compact" }, workerTasksCompact),
+      workerFlags.length
+        ? el("span", { className: "hlv-workers-flag" }, " · " + workerFlags.join(" · "))
+        : null
+    );
     // `sortTick` is read here (not merely declared) so the backfill's state bump
     // re-renders the rows in their new priority/completion order. Without this
     // reference the value would be dead and the fill-in would only show up on
     // the next 2 s list poll.
     if (sortTick < 0) return null;
     var vt = visibleTasks();
-
-    var el = R.createElement;
 
     // Board selector — which board's tasks the left list shows. "Все доски"
     // keeps the merged view; the choice is remembered between visits.
@@ -2524,12 +3308,71 @@ function Page() {
       )
     );
 
+    // --- Гейтвей -----------------------------------------------------------
+    // Two explicit buttons rather than one toggle: a toggle changes its face
+    // with the state, so the very control you reach for is the one you cannot
+    // read at a glance. The inapplicable button is DISABLED rather than hidden,
+    // so the strip does not jump when the state flips.
+    //
+    // `null` (the route did not answer — an older backend, a host without
+    // systemd) draws nothing at all: buttons that cannot do anything would
+    // promise more than the host can keep.
+    var gwUnit = gateway ? (gateway.unit || "hermes-gateway.service") : "";
+    var gwState = gateway ? (gateway.state || "") : "";
+    var gwLabel = !gateway
+      ? ""
+      : gateway.active
+        ? "запущен"
+        : gateway.known === false
+          ? "не найден"
+          : gwState === "activating"
+            ? "запускается…"
+            : gwState === "deactivating"
+              ? "останавливается…"
+              : "остановлен";
+    var gatewayBadge = !gateway ? null : el(
+      "div",
+      {
+        className: "hlv-gateway" + (gateway.active ? " on" : " off"),
+        title: "гейтвей (messaging): " + gwUnit +
+          " · состояние: " + (gwState || "?") +
+          (gateway.sub ? "/" + gateway.sub : "") +
+          (gateway.known === false && gateway.error ? " · " + gateway.error : ""),
+        "data-gateway-state": gwState,
+        "data-gateway-active": gateway.active ? "1" : "0",
+      },
+      el("span", { className: "hlv-gateway-face" }, "гейтвей"),
+      el("span", { className: "hlv-gateway-state" }, gwLabel),
+      el("button", {
+        type: "button",
+        className: "hlv-gateway-btn",
+        disabled: gatewayBusy || !!gateway.active || gateway.known === false,
+        title: "запустить гейтвей (systemctl --user start " + gwUnit + ")",
+        "data-gateway-action": "start",
+        onClick: function () { controlGateway("start"); },
+      }, "▶"),
+      el("button", {
+        type: "button",
+        className: "hlv-gateway-btn",
+        disabled: gatewayBusy || !gateway.active || gateway.known === false,
+        title: "остановить гейтвей (systemctl --user stop " + gwUnit + ")",
+        "data-gateway-action": "stop",
+        onClick: function () { controlGateway("stop"); },
+      }, "⏹"),
+      gatewayNote.text
+        ? el("span", { className: "hlv-gateway-note " + gatewayNote.kind },
+            gatewayNote.text)
+        : null
+    );
+
     var header = el(
       "div",
       { className: "hlv-header" },
       boardBlock,
       el("span", { className: "hlv-hints" },
         c.running + " running · " + c.other + " queued · " + c.archived + " archived"),
+      workersBadge,
+      gatewayBadge,
       el("div", { className: "hlv-header-actions" },
         createNote.text && !createOpen ? el("span", {
           className: "hlv-hints hlv-create-flash " + createNote.kind,
@@ -2615,8 +3458,37 @@ function Page() {
                 title: t.id + (t.board ? " · board " + t.board : ""),
               },
               el("span", { className: "hlv-row-title" }, t.title),
+              // Id + creation stamp, always visible: the id is how a card is
+              // referred to everywhere else (board links, log filenames, chat,
+              // «задача t_…»), and the creation moment separates cards that a
+              // single dispatch created within the same minute.
+              el("span", { className: "hlv-row-sub" },
+                el("span", { className: "hlv-row-id", title: "id задачи" }, t.id),
+                el("span", {
+                  className: "hlv-row-created",
+                  title: "создана: " + (fmtDateTimeFull(t.created_at) || "?"),
+                }, fmtDateTimeFull(t.created_at))
+              ),
               el("span", { className: "hlv-row-meta" },
                 el("span", { className: statusClass(t.status) }, STATUS_LABEL[t.status] || t.status),
+                // Живой воркер, о котором статус НЕ говорит: карточка уже не в
+                // running, а процесс всё ещё её доделывает (или наоборот —
+                // карточка в running, а процесса нет). Ровно тот случай, ради
+                // которого завели эту метку: по статусу его не видно.
+                (function () {
+                  var w = workerByTask[boardSlug(t) + "/" + t.id];
+                  if (!w || w.phase === "running") return null;
+                  return el("span", {
+                    className: "hlv-row-worker " + w.phase,
+                    title: w.phase === "after"
+                      ? "воркер всё ещё работает, хотя карточка уже не в running: " +
+                        fmtDuration(w.since_s) + " (pid " + w.pid + ", завершение: " +
+                        (w.outcome || w.run_status || "?") + ")"
+                      : "карточка в running, но живого процесса нет уже " +
+                        fmtDuration(w.since_s),
+                    "data-worker-phase": w.phase,
+                  }, WORKER_PHASE_LABEL[w.phase]);
+                })(),
                 // The priority the list is ORDERED by, not the raw field:
                 // sortInputs() already folds in the backfill cache, so this
                 // badge can never disagree with the row's position or with
@@ -2753,6 +3625,56 @@ function Page() {
     var transcriptIsForSelected = transcript.task_id === selected;
     var transcriptMessages = transcriptIsForSelected ? (transcript.messages || []) : [];
     var transcriptSource = transcriptIsForSelected ? (transcript.source || "") : "";
+
+    // Живой поток модели — ПОСЛЕДНИЙ блок списка, который обновляется в
+    // прямом эфире. Транскрипт выше — история: строка ассистента попадает в
+    // него, когда вызов модели закончился. Здесь же токены текущего вызова.
+    //
+    // Ответ чужой карточки не показывается: при переключении панель ждёт
+    // своего опроса, как и с транскриптом.
+    var liveForSelected = !!selected && liveStream.task_id === selected;
+    var liveText = liveForSelected ? (liveStream.text || "") : "";
+    var liveReasoning = liveForSelected ? (liveStream.reasoning || "") : "";
+    // Блок живёт, пока идёт вызов. После его конца текст остаётся ещё
+    // несколько секунд: та же строка доезжает в транскрипт отдельным
+    // сообщением, и мгновенное исчезновение читалось бы как сбой.
+    var liveVisible = liveForSelected && liveStream.available &&
+      (liveStream.streaming ||
+        ((liveText || liveReasoning) && (liveStream.age_s == null || liveStream.age_s < 5)));
+    var liveBlock = null;
+    if (liveVisible) {
+      var liveState = liveStream.streaming ? "пишет…" : "ответ закончен";
+      if (liveStream.iteration) liveState += " · вызов #" + liveStream.iteration;
+      liveBlock = el(
+        "div",
+        { className: "hlv-transcript-msg hlv-role-assistant hlv-live-msg" },
+        el("div", { className: "hlv-transcript-head" },
+          el("span", { className: "hlv-transcript-role" }, "--- assistant (поток)"),
+          el("span", { className: "hlv-live-msg-state" }, liveState)),
+        el("div", { className: "hlv-transcript-inner" },
+          liveReasoning
+            ? el("div", { className: "hlv-live-reasoning" },
+                el("div", { className: "hlv-live-reasoning-label" }, "рассуждения"),
+                el("pre", { className: "hlv-transcript-reasoning-text" }, liveReasoning))
+            : null,
+          liveText ? el("pre", { className: "hlv-transcript-text" }, liveText) : null,
+          (!liveReasoning && !liveText)
+            ? el("div", { className: "hlv-transcript-text hlv-transcript-empty" },
+                "вызов начался — первых токенов ещё нет…")
+            : null,
+          // Модель думает, но рассуждения до плагина не доходят: это не
+          // «ничего не думала», а настройка профиля — и читатель должен
+          // видеть, какая именно.
+          (!liveReasoning && liveText && !liveStream.reasoning_enabled)
+            ? el("div", { className: "hlv-live-hint" },
+                "рассуждения в профиле-владельце не отдаются плагину " +
+                "(plugins.stream_reasoning_deltas: true)")
+            : null,
+          liveStream.error
+            ? el("div", { className: "hlv-live-hint" }, "поток прервался: " + liveStream.error)
+            : null));
+    }
+
     var transcriptBody;
     if (!selected) {
       transcriptBody = el("div", { className: "hlv-empty" }, "выберите задачу слева");
@@ -2766,7 +3688,7 @@ function Page() {
     } else if (transcript.error) {
       transcriptBody = el("div", { className: "hlv-empty" },
         "транскрипт недоступен: " + transcript.error);
-    } else if (!transcriptMessages.length) {
+    } else if (!transcriptMessages.length && !liveBlock) {
       transcriptBody = el("div", { className: "hlv-empty" },
         "транскрипта пока нет — он появится, когда воркер начнёт работу");
     } else {
@@ -2868,7 +3790,7 @@ function Page() {
               : null,
             inner
           );
-        })
+        }).concat(liveBlock ? [liveBlock] : [])
       );
     }
 
@@ -2915,13 +3837,33 @@ function Page() {
       if (transcriptLive.ended_at) {
         liveBits.push("сессия завершена");
       }
+      var liveHeadText = liveBits.length ? liveBits.join(" · ") : "сессия без активности";
+      // Свёрнутая полоса оставляет ОДНУ строку: что агент делает и жив ли
+      // поток. Остальное (модель, счётчики, возраст активности, след запуска)
+      // — в подсказке и в развёрнутом виде: полоса занимает верх панели, а
+      // читают ради транскрипта.
+      var liveShortBits = [];
+      if (liveActivity) liveShortBits.push(liveActivity);
+      if (liveForSelected && liveStream.streaming) liveShortBits.push("поток модели");
+      var liveHeadShort = liveShortBits.join(" · ") || "полоса свёрнута";
       transcriptLiveStrip = el(
         "div",
-        { className: "hlv-transcript-live" + (transcriptLive.running ? " hlv-live-on" : "") },
+        { className: "hlv-transcript-live" + (transcriptLive.running ? " hlv-live-on" : "") +
+            (liveCollapsed ? " hlv-live-collapsed" : "") },
         el("div", { className: "hlv-transcript-live-head" },
           el("span", { className: "hlv-live-dot" }),
-          el("span", null, liveBits.length ? liveBits.join(" · ") : "сессия без активности")),
-        transcriptEvents.length
+          el("span", {
+            className: "hlv-live-head-text",
+            title: liveCollapsed ? liveHeadText : "",
+          }, liveCollapsed ? liveHeadShort : liveHeadText),
+          el("button", {
+            type: "button",
+            className: "hlv-live-toggle",
+            title: liveCollapsed ? "развернуть верхнюю полосу" : "свернуть верхнюю полосу",
+            "data-collapsed": liveCollapsed ? "1" : "0",
+            onClick: toggleLiveCollapsed,
+          }, liveCollapsed ? "развернуть" : "свернуть")),
+        !liveCollapsed && transcriptEvents.length
           ? el("div", {
               className: "hlv-transcript-events",
               ref: transcriptEventsRef,
@@ -2942,6 +3884,17 @@ function Page() {
       );
     }
 
+    // Живого потока нет — и панель говорит, почему. Ответ /live приходит с
+    // available:false и точной причиной (нет файла, выключены рассуждения,
+    // плагин не установлен), но раньше эта причина оставалась в стейте: блок
+    // не рисовался, и читатель видел пустое место там, где ждал рассуждения.
+    // Показываем её только на РАБОТАЮЩЕЙ карточке: у завершённой «агент сейчас
+    // не вызывает модель» — не диагноз, а шум.
+    var liveAbsentNotice = liveForSelected && !liveStream.available &&
+      liveStream.reason && transcriptLive.running
+      ? el("div", { className: "hlv-live-hint hlv-live-absent" }, liveStream.reason)
+      : null;
+
     var transcriptPane = el(
       "div",
       {
@@ -2951,6 +3904,7 @@ function Page() {
       },
       transcriptLiveStrip,
       transcriptMeta,
+      liveAbsentNotice,
       transcriptBody,
       selected && transcript.loaded && transcriptMessages.length &&
         !transcriptAtBottom && el("button", {
@@ -2973,12 +3927,55 @@ function Page() {
           ? el("div", { className: "hlv-empty" }, "комментариев пока нет")
           : el("div", { className: "hlv-comment-list" },
               comments.map(function (c) {
+                // `delivery` says whether the WORKER has seen this comment
+                // (computed by the backend from the card's own transcript:
+                // the spawn prompt or the mid-run steer note). It decides what
+                // the delete button MEANS: a pending comment is cancelled
+                // before delivery, a delivered one is only removed from the
+                // history — the agent already has the text.
+                var state = c.delivery || "unknown";
+                // A worker's own comment is not a message FOR the worker: it is
+                // never "delivered" and never "not delivered", so it carries no
+                // delivery chip at all. Showing «не доставлен» on it was the
+                // wrong question — nobody was supposed to deliver it.
+                var chip = state === "own" ? null : (COMMENT_DELIVERY[state] || COMMENT_DELIVERY.unknown);
+                var chipTitle = chip ? chip.title : "";
+                if (state === "delivered") {
+                  // WHERE it was found decides the wording: the spawn prompt, a
+                  // mid-run steer note, or the card's log (the old
+                  // child-process scheme, where the log WAS the transcript).
+                  if (c.delivered_channel === "spawn") {
+                    chipTitle = "было в стартовом задании воркера — он прочитал это до начала работы";
+                  } else if (c.delivered_channel === "mid_run") {
+                    chipTitle = "воркер получил это заметкой в ходе работы";
+                  } else if (c.delivered_channel === "worker_log") {
+                    chipTitle = "текст есть в логе воркера (схема без owner-сессии)";
+                  }
+                  if (c.delivered_at) {
+                    chipTitle += " (" + timeAgo(c.delivered_at) + " назад)";
+                  }
+                }
                 return el(
                   "div",
                   { key: c.id, className: "hlv-comment" },
                   el("div", { className: "hlv-comment-head" },
                     el("span", { className: "hlv-comment-author" }, "@" + (c.author || "?")),
-                    el("span", { className: "hlv-comment-time" }, timeAgo(c.created_at))),
+                    el("span", { className: "hlv-comment-time" }, timeAgo(c.created_at)),
+                    chip ? el("span", {
+                      className: "hlv-comment-delivery " + state,
+                      title: chipTitle,
+                    }, chip.text) : null,
+                    // The ✕ exists for ONE case: an operator message the worker
+                    // has not received yet, where deleting really cancels the
+                    // delivery. A delivered comment is already in the agent's
+                    // context (deleting only rewrites history), and a worker's
+                    // own comment is not ours to cancel — neither gets a ✕.
+                    state === "pending" ? el("button", {
+                      type: "button",
+                      className: "hlv-comment-del",
+                      title: "удалить комментарий — воркер его ещё не получил",
+                      onClick: function () { deleteComment(c); },
+                    }, "✕") : null),
                   el("div", { className: "hlv-comment-body" }, c.body)
                 );
               }))
@@ -3016,6 +4013,150 @@ function Page() {
       commentsPane,
       composer
     );
+
+    // --- «запуски» pane: the card's attempts --------------------------------
+    //
+    // One row per `task_runs` attempt, newest first: the outcome, who ran it,
+    // how long it took, the handoff summary and the error. All of it already
+    // arrives with GET /tasks/{id} (`runs`), so the tab has no route of its
+    // own — and a route of ours would need a dashboard restart to go live.
+    //
+    // The summary is the point of the tab: a worker hands off through it, and
+    // in the built-in drawer it is the only place the text is readable.
+    var runsPane;
+    if (!selected) {
+      runsPane = el("div", { className: "hlv-empty" }, "выберите задачу слева");
+    } else if (!runs.length) {
+      runsPane = el("div", { className: "hlv-run-list" },
+        el("div", { className: "hlv-empty" },
+          "запусков пока нет: карточку ещё не брал воркер"));
+    } else {
+      runsPane = el("div", { className: "hlv-run-list" },
+        runs.map(function (r) {
+          var active = !r.ended_at;
+          var outcomeName = active ? "идёт" : (r.outcome || r.status || "завершён");
+          var elapsed = r.started_at
+            ? fmtDuration((r.ended_at || Math.floor(Date.now() / 1000)) - r.started_at)
+            : "";
+          // One line of plain facts, so the head stays scannable: when it
+          // started and ended, the cap it ran under, the worker pid.
+          var facts = [];
+          if (r.started_at) facts.push("начат " + fmtDateTime(r.started_at));
+          if (r.ended_at) facts.push("закончен " + fmtDateTime(r.ended_at));
+          if (r.max_runtime_seconds) facts.push("лимит " + fmtDuration(r.max_runtime_seconds));
+          if (r.worker_pid) facts.push("pid " + r.worker_pid);
+          var metaJson = (r.metadata && Object.keys(r.metadata).length)
+            ? JSON.stringify(r.metadata, null, 2)
+            : "";
+          return el(
+            "div",
+            {
+              key: r.id,
+              className: "hlv-run hlv-run-" + (active ? "active" : runOutcomeClass(outcomeName)),
+              "data-run-id": String(r.id),
+              "data-run-outcome": outcomeName,
+            },
+            el("div", { className: "hlv-run-head" },
+              el("span", { className: "hlv-run-outcome" }, outcomeName),
+              el("span", { className: "hlv-run-profile" },
+                r.profile ? "@" + r.profile : "без профиля"),
+              elapsed ? el("span", { className: "hlv-run-elapsed", title: "длительность запуска" }, elapsed) : null,
+              r.started_at ? el("span", { className: "hlv-run-when", title: fmtDateTime(r.started_at) },
+                timeAgo(r.started_at) + " назад") : null
+            ),
+            facts.length ? el("div", { className: "hlv-run-facts" }, facts.join(" · ")) : null,
+            r.summary
+              ? el("div", { className: "hlv-run-summary" }, r.summary)
+              : null,
+            r.error
+              ? el("div", { className: "hlv-run-error" }, r.error)
+              : null,
+            metaJson
+              ? el("details", {
+                  className: "hlv-run-meta-block",
+                  // Short metadata is readable as it is; a long one starts
+                  // folded so one attempt cannot swallow the whole tab.
+                  open: metaJson.length <= 300,
+                },
+                el("summary", { className: "hlv-run-meta-label" }, "metadata"),
+                el("code", { className: "hlv-run-meta" }, metaJson))
+              : null
+          );
+        })
+      );
+    }
+
+    // --- «файлы» pane: attachments, upload / download / delete -------------
+    //
+    // Upload is multipart (the browser owns the boundary) and download is a
+    // blob handed to the browser through an object URL — both need the host's
+    // authedFetch, because a plain <a href> carries no auth in token mode.
+    var filesPane;
+    if (!selected) {
+      filesPane = el("div", { className: "hlv-empty" }, "выберите задачу слева");
+    } else {
+      filesPane = el(
+        "div",
+        { className: "hlv-files-wrap" },
+        el("div", { className: "hlv-files-bar" },
+          el("input", {
+            ref: attFileRef,
+            type: "file",
+            multiple: true,
+            className: "hlv-files-input",
+            onChange: function (e) {
+              uploadAttachments(e.target.files);
+              // Reset, so picking the same file again still fires onChange.
+              try { e.target.value = ""; } catch (err) { /* ignore */ }
+            },
+          }),
+          el("button", {
+            type: "button",
+            className: "hlv-btn hlv-btn-upload",
+            disabled: attBusy,
+            title: "загрузить файл на карточку",
+            onClick: function () {
+              if (attFileRef.current) attFileRef.current.click();
+            },
+          }, attBusy ? "загрузка…" : "загрузить файл"),
+          el("span", { className: "hlv-field-hint" },
+            "файл кладётся рядом с карточкой; воркер читает его как обычный файл")
+        ),
+        attNote.text
+          ? el("div", { className: "hlv-files-note " + attNote.kind }, attNote.text)
+          : null,
+        attachments.length === 0
+          ? el("div", { className: "hlv-empty" }, "файлов пока нет")
+          : el("div", { className: "hlv-file-list" },
+              attachments.map(function (a) {
+                return el(
+                  "div",
+                  {
+                    key: a.id,
+                    className: "hlv-file",
+                    "data-attachment-id": String(a.id),
+                  },
+                  el("button", {
+                    type: "button",
+                    className: "hlv-file-name",
+                    title: "скачать «" + a.filename + "»",
+                    onClick: function () { downloadAttachment(a); },
+                  }, a.filename),
+                  el("span", { className: "hlv-file-size", title: fmtBytes(a.size) },
+                    fmtHuman(a.size)),
+                  el("span", { className: "hlv-file-meta" },
+                    (a.uploaded_by ? "@" + a.uploaded_by + " · " : "") +
+                    fmtDateTime(a.created_at)),
+                  el("button", {
+                    type: "button",
+                    className: "hlv-file-del",
+                    title: "удалить файл с карточки",
+                    onClick: function () { deleteAttachment(a); },
+                  }, "✕")
+                );
+              }))
+      );
+    }
 
     // --- "Основное" pane ---------------------------------------------------
     // The whole card in one place: the title (editable), the meta line, the
@@ -3125,7 +4266,7 @@ function Page() {
             startMetaEdit,
             saveMeta,
             cancelMetaEdit,
-            "править приоритет (Ctrl+Enter — сохранить, Esc — отмена)"
+            "править приоритет"
           ),
           el("span", { className: "hlv-field-hint" },
             "чем выше, тем раньше воркер возьмёт задачу; порядок ready — как в диспетчере")
@@ -3155,6 +4296,44 @@ function Page() {
           ),
           el("span", { className: "hlv-field-hint" },
             "через сколько минут воркер будет прерван; 0 — без ограничения. Понижение лимита у уже идущей задачи останавливает воркер")
+        ),
+        el("div", { className: "hlv-field-row" },
+          el("span", { className: "hlv-field-label" }, "исполнитель"),
+          assigneeEdit
+            ? el("select", {
+                className: "hlv-input hlv-assignee-select",
+                value: assigneeDraft,
+                autoFocus: true,
+                "aria-label": "исполнитель задачи — профиль Hermes",
+                onChange: function (e) { setAssigneeDraft(e.target.value); },
+                onKeyDown: onAssigneeKeyDown,
+              },
+              el("option", { value: "" }, "— не назначен —"),
+              // The current executor can be a profile that is no longer
+              // installed. Keeping it as an option makes the closed control
+              // show the real value instead of the first entry of the list.
+              (desc.assignee && !profiles.some(function (p) { return p.name === desc.assignee; }))
+                ? el("option", { key: desc.assignee, value: desc.assignee },
+                    "@" + desc.assignee + " (не установлен)")
+                : null,
+              profiles.map(function (p) {
+                return el(
+                  "option",
+                  { key: p.name, value: p.name, title: p.description || "" },
+                  "@" + p.name + (p.description ? " — " + p.description : "")
+                );
+              })
+            )
+            : el("span", { className: "hlv-assignee-value" }, assigneeLabel(desc.assignee)),
+          pencilBtn(
+            assigneeEdit,
+            startAssigneeEdit,
+            saveAssignee,
+            cancelAssigneeEdit,
+            "править исполнителя"
+          ),
+          el("span", { className: "hlv-field-hint" },
+            "профиль Hermes, который возьмёт задачу из очереди; без исполнителя карточка не уходит в работу")
         ),
         el("div", { className: "hlv-field-row" },
           el("span", { className: "hlv-field-label" }, "состояние"),
@@ -3238,28 +4417,46 @@ function Page() {
       "div",
       { className: "hlv-right" },
       el("div", { className: "hlv-tabs" },
-        el("button", {
-          type: "button",
-          className: "hlv-tab" + (pane === "log" ? " active" : ""),
-          onClick: function () { setPane("log"); },
-        }, "лог"),
-        el("button", {
-          type: "button",
-          className: "hlv-tab" + (pane === "transcript" ? " active" : ""),
-          onClick: function () { setPane("transcript"); },
-          title: "живой транскрипт карточки: что говорит агент и что отвечают инструменты",
-        }, "транскрипт" + (transcriptCount ? " · " + transcriptCount : "")),
-        el("button", {
-          type: "button",
-          className: "hlv-tab" + (pane === "comments" ? " active" : ""),
-          onClick: function () { setPane("comments"); },
-        }, "комментарии" + (comments.length ? " · " + comments.length : "")),
-        el("button", {
-          type: "button",
-          className: "hlv-tab" + (pane === "main" ? " active" : ""),
-          onClick: function () { setPane("main"); },
-          title: "карточка задачи: заголовок, описание, приоритет и состояние",
-        }, "основное"),
+        // Six tabs do not fit a phone (nor a 360px carousel frame), so the
+        // buttons live in their own sideways-scrolling box. The right-hand
+        // block sits OUTSIDE it: log size and «развернуть» must stay reachable
+        // when the tab strip is scrolled.
+        el("div", { className: "hlv-tabs-list" },
+          el("button", {
+            type: "button",
+            className: "hlv-tab" + (pane === "log" ? " active" : ""),
+            onClick: function () { setPane("log"); },
+          }, "лог"),
+          el("button", {
+            type: "button",
+            className: "hlv-tab" + (pane === "transcript" ? " active" : ""),
+            onClick: function () { setPane("transcript"); },
+            title: "живой транскрипт карточки: что говорит агент и что отвечают инструменты",
+          }, "транскрипт" + (transcriptCount ? " · " + transcriptCount : "")),
+          el("button", {
+            type: "button",
+            className: "hlv-tab" + (pane === "comments" ? " active" : ""),
+            onClick: function () { setPane("comments"); },
+          }, "комментарии" + (comments.length ? " · " + comments.length : "")),
+          el("button", {
+            type: "button",
+            className: "hlv-tab" + (pane === "runs" ? " active" : ""),
+            onClick: function () { setPane("runs"); },
+            title: "история запусков карточки: кто, чем закончилось, сколько шло, что передал воркер",
+          }, "запуски" + (runs.length ? " · " + runs.length : "")),
+          el("button", {
+            type: "button",
+            className: "hlv-tab" + (pane === "files" ? " active" : ""),
+            onClick: function () { setPane("files"); },
+            title: "файлы карточки: загрузить, скачать, удалить",
+          }, "файлы" + (attachments.length ? " · " + attachments.length : "")),
+          el("button", {
+            type: "button",
+            className: "hlv-tab" + (pane === "main" ? " active" : ""),
+            onClick: function () { setPane("main"); },
+            title: "карточка задачи: заголовок, описание, приоритет и состояние",
+          }, "основное")
+        ),
         el("div", { className: "hlv-tabs-right" },
           sizeInfo,
           expandBtn
@@ -3268,6 +4465,8 @@ function Page() {
       pane === "log" ? logPane
         : pane === "transcript" ? transcriptPane
         : pane === "main" ? mainPane
+        : pane === "runs" ? runsPane
+        : pane === "files" ? filesPane
         : commentsView
     );
 
@@ -3649,6 +4848,89 @@ function Page() {
       )
     );
 
+    // Панель «кто именно работает». Строка — кнопка: клик открывает карточку
+    // (и переключает доску, если процесс работает на другой). На узком экране
+    // это обычный модал — наведение там недоступно, поэтому детали живут за
+    // кликом, а не в title.
+    function onWorkersKeyDown(e) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setWorkersOpen(false);
+      }
+    }
+
+    var workersDialog = !workersOpen || !workersReady ? null : el(
+      "div",
+      {
+        className: "hlv-modal-backdrop",
+        onClick: function (e) {
+          if (e.target === e.currentTarget) setWorkersOpen(false);
+        },
+      },
+      el("div", {
+          className: "hlv-modal hlv-workers-modal",
+          role: "dialog",
+          "aria-label": "Кто сейчас работает",
+        },
+        el("div", { className: "hlv-modal-title" }, "Кто сейчас работает"),
+        el("div", { className: "hlv-modal-hint", "data-workers-summary": "1" },
+          workerSummary),
+        // Счётчик в шапке называет «running» и запланированные карточки. Без
+        // этой строки разница «7 running / 3 воркера» читалась бы как поломка.
+        cs.scheduled ? el("div", { className: "hlv-modal-hint hlv-workers-sched" },
+          "счётчик «N running» слева включает запланированные: их " +
+          cs.scheduled + ", процесса у них нет и быть не должно") : null,
+        wList.length
+          ? el("div", { className: "hlv-workers-list" },
+              wList.map(function (w) {
+                return el("button", {
+                    key: w.board + "/" + w.task_id + "/" + (w.pid || 0) + "/" + w.run_id,
+                    type: "button",
+                    className: "hlv-worker-row " + w.phase,
+                    title: "открыть карточку " + w.task_id,
+                    "data-worker-task": w.task_id,
+                    "data-worker-phase": w.phase,
+                    onClick: function () { openWorkerCard(w); },
+                  },
+                  el("span", { className: "hlv-worker-title" }, w.title),
+                  el("span", { className: "hlv-worker-meta" },
+                    el("span", { className: "hlv-worker-phase " + w.phase },
+                      WORKER_PHASE_LABEL[w.phase] || w.phase),
+                    el("span", null,
+                      (w.phase === "running"
+                        ? "в работе "
+                        : w.phase === "stale"
+                          ? "нет процесса "
+                          : "после перехода ") + fmtDuration(w.since_s)),
+                    el("span", null, "@" + (w.profile || "?")),
+                    el("span", null, w.task_status + " · " + w.board),
+                    w.state === "remote"
+                      ? el("span", { className: "hlv-worker-note" },
+                          "не проверено: процесс на другом хосте")
+                      : null,
+                    w.state === "unknown"
+                      ? el("span", { className: "hlv-worker-note" },
+                          "не проверено: fingerprint спавна не снят")
+                      : null,
+                    w.pid ? el("span", null, "pid " + w.pid) : null
+                  )
+                );
+              })
+            )
+          : el("div", { className: "hlv-empty" },
+              "живых воркеров нет — ни один процесс не работает над карточкой"),
+        el("div", { className: "hlv-modal-row" },
+          el("button", {
+            type: "button",
+            className: "hlv-btn",
+            autoFocus: true,
+            onKeyDown: onWorkersKeyDown,
+            onClick: function () { setWorkersOpen(false); },
+          }, "закрыть")
+        )
+      )
+    );
+
     // Left column: the search field sits above the scrolling task list and does
     // not scroll with it.
     var leftColumn = el(
@@ -3663,7 +4945,8 @@ function Page() {
       { className: "hlv-root" },
       header,
       el("div", { className: "hlv-main" }, leftColumn, rightPane),
-      createDialog
+      createDialog,
+      workersDialog
     );
   }
 

@@ -29,8 +29,13 @@ const http = require("http");
 const ROOT = process.env.HERMES_ROOT || "/home/alexander/.hermes/hermes-agent";
 const { JSDOM, VirtualConsole } = require(path.join(ROOT, "node_modules/jsdom"));
 
+// The plugin copy THIS test belongs to — resolved from the test's own path, not
+// a hardcoded checkout. It used to be an absolute path to a second working copy
+// (`~/src/alex-dubatov/...`), which silently went stale: the stand then tested
+// an older plugin than the one the dashboard serves and reported its missing
+// features as failures. An explicit path still overrides it.
 const PLUGIN = process.argv[2] ||
-  "/home/alexander/src/alex-dubatov/hermes-logs-viewer/dashboard/dist/index.js";
+  path.join(__dirname, "..", "dashboard", "dist", "index.js");
 const CREDS = "/tmp/hlv.cookies";
 const ORIGIN = "http://127.0.0.1:9119";
 
@@ -47,6 +52,38 @@ function cookieHeader() {
     .join("; ");
 }
 const COOKIE = cookieHeader();
+
+// Raw HTTP, bytes in / bytes out. The files tab uploads multipart and downloads
+// a blob, so the harness has to speak both — fetchJSON above cannot.
+function httpRaw(p, opts) {
+  opts = opts || {};
+  return new Promise((resolve, reject) => {
+    const u = new URL(p, ORIGIN);
+    const req = http.request(
+      {
+        hostname: u.hostname, port: u.port, path: u.pathname + u.search,
+        method: opts.method || "GET",
+        headers: Object.assign({ Cookie: COOKIE }, opts.headers || {}),
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => resolve({
+          status: res.statusCode,
+          headers: res.headers,
+          body: Buffer.concat(chunks),
+        }));
+      }
+    );
+    req.on("error", reject);
+    if (opts.body) req.write(opts.body);
+    req.end();
+  });
+}
+
+// Uploads the plugin made through authedFetch — path + filename, so a test can
+// assert WHAT went over the wire and not only that something did.
+const ATTACHMENT_POSTS = [];
 
 // fetchJSON(path, opts) -> parsed JSON or a throw, like the dashboard's.
 function fetchJSON(p, opts) {
@@ -110,14 +147,77 @@ let Page = null;
 // entirely in that body, and reading it back off a created card would only
 // prove what the core did with it, not what the form sent.
 const POSTS = [];
+// Every DELETE the plugin makes, recorded the same way: the comment-delete path
+// is the one write whose URL carries the comment id, and asserting it is how
+// the stand knows the click went to the right row.
+const DELETES = [];
+// One-shot rewrite of the worker block of `/tasks/all`. The case the operator
+// asked to see — a worker still finishing a card that already left `running` —
+// cannot be produced on demand on a live board (it needs a real process that
+// outlived its run), so the UI contract for it is pinned by feeding the panel a
+// synthetic answer while every other request keeps going to the live dashboard.
+let WORKERS_OVERRIDE = null;
 const sdkFetch = function (p, opts) {
   opts = opts || {};
-  if ((opts.method || "GET").toUpperCase() === "POST") {
+  const verb = (opts.method || "GET").toUpperCase();
+  if (verb === "POST") {
     let parsed = null;
     try { parsed = JSON.parse(opts.body); } catch (e) { parsed = null; }
     POSTS.push({ path: p, body: parsed });
+  } else if (verb === "DELETE") {
+    DELETES.push({ path: p });
   }
-  return fetchJSON(p, opts);
+  const pending = fetchJSON(p, opts);
+  if (WORKERS_OVERRIDE && /\/tasks\/all(\?|$)/.test(p)) {
+    return pending.then((body) => {
+      if (body && Array.isArray(body.workers)) {
+        if (WORKERS_OVERRIDE === "missing") delete body.workers;
+        else if (Array.isArray(WORKERS_OVERRIDE)) body.workers = WORKERS_OVERRIDE;
+      }
+      return body;
+    });
+  }
+  return pending;
+};
+
+// The host's authedFetch: raw HTTP with the session cookie, no JSON encoding.
+// A FormData body is re-encoded into a REAL multipart body (jsdom's FormData
+// cannot be handed to node's http), so an upload here genuinely lands on the
+// live dashboard. A plain request returns a Response-like object whose blob()
+// carries the file's bytes — that is what the download path reads.
+const sdkAuthedFetch = function (p, opts) {
+  opts = opts || {};
+  const method = (opts.method || "GET").toUpperCase();
+  if (opts.body && typeof opts.body.get === "function") {
+    const file = opts.body.get("file");
+    ATTACHMENT_POSTS.push({ path: p, filename: file && file.name, type: file && file.type });
+    return Promise.resolve(file.arrayBuffer()).then((ab) => {
+      const boundary = "----hlv" + Date.now().toString(16);
+      const head = Buffer.from(
+        "--" + boundary + "\r\n" +
+        'Content-Disposition: form-data; name="file"; filename="' +
+          (file.name || "file") + '"\r\n' +
+        "Content-Type: " + (file.type || "application/octet-stream") + "\r\n\r\n");
+      const tail = Buffer.from("\r\n--" + boundary + "--\r\n");
+      return httpRaw(p, {
+        method: "POST",
+        headers: { "Content-Type": "multipart/form-data; boundary=" + boundary },
+        body: Buffer.concat([head, Buffer.from(ab), tail]),
+      }).then((r) => ({
+        ok: r.status < 400,
+        status: r.status,
+        text: () => Promise.resolve(r.body.toString("utf8")),
+      }));
+    });
+  }
+  return httpRaw(p, { method }).then((r) => ({
+    ok: r.status < 400,
+    status: r.status,
+    text: () => Promise.resolve(r.body.toString("utf8")),
+    blob: () => Promise.resolve(new dom.window.Blob([r.body], {
+      type: (r.headers["content-type"] || "").split(";")[0],
+    })),
+  }));
 };
 dom.window.__HERMES_PLUGIN_SDK__ = {
   React,
@@ -129,11 +229,26 @@ dom.window.__HERMES_PLUGIN_SDK__ = {
     useMemo: React.useMemo,
   },
   fetchJSON: sdkFetch,
+  authedFetch: sdkAuthedFetch,
 };
 dom.window.__HERMES_PLUGINS__ = {
   register: (_name, C) => { Page = C; },
 };
 dom.window.fetch = sdkFetch;
+
+// jsdom has no object URLs, and a synthetic download anchor would try to
+// navigate. Both are recorded instead, so a test can read the bytes the plugin
+// handed to the browser and the filename it offered.
+const DOWNLOADS = [];
+const ANCHOR_DOWNLOADS = [];
+dom.window.URL.createObjectURL = (blob) => {
+  DOWNLOADS.push(blob);
+  return "blob:hlv/" + DOWNLOADS.length;
+};
+dom.window.URL.revokeObjectURL = () => {};
+dom.window.HTMLAnchorElement.prototype.click = function () {
+  ANCHOR_DOWNLOADS.push({ download: this.download, href: this.href });
+};
 
 // The plugin is a plain IIFE — evaluate it in the jsdom realm.
 dom.window.eval(fs.readFileSync(PLUGIN, "utf8"));
@@ -369,6 +484,141 @@ const TEST_ASSIGNEE = "default";
     (s) => !new RegExp("\\.hlv-status\\." + s + "\\s*\\{").test(css));
   check("в CSS есть правило бейджа для каждого статуса", missingRules.length === 0,
     missingRules.length ? "нет: " + missingRules.join(",") : "все 9");
+
+  // --- 3-bis. живые воркеры: бейдж в шапке и панель «кто работает» ------
+  // «N running» считает КАРТОЧКИ, а бейдж — ПРОЦЕССЫ. Они расходятся в обе
+  // стороны, и оба расхождения — то, ради чего бейдж завели: воркер ещё
+  // доделывает карточку, ушедшую из running, либо карточка числится running,
+  // а процесса уже нет.
+  const wBadge = $(".hlv-header .hlv-workers");
+  const counters = $(".hlv-header .hlv-hints");
+  check("бейдж живых воркеров есть в шапке", !!wBadge);
+  check("бейдж стоит сразу за «N running · N queued · N archived»",
+    !!counters && !!wBadge &&
+      !!(counters.compareDocumentPosition(wBadge) &
+         dom.window.Node.DOCUMENT_POSITION_FOLLOWING));
+  check("бейдж — кнопка: клик открывает список процессов",
+    !!wBadge && wBadge.tagName === "BUTTON");
+
+  // Живой ответ того же маршрута: бейдж обязан считать ровно его.
+  const liveAll = await fetchJSON("/api/plugins/hermes-logs-viewer/tasks/all", {});
+  const liveWorkers = (liveAll && liveAll.workers) || [];
+  check("бейдж считает живой ответ /tasks/all",
+    !!wBadge && Number(wBadge.getAttribute("data-workers")) === liveWorkers.length,
+    (wBadge && wBadge.getAttribute("data-workers")) + " vs " + liveWorkers.length);
+  const textOf = (q) => (q ? q.textContent : "");
+  check("число воркеров склоняется по-русски",
+    /^\d+ (воркер|воркера|воркеров)$/.test(textOf($(".hlv-workers-face"))),
+    textOf($(".hlv-workers-face")));
+  check("в бейдже есть «на N задачах»",
+    liveWorkers.length === 0
+      ? textOf($(".hlv-workers-tasks-wide")) === ""   // «0 воркеров», без второй половины
+      : /^ на \d+ задач(е|ах)$/.test(textOf($(".hlv-workers-tasks-wide"))),
+    textOf($(".hlv-workers-tasks-wide")));
+  check("короткая форма числа задач включается только на узком экране (CSS)",
+    /\.hlv-workers-tasks-compact\s*\{[^}]*display:\s*none/.test(css) &&
+    /@media[^{]*max-width:\s*1023px[^{]*\{[\s\S]*?\.hlv-workers-tasks-compact\s*\{[^}]*display:\s*inline/.test(css));
+
+  // Дальше — синтетическая выдача: живой стенд не умеет по заказу оставить
+  // воркер, переживающий свою карточку, поэтому два расхождения из трёх
+  // подставляются в ответ маршрута (см. WORKERS_OVERRIDE).
+  const doneRow = $$(".hlv-row[data-status='done']")[0];
+  const idleRow = $$(".hlv-row[data-status='todo']")[0] ||
+    $$(".hlv-row[data-status='ready']")[0] || $$(".hlv-row")[1];
+  const metaOf = (row) => (liveAll && liveAll.tasks || []).find(
+    (t) => t.id === (row && row.getAttribute("data-task-id")));
+  const doneMeta = metaOf(doneRow);
+  const idleMeta = metaOf(idleRow);
+  if (doneMeta && idleMeta) {
+    const nowS = Math.floor(Date.now() / 1000);
+    const synth = (meta, phase, since, state) => ({
+      board: meta.board, task_id: meta.id, title: meta.title,
+      task_status: meta.status, profile: "executor", run_id: 7,
+      run_status: phase === "running" ? "running" : "done",
+      outcome: phase === "running" ? "" : "completed",
+      pid: 4242, started_at: nowS - since - 600, ended_at: nowS - since,
+      last_heartbeat_at: nowS - since - 5, state: state,
+      phase: phase, since_s: since,
+    });
+    WORKERS_OVERRIDE = [
+      synth(doneMeta, "after", 120, "alive"),
+      synth(idleMeta, "stale", 300, "dead"),
+    ];
+    await sleep(2600);   // следующий опрос списка (2 с) с подменённым workers
+    const badge2 = $(".hlv-header .hlv-workers");
+    check("бейдж показывает 2 процесса на 2 задачах",
+      !!badge2 && badge2.getAttribute("data-workers") === "2" &&
+        textOf(badge2.querySelector(".hlv-workers-face")) === "2 воркера" &&
+        /^ на 2 задачах$/.test(textOf(badge2.querySelector(".hlv-workers-tasks-wide"))),
+      textOf(badge2));
+    check("расхождения названы словами: «1 доделывает» и «1 без воркера»",
+      !!badge2 && /1 доделывает/.test(textOf(badge2)) &&
+        /1 без воркера/.test(textOf(badge2)),
+      textOf(badge2));
+    check("бейдж с расхождением получает предупреждающий класс",
+      !!badge2 && /\bhlv-workers-alert\b/.test(badge2.className));
+    const afterChip = $(".hlv-row[data-task-id='" + doneMeta.id + "'] .hlv-row-worker");
+    check("на строке карточки вне running появилась метка «доделывает»",
+      !!afterChip && afterChip.textContent === "доделывает" &&
+        afterChip.getAttribute("data-worker-phase") === "after",
+      afterChip && afterChip.textContent);
+    const staleChip = $(".hlv-row[data-task-id='" + idleMeta.id + "'] .hlv-row-worker");
+    check("на строке running-карточки без процесса — метка «без воркера»",
+      !!staleChip && staleChip.textContent === "без воркера",
+      staleChip && staleChip.textContent);
+
+    click($(".hlv-header .hlv-workers"));
+    await sleep(60);
+    check("клик по бейджу открывает панель «кто сейчас работает»",
+      !!$(".hlv-workers-modal"));
+    const wRows = $$(".hlv-worker-row");
+    check("в панели две строки — по одной на процесс", wRows.length === 2, wRows.length);
+    check("«доделывает» стоит первым",
+      wRows.length > 0 && wRows[0].getAttribute("data-worker-phase") === "after",
+      wRows[0] && wRows[0].getAttribute("data-worker-phase"));
+    check("в строке есть длительность после перехода",
+      wRows.length > 0 && /после перехода 2m/.test(textOf(wRows[0])),
+      wRows.length > 0 && textOf(wRows[0]));
+    check("сводка панели повторяет числа бейджа",
+      /2 воркера на 2 задачах/.test(textOf($(".hlv-workers-modal .hlv-modal-hint"))),
+      textOf($(".hlv-workers-modal .hlv-modal-hint")));
+    // Счётчик в шапке называет «running» и запланированные карточки — панель
+    // обязана это объяснить, иначе разница читается как поломка. Проверяется
+    // относительно живого списка: есть ли сейчас scheduled-карточки.
+    const hasScheduled = $$(".hlv-row[data-status='scheduled']").length > 0;
+    const schedNote = $(".hlv-workers-sched");
+    check("панель объясняет разницу с «N running» (запланированные карточки)",
+      hasScheduled ? !!schedNote : !schedNote,
+      hasScheduled ? "карточки scheduled есть" : "scheduled-карточек в списке нет");
+    click(wRows[0]);
+    await sleep(60);
+    check("клик по процессу открывает его карточку",
+      !!$(".hlv-row.active") &&
+        $(".hlv-row.active").getAttribute("data-task-id") === doneMeta.id,
+      $(".hlv-row.active") && $(".hlv-row.active").getAttribute("data-task-id"));
+    check("панель закрылась после выбора карточки", !$(".hlv-workers-modal"));
+    WORKERS_OVERRIDE = null;
+    await sleep(2600);
+    const back = $(".hlv-header .hlv-workers");
+    check("после синтетики бейдж снова считает живой ответ",
+      !!back && Number(back.getAttribute("data-workers")) === liveWorkers.length,
+      back && back.getAttribute("data-workers"));
+
+    // Старый бэкенд (маршрут ещё не отдаёт `workers`): бейджа нет вовсе, а не
+    // «0 воркеров» — иначе переживший свою карточку воркер был бы объявлен
+    // несуществующим.
+    WORKERS_OVERRIDE = "missing";
+    await sleep(2600);
+    check("без поля workers в ответе бейдж не показывается вовсе",
+      !$(".hlv-header .hlv-workers"));
+    WORKERS_OVERRIDE = null;
+    await sleep(2600);
+    check("поле workers вернулось — бейдж вернулся",
+      !!$(".hlv-header .hlv-workers"));
+  } else {
+    check("на доске нашлись карточки для проверки меток воркеров", false,
+      "нет done/todo карточек");
+  }
 
   // --- 4. no border-radius anywhere ------------------------------------
   // Match `border-radius: <value>` and treat only a literal 0 as "removed".
@@ -2286,6 +2536,85 @@ const TEST_ASSIGNEE = "default";
         }
       }
 
+      // --- Executor: the pencil next to the assignee -----------------------
+      // The executor is a COMBOBOX of installed profiles, not a free-text
+      // field: a typo in a profile name leaves the card in `ready` with
+      // nobody to run it. The pick must land on the server through the same
+      // bundled PATCH, and the empty pick must unassign the card.
+      const whoValue = $(".hlv-assignee-value");
+      check("исполнитель показан в «основном»", !!whoValue,
+        whoValue ? (whoValue.textContent || "").trim() : "нет .hlv-assignee-value");
+      const whoPencil = $$(".hlv-pencil").find((b) => {
+        const row = b.closest(".hlv-field-row");
+        return row && /исполнитель/.test(row.textContent || "");
+      });
+      check("карандаш у исполнителя есть", !!whoPencil,
+        whoPencil ? "найден" : "нет .hlv-pencil рядом с «исполнитель»");
+      const profs = (await fetchJSON("/api/plugins/kanban/profiles")).profiles || [];
+      const WANT_WHO = (profs[0] || {}).name;
+      check("есть установленный профиль для проверки", !!WANT_WHO,
+        WANT_WHO || "маршрут /profiles отдал пустой список");
+      if (whoPencil && WANT_WHO) {
+        click(whoPencil);
+        await sleep(400);
+        const whoSel = $(".hlv-assignee-select");
+        check("вместо значения открылся комбобокс профилей", !!whoSel);
+        if (whoSel) {
+          const opts = [...whoSel.querySelectorAll("option")].map((o) => o.value);
+          check("комбобокс перечисляет установленные профили",
+            profs.every((p) => opts.indexOf(p.name) !== -1),
+            opts.join(", ") || "опций нет");
+          check("в комбобоксе есть явный «без исполнителя»",
+            opts.indexOf("") !== -1, opts.join(", "));
+          setSelectValue(whoSel, WANT_WHO);
+          await sleep(200);
+          const saveWho = $$(".hlv-pencil").find((b) => (b.textContent || "").trim() === "✓");
+          check("у исполнителя есть кнопка сохранения", !!saveWho);
+          if (saveWho) {
+            click(saveWho);
+            await sleep(2000);
+            const afterWho = (await fetchJSON(
+              "/api/plugins/kanban/tasks/" + encodeURIComponent(made.id) +
+              "?board=" + encodeURIComponent(defaultBoard.slug))).task;
+            check("исполнитель сохранился через bundled PATCH",
+              afterWho && afterWho.assignee === WANT_WHO,
+              afterWho ? "на доске @" + afterWho.assignee : "нет задачи");
+            check("исполнитель обновился в панели",
+              !!$(".hlv-assignee-value") &&
+              ($(".hlv-assignee-value").textContent || "").trim() === "@" + WANT_WHO,
+              $(".hlv-assignee-value") ? $(".hlv-assignee-value").textContent
+                                       : "нет значения");
+          }
+        }
+      }
+      // An empty pick is how a card is unassigned — and it must actually
+      // clear the column, not fall back to the previous profile.
+      const whoPencil2 = $$(".hlv-pencil").find((b) => {
+        const row = b.closest(".hlv-field-row");
+        return row && /исполнитель/.test(row.textContent || "");
+      });
+      if (whoPencil2) {
+        click(whoPencil2);
+        await sleep(400);
+        const whoSel2 = $(".hlv-assignee-select");
+        if (whoSel2) {
+          setSelectValue(whoSel2, "");
+          await sleep(200);
+          const saveWho2 = $$(".hlv-pencil").find((b) => (b.textContent || "").trim() === "✓");
+          if (saveWho2) {
+            click(saveWho2);
+            await sleep(2000);
+            const afterWho2 = (await fetchJSON(
+              "/api/plugins/kanban/tasks/" + encodeURIComponent(made.id) +
+              "?board=" + encodeURIComponent(defaultBoard.slug))).task;
+            check("пустой выбор снимает исполнителя",
+              afterWho2 && !afterWho2.assignee,
+              afterWho2 ? "на доске assignee=" + JSON.stringify(afterWho2.assignee)
+                        : "нет задачи");
+          }
+        }
+      }
+
       // --- Title: the pencil next to the title -----------------------------
       // The title is edited IN PLACE: the pencil opens an input next to the
       // title, the save writes it, and the card's own title on the server
@@ -2537,9 +2866,350 @@ const TEST_ASSIGNEE = "default";
           check("поле ввода очищено после отправки",
             ($(".hlv-composer-input") || {}).value === "",
             JSON.stringify(($(".hlv-composer-input") || {}).value));
+
+          // --- 12-bis-2. доставка комментария и его удаление --------------
+          // The operator asked whether a comment the agent has NOT received yet
+          // can be removed. It can: the row is deleted before the next poll /
+          // spawn reads it, and the delivery really is cancelled. The row says
+          // so out loud ("не доставлен"), which is what makes the delete button
+          // honest — once the text IS in the worker's transcript the same
+          // button only rewrites the history.
+          const row = $$(".hlv-comment").find((n) => {
+            const b = n.querySelector(".hlv-comment-body");
+            return b && (b.textContent || "") === text;
+          });
+          check("у комментария есть строка с кнопкой удаления", !!row,
+            $$(".hlv-comment").length + " строк");
+          const chipEl = row && row.querySelector(".hlv-comment-delivery");
+          check("свежий комментарий помечен «не доставлен»",
+            !!chipEl && (chipEl.textContent || "") === "не доставлен",
+            chipEl ? chipEl.textContent : "нет плашки");
+          check("плашка «не доставлен» — жёлтая (класс pending)",
+            !!chipEl && chipEl.classList.contains("pending"),
+            chipEl ? chipEl.className : "нет плашки");
+
+          // Declining the confirmation must change nothing: no DELETE, the row
+          // stays, the comment stays on the board.
+          const del = row && row.querySelector(".hlv-comment-del");
+          const question = [];
+          const prevConfirm = dom.window.confirm;
+          dom.window.confirm = (m) => { question.push(String(m)); return false; };
+          DELETES.length = 0;
+          if (del) { click(del); await sleep(900); }
+          check("удаление спрашивает подтверждение",
+            question.length === 1, question.join(" | ") || "диалог не показывался");
+          check("вопрос объясняет, что комментарий ещё не доставлен",
+            question.length === 1 && /не получил|не доставлен/.test(question[0]),
+            question[0] || "");
+          check("отказ от подтверждения не шлёт DELETE", DELETES.length === 0,
+            DELETES.map((d) => d.path).join(", "));
+
+          const stillThere = await fetchJSON(
+            "/api/plugins/hermes-logs-viewer/tasks/" + encodeURIComponent(made.id) +
+            "/comments?board=" + encodeURIComponent(defaultBoard.slug));
+          check("отказ от подтверждения оставляет комментарий на доске",
+            (stillThere.comments || []).some((c) => c.body === text),
+            (stillThere.comments || []).length + " в ленте");
+
+          // Accepting deletes it: the DELETE goes to THIS plugin's route (the
+          // bundled kanban plugin has no delete), carries the comment id, and
+          // the thread is refetched so the row disappears at once.
+          dom.window.confirm = () => true;
+          if (del) { click(row.querySelector(".hlv-comment-del") || del); await sleep(1500); }
+          const delCall = DELETES.find((d) => /\/tasks\//.test(d.path) && /\/comments\//.test(d.path));
+          check("удаление ушло на маршрут плагина с id комментария",
+            !!delCall && delCall.path.indexOf("/api/plugins/hermes-logs-viewer/") === 0,
+            DELETES.map((d) => d.path).join(", ") || "DELETE-ов нет");
+          check("удаление не запрашивает force для не доставленного",
+            !!delCall && !/force=1/.test(delCall.path), delCall ? delCall.path : "");
+          const afterDelete = await fetchJSON(
+            "/api/plugins/hermes-logs-viewer/tasks/" + encodeURIComponent(made.id) +
+            "/comments?board=" + encodeURIComponent(defaultBoard.slug));
+          check("комментарий удалён с доски",
+            !(afterDelete.comments || []).some((c) => c.body === text),
+            (afterDelete.comments || []).length + " в ленте");
+          const goneFromUi = !$$(".hlv-comment-body").some((n) => (n.textContent || "") === text);
+          check("строка комментария исчезла из ленты", goneFromUi,
+            $$(".hlv-comment-body").length + " тел в DOM");
+          dom.window.confirm = prevConfirm;
+
+          // --- 12-bis-2-bis. a worker's own comment has no chip and no ✕ --
+          // A comment written BY a worker is not a message FOR the worker: it is
+          // never "delivered" and never "not delivered", so it must carry no
+          // delivery chip at all (it used to say «не доставлен», which was the
+          // wrong question) and no delete cross either — deleting it would only
+          // rewrite the worker's own history. Posted straight onto the route
+          // (the composer always writes as the operator), then read out of the
+          // re-rendered pane and cleaned up by id.
+          const ownText = "стенд: комментарий воркера " + Date.now();
+          const postedOwn = await fetchJSON(
+            "/api/plugins/hermes-logs-viewer/tasks/" + encodeURIComponent(made.id) +
+            "/comments?board=" + encodeURIComponent(defaultBoard.slug),
+            { method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ body: ownText, author: "agent-stand" }) });
+          check("воркерский комментарий записан для проверки плашки",
+            !!postedOwn && postedOwn.ok, JSON.stringify(postedOwn));
+          await sleep(6000);  // one comment poll (COMMENT_POLL_MS = 5000)
+          const ownRow = $$(".hlv-comment").find((n) => {
+            const b = n.querySelector(".hlv-comment-body");
+            return b && (b.textContent || "") === ownText;
+          });
+          check("воркерский комментарий виден в ленте", !!ownRow,
+            $$(".hlv-comment").length + " строк");
+          check("у комментария воркера НЕТ плашки «не доставлен»",
+            !!ownRow && !ownRow.querySelector(".hlv-comment-delivery"),
+            ownRow ? (ownRow.textContent || "").slice(0, 60) : "нет строки");
+          check("у комментария воркера НЕТ крестика удаления",
+            !!ownRow && !ownRow.querySelector(".hlv-comment-del"),
+            ownRow ? (ownRow.textContent || "").slice(0, 60) : "нет строки");
+          if (postedOwn && postedOwn.id) {
+            await fetchJSON(
+              "/api/plugins/hermes-logs-viewer/tasks/" + encodeURIComponent(made.id) +
+              "/comments/" + postedOwn.id + "?board=" + encodeURIComponent(defaultBoard.slug),
+              { method: "DELETE" });
+          }
         }
         click(findButton("основное"));
         await sleep(600);
+      }
+
+      // --- 12-ter. приоритет сохраняется простым Enter --------------------
+      // The field used to require Ctrl+Enter even though its own sibling (the
+      // title) saves on a bare Enter — the obvious key did nothing. These
+      // checks press the REAL key on the REAL input and read the value back
+      // off the board.
+      click(findButton("основное"));
+      await sleep(1200);
+      const prioPencilEnter = $$(".hlv-pencil").find((b) => {
+        const row = b.closest(".hlv-field-row");
+        return row && /приоритет/.test(row.textContent || "");
+      });
+      check("карандаш приоритета на месте (перед Enter-тестом)", !!prioPencilEnter);
+      const prioBeforeEnter = (await fetchJSON(
+        "/api/plugins/kanban/tasks/" + encodeURIComponent(made.id) +
+        "?board=" + encodeURIComponent(defaultBoard.slug))).task.priority || 0;
+      const ENTER_WANT = prioBeforeEnter + 5;
+      if (prioPencilEnter) {
+        click(prioPencilEnter);
+        await sleep(400);
+        const prioInput = $(".hlv-prio-input");
+        check("поле приоритета открылось (перед Enter-тестом)", !!prioInput);
+        if (prioInput) {
+          setInputValue(prioInput, String(ENTER_WANT));
+          await sleep(150);
+          prioInput.dispatchEvent(new dom.window.KeyboardEvent("keydown", {
+            key: "Enter", bubbles: true,
+          }));
+          await sleep(2000);
+          const afterEnter = (await fetchJSON(
+            "/api/plugins/kanban/tasks/" + encodeURIComponent(made.id) +
+            "?board=" + encodeURIComponent(defaultBoard.slug))).task;
+          check("приоритет сохраняется простым Enter",
+            !!afterEnter && afterEnter.priority === ENTER_WANT,
+            afterEnter ? "на доске priority=" + afterEnter.priority + " (ждали " + ENTER_WANT + ")"
+                       : "нет задачи");
+          check("поле приоритета закрылось после Enter", !$(".hlv-prio-input"));
+        }
+      }
+
+      // --- 12-quater. «запуски»: отдельная вкладка истории запусков -------
+      // The tab reads `runs` out of the bundled GET /tasks/{id} — the same
+      // payload the card pane already polls — so nothing here is a
+      // re-implementation: the rendered rows are compared with the route.
+      const runsTab = $$(".hlv-tab").find((b) =>
+        (b.textContent || "").trim().indexOf("запуски") === 0);
+      check("вкладка «запуски» есть", !!runsTab,
+        $$(".hlv-tab").map((t) => (t.textContent || "").trim()).join(" | "));
+      if (runsTab) {
+        click(runsTab);
+        await sleep(1200);
+        check("панель «запуски» открылась", !!$(".hlv-run-list"),
+          $(".hlv-run-list") ? "ok" : "нет .hlv-run-list");
+        // The throwaway card was never claimed, so its history is empty — and
+        // the pane must SAY so instead of showing a blank box.
+        check("пустая история объяснена словами",
+          /запусков пока нет/.test(($(".hlv-run-list") || {}).textContent || ""),
+          ($(".hlv-run-list") || {}).textContent || "нет панели");
+      }
+
+      // A card that HAS a finished run: taken from the live board, so the check
+      // works on real data instead of a fixture. Only cards whose newest run
+      // has ENDED are considered — a running card could gain a run between the
+      // fetch and the render and make the count check flaky through no fault
+      // of the pane.
+      let withRuns = null;
+      const boardNow = await fetchJSON(
+        "/api/plugins/kanban/board?board=" + encodeURIComponent(defaultBoard.slug));
+      // The bundled /board answers per COLUMN (`columns[].tasks`), not as a flat
+      // `tasks` array — reading the wrong key would silently check nothing.
+      const boardTasks = [];
+      for (const col of (boardNow.columns || [])) {
+        for (const t of (col.tasks || [])) boardTasks.push(t);
+      }
+      for (const cand of boardTasks.slice(0, 30)) {
+        const d = await fetchJSON(
+          "/api/plugins/kanban/tasks/" + encodeURIComponent(cand.id) +
+          "?board=" + encodeURIComponent(defaultBoard.slug));
+        const rs = d.runs || [];
+        if (rs.length && rs[rs.length - 1].ended_at) {
+          withRuns = { id: cand.id, runs: rs };
+          break;
+        }
+      }
+      check("на доске нашлась карточка с завершённым запуском", !!withRuns,
+        withRuns ? withRuns.id + ": " + withRuns.runs.length + " запуск(ов)" : "не найдено");
+      if (withRuns) {
+        setInputValue($(".hlv-search-input"), withRuns.id);
+        await sleep(700);
+        const runRow = $$(".hlv-row").find((r) => r.getAttribute("data-task-id") === withRuns.id);
+        check("карточка с историей выбрана", !!runRow);
+        if (runRow) {
+          runRow.click();
+          await sleep(900);
+          click($$(".hlv-tab").find((b) =>
+            (b.textContent || "").trim().indexOf("запуски") === 0));
+          await sleep(1600);
+          const runNodes = $$(".hlv-run");
+          check("история запусков отрисована", runNodes.length === withRuns.runs.length,
+            runNodes.length + " строк из " + withRuns.runs.length);
+          // The route returns start order; the pane shows newest first.
+          const newestRun = withRuns.runs[withRuns.runs.length - 1];
+          const expectedOutcome = newestRun.ended_at
+            ? (newestRun.outcome || newestRun.status || "завершён") : "идёт";
+          const firstRun = runNodes[0];
+          check("первым идёт самый свежий запуск",
+            !!firstRun && firstRun.getAttribute("data-run-id") === String(newestRun.id),
+            firstRun ? "data-run-id=" + firstRun.getAttribute("data-run-id") +
+              " (ждали " + newestRun.id + ")" : "нет строк");
+          check("исход запуска совпадает с доской",
+            !!firstRun && firstRun.getAttribute("data-run-outcome") === expectedOutcome,
+            firstRun ? firstRun.getAttribute("data-run-outcome") + " / " + expectedOutcome : "нет строки");
+          // The handoff summary is the reason the tab exists: it must be on
+          // screen, and it must be the route's text, not a placeholder.
+          const summaries = $$(".hlv-run-summary").map((n) => n.textContent || "");
+          const wanted = withRuns.runs.filter((r) => r.summary);
+          check("сводки воркера показаны все", summaries.length === wanted.length,
+            summaries.length + " из " + wanted.length);
+          check("сводка совпадает с той, что лежит на доске",
+            wanted.length === 0 ||
+              summaries.indexOf(wanted[wanted.length - 1].summary) !== -1,
+            wanted.length ? (summaries[0] || "").slice(0, 60) : "у карточки нет сводок");
+          // Count badge on the tab itself.
+          check("на вкладке стоит число запусков",
+            new RegExp("запуски · " + withRuns.runs.length).test(
+              ($$(".hlv-tab").find((b) => (b.textContent || "").trim().indexOf("запуски") === 0) || {}).textContent || ""),
+            (($$(".hlv-tab").find((b) => (b.textContent || "").trim().indexOf("запуски") === 0) || {}).textContent || ""));
+          setInputValue($(".hlv-search-input"), "");
+          await sleep(400);
+        }
+      }
+
+      // --- 12-quinquies. «файлы»: загрузка, скачивание, удаление ----------
+      // Driven against the throwaway card, and every step is read back from
+      // the SERVER: the upload really lands on disk, the download really
+      // returns those bytes, the delete really removes the row.
+      setInputValue($(".hlv-search-input"), made.id);
+      await sleep(700);
+      const ownRow = $$(".hlv-row").find((r) => r.getAttribute("data-task-id") === made.id);
+      check("временная карточка снова выбрана", !!ownRow);
+      if (ownRow) {
+        ownRow.click();
+        await sleep(900);
+        const filesTab = $$(".hlv-tab").find((b) =>
+          (b.textContent || "").trim().indexOf("файлы") === 0);
+        check("вкладка «файлы» есть", !!filesTab,
+          $$(".hlv-tab").map((t) => (t.textContent || "").trim()).join(" | "));
+        if (filesTab) {
+          click(filesTab);
+          await sleep(1200);
+          check("панель «файлы» открылась", !!$(".hlv-files-wrap"),
+            $(".hlv-files-wrap") ? "ok" : "нет .hlv-files-wrap");
+          check("пустой список файлов объяснён словами",
+            /файлов пока нет/.test(($(".hlv-files-wrap") || {}).textContent || ""),
+            ($(".hlv-files-wrap") || {}).textContent || "нет панели");
+          const fileInput = $(".hlv-files-input");
+          check("скрытый input выбора файла на месте",
+            !!fileInput && fileInput.type === "file" &&
+              (fileInput.className || "").indexOf("hlv-files-input") !== -1);
+          check("кнопка «загрузить файл» на месте",
+            !!($(".hlv-btn-upload") || {}).textContent &&
+              /загрузить файл/.test($(".hlv-btn-upload").textContent));
+
+          const content = "стенд: содержимое файла " + Date.now();
+          const fname = "hlv-probe-" + Date.now() + ".txt";
+          let onServer = null;
+          if (fileInput) {
+            // jsdom's input.files is read-only; the instance gets its own
+            // property so the change event carries a real File.
+            Object.defineProperty(fileInput, "files", {
+              value: [new dom.window.File([content], fname, { type: "text/plain" })],
+              configurable: true,
+            });
+            fileInput.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+            await sleep(2500);
+            const sent = ATTACHMENT_POSTS.find((p) => p.filename === fname);
+            check("файл ушёл multipart-ом на bundled-маршрут",
+              !!sent && sent.path.indexOf(
+                "/api/plugins/kanban/tasks/" + made.id + "/attachments") === 0,
+              sent ? sent.path : "POST не ушёл");
+            const list = await fetchJSON(
+              "/api/plugins/kanban/tasks/" + encodeURIComponent(made.id) +
+              "/attachments?board=" + encodeURIComponent(defaultBoard.slug));
+            onServer = (list.attachments || []).find((a) => a.filename === fname);
+            check("файл реально записан на карточку", !!onServer,
+              onServer ? "id=" + onServer.id + ", " + onServer.size + " Б"
+                       : "на доске нет " + fname);
+            // The row must be there without waiting for the 5 s card poll: the
+            // upload handler re-reads the card on success.
+            const shownNames = $$(".hlv-file-name").map((n) => n.textContent || "");
+            check("загруженный файл виден в списке без ожидания опроса",
+              shownNames.indexOf(fname) !== -1, shownNames.join(" | ") || "список пуст");
+          }
+
+          if (onServer) {
+            // Download: click the filename and read the bytes the plugin handed
+            // to the browser through the object URL.
+            DOWNLOADS.length = 0;
+            ANCHOR_DOWNLOADS.length = 0;
+            const nameBtn = $$(".hlv-file-name").find((n) => (n.textContent || "") === fname);
+            if (nameBtn) {
+              click(nameBtn);
+              await sleep(1500);
+            }
+            check("скачивание запрошено у маршрута", DOWNLOADS.length === 1,
+              DOWNLOADS.length + " blob-ов");
+            let bytes = "";
+            if (DOWNLOADS.length) {
+              bytes = Buffer.from(await DOWNLOADS[0].arrayBuffer()).toString("utf8");
+            }
+            check("скачанные байты совпадают с загруженными", bytes === content,
+              JSON.stringify(bytes.slice(0, 60)));
+            check("браузеру предложено имя файла",
+              (ANCHOR_DOWNLOADS[0] || {}).download === fname,
+              JSON.stringify(ANCHOR_DOWNLOADS[0] || null));
+
+            // Delete: confirmed, then the row must be gone from BOTH the server
+            // and the list.
+            dom.window.confirm = () => true;
+            const fileRow = $$(".hlv-file").find((r) =>
+              r.getAttribute("data-attachment-id") === String(onServer.id));
+            const delBtn = fileRow && fileRow.querySelector(".hlv-file-del");
+            check("кнопка удаления файла есть", !!delBtn);
+            if (delBtn) {
+              click(delBtn);
+              await sleep(2000);
+            }
+            dom.window.confirm = realConfirm;
+            const afterDel = await fetchJSON(
+              "/api/plugins/kanban/tasks/" + encodeURIComponent(made.id) +
+              "/attachments?board=" + encodeURIComponent(defaultBoard.slug));
+            check("файл удалён с карточки", (afterDel.attachments || []).length === 0,
+              (afterDel.attachments || []).length + " осталось");
+            check("строка файла исчезла из списка", $$(".hlv-file").length === 0,
+              $$(".hlv-file").length + " строк");
+          }
+        }
       }
 
       // Leave no debris, whatever happened above.

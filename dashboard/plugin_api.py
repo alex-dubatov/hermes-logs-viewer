@@ -17,16 +17,42 @@ Endpoints:
   GET /tasks/all                    -> {"tasks": [ ... every task on every board, each tagged
                                           with its `board` slug, sorted for display ... ]}
         Each task carries `priority` and `completed_at` so the UI can order the
-        list without a second round-trip: finished cards (`done`/`archived`) by
-        completion time, everything else by priority.
+        list without a second round-trip. The merged pool is sorted by the SAME
+        rule a single board uses — status group first, then the group's own key
+        — with the board slug only as a late tiebreak, so "все доски" reads as
+        one queue instead of a stack of boards (see ``list_all_tasks``).
+  GET /gateway                      -> {"unit", "load", "state", "sub", "active",
+                                          "checked_at"}
+     State of the messaging-gateway systemd --user unit the header's
+     start/stop buttons drive.
+  POST /gateway/{start|stop|restart} -> {"ok", "action", "returncode", "stdout",
+                                          "stderr", ... gateway state ...}
+     Drive that unit. The UNIT IS AN ALLOWLIST (``_GATEWAY_UNIT``): the route
+     takes an action, never a unit name, so one request cannot stop another
+     service.
   GET /tasks/{task_id}/comments?board=default
-        -> {"task_id", "board", "comments": [{id, author, body, created_at}]}
-     The task's comment thread, oldest first.
+        -> {"task_id", "board", "comments": [{id, author, body, created_at,
+                                              delivery, delivered_channel,
+                                              delivered_at}]}
+     The task's comment thread, oldest first. `delivery` says whether the WORKER
+     has already read the comment: "delivered" (its text is in one of the card's
+     owner sessions — `delivered_channel` is "spawn" or "mid_run"),
+     "pending" (no worker has seen it: deleting it cancels the delivery),
+     "own" (written by a worker — the card's assignee or any other agent
+     profile — so it is not a message FOR the worker at all) or "unknown" (the
+     card ran but a store could not be read). See ``_comment_delivery``.
   POST /tasks/{task_id}/comments?board=default   body: {"body": str, "author"?: str}
         -> {"ok": true, "id": int}
      Append a comment to the task, exactly as the built-in Kanban plugin does.
      `author` defaults to "dashboard". 400 on empty body / bad id / unknown
      board, 404 when the task does not exist on that board.
+  DELETE /tasks/{task_id}/comments/{comment_id}?board=default[&force=1]
+        -> {"ok": true, "id", "delivery", "event_removed": bool}
+     Remove one comment AND its paired `commented` activity row.
+     A comment the worker has ALREADY seen answers 409 with `needs_force: true`
+     unless `force=1`: deleting it rewrites the history, it does not take the
+     text out of the agent's context. 404 for an unknown comment/task/board,
+     400 for a malformed task id.
   GET /projects                                 -> {"projects": [{id, slug, name,
                                           primary_path, board_slug}, ...]}
      Every non-archived project of the per-profile ``projects.db``, each
@@ -100,6 +126,29 @@ Endpoints:
      tools that finished, context compressions). Both are empty rather than
      fatal when the store has no ``sessions`` table or the profile has no
      log.
+
+  GET /tasks/{task_id}/live?board=default
+        -> {"task_id", "board", "session_id", "available",
+            "streaming", "reason", "turn_id", "iteration", "model",
+            "reasoning", "text", "age_s", "updated_at", "ended", "error",
+            "reasoning_enabled"}
+     The TOKENS OF THE CURRENT MODEL CALL, while the model is still writing
+     them: the live reasoning block of the «транскрипт» tab.
+
+     WHY THIS ROUTE EXISTS: the store only gets the assistant row when the
+     call ENDS, so during a long call (tens of seconds on a local model) the
+     transcript is frozen. The tokens do exist — the core hands them to
+     stream subscribers (``agent/plugin_stream_hooks.py``), and this plugin
+     IS such a subscriber: its ``__init__.py`` writes them to
+     ``<profile home>/plugin-data/hermes-logs-viewer/live/<session>.ndjson``.
+     This route assembles that file into the current call's reasoning and
+     text.
+
+     ``available: false`` means the file is not there, and ``reason`` says
+     why in the operator's words (plugin not enabled in the owner profile /
+     reasoning deltas off / the agent is not calling the model right now).
+     Kept separate from ``/transcript`` on purpose: this one is polled about
+     once a second and must not re-read the store.
 """
 
 from __future__ import annotations
@@ -108,8 +157,10 @@ import asyncio
 import json
 import os
 import re
+import socket
 import sqlite3
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -285,18 +336,33 @@ def _project_rows() -> tuple[Optional[list], Optional[str]]:
 
 def _board_slugs() -> List[str]:
     """Every board that has a kanban.db: "default" first (if present),
-    then any named boards in sorted order."""
+    then any named boards in sorted order — each slug at most ONCE.
+
+    The dedupe is not cosmetic. ``default`` lives at ``<root>/kanban.db``
+    (``kanban_db.kanban_db_path``'s back-compat rule), but a ``boards/default/``
+    directory also exists on hosts where something created one — and this
+    function would then append the name a second time while
+    ``_board_db_path("default")`` still resolves to the same legacy file. Every
+    default-board card was listed twice (and the same for its workers), which
+    is exactly the "одна задача дважды в списке" report. ``list_boards`` in the
+    core refuses this with a ``seen`` set; mirror it.
+    """
     root = _kanban_root()
     slugs: List[str] = []
+    seen = set()
     if (root / "kanban.db").exists():
         slugs.append("default")
+        seen.add("default")
     boards_dir = root / "kanban" / "boards"
     if boards_dir.is_dir():
         for child in sorted(boards_dir.iterdir()):
             if not child.is_dir():
                 continue
+            if child.name in seen:
+                continue
             if (child / "board.json").exists() or (child / "kanban.db").exists():
                 slugs.append(child.name)
+                seen.add(child.name)
     return slugs
 
 
@@ -425,13 +491,294 @@ def _sort_key(t: dict):
     )
 
 
+# --- Живые воркеры ---------------------------------------------------------
+#
+# Верхняя строка панели считает «running» по `tasks.status`, а это запись о
+# НАМЕРЕНИИ доски, не о живом процессе. Расхождения с ОС бывают в обе стороны:
+#   * карточка ушла из running (done / review / blocked), а процесс воркера жив
+#     и продолжает доделывать работу — иногда минутами;
+#   * карточка числится running, а процесса уже нет (claim протух, reap не
+#     успел) — «running» без работающего воркера.
+# Панель поэтому спрашивает /proc, а не доску.
+#
+# Семантика liveness повторяет ядро (kanban_db_dispatch._worker_alive): pid
+# живой И его restart-stable fingerprint совпадает с записанным при спавне. Это
+# намеренно СВОЯ копия десяти строк, а не импорт hermes_cli: модуль сознательно
+# не зависит от конкретной установки (стенд гоняет его по fake-базам), а правило
+# простое и в ядре не менялось. Записи чужого хоста (claim_lock не с нашей
+# машины) проверить отсюда нельзя — они отдаются как `remote`, а не как «живые».
+_WORKER_LOOKBACK_S = 6 * 3600
+
+# Сколько секунд процесс должен прожить ПОСЛЕ ухода карточки из running, чтобы
+# это считалось «доделывает», а не «нормально выходит»: сразу после
+# kanban_complete воркер ещё секунду-две закрывает файлы и умирает, и без этого
+# порога каждый завершённый запуск мигал бы предупреждением.
+_AFTER_GRACE_S = 10
+
+# Открытый run без живого процесса и без heartbeat дольше этого — карточка
+# числится running, а работать некому. 120 с — та же выдержка, которую ядро
+# даёт воркеру, пережившему свой переход (TERMINAL_WORKER_REAP_GRACE_SECONDS).
+_STALE_WORKER_S = 120
+
+# Значение fingerprint'а для спавна, у которого его не удалось снять
+# (kanban_db_dispatch.UNVERIFIED_WORKER_FINGERPRINT): процесса не трогаем, но и
+# «нашим» его не считаем.
+_UNVERIFIED_FINGERPRINT = "unverified"
+
+
+def _host_prefix() -> str:
+    """``"<host>:"`` — тот же префикс, что ядро пишет в claim_lock
+    (``kanban_db._host_prefix``). По нему видно, наш это воркер или чужой."""
+    try:
+        host = socket.gethostname() or "unknown"
+    except Exception:  # noqa: BLE001 — имя хоста не должно ронять панель
+        host = "unknown"
+    return f"{host}:"
+
+
+def _proc_stat(pid: int) -> Optional[list]:
+    """Поля ``/proc/<pid>/stat`` ПОСЛЕ имени процесса.
+
+    ``comm`` может содержать пробелы и скобки, поэтому режем по ПОСЛЕДНЕЙ
+    ``)`` — это то же правило, что в ``gateway.drain_control``. ``None`` —
+    процесса (или /proc) нет.
+    """
+    try:
+        raw = Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    parts = raw.rsplit(")", 1)
+    if len(parts) != 2:
+        return None
+    return parts[1].split()
+
+
+def _pid_alive(pid) -> bool:
+    """Живой ли процесс. Зомби (вышел, но не пожал) — уже мёртв.
+
+    ``os.kill(pid, 0)`` на Windows шлёт CTRL_C_EVENT всей консольной группе,
+    поэтому там проверка не делается: панель живёт на POSIX-хосте, а на
+    не-Linux платформах остаётся только ответ по существованию pid.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True                       # процесс есть, просто не наш
+    except OSError:
+        return False
+    if sys.platform == "linux":
+        fields = _proc_stat(pid)
+        if fields and fields[0] == "Z":   # "State: Z" — уже не работает
+            return False
+    return True
+
+
+def _proc_start_time(pid) -> Optional[int]:
+    """Поле 22 ``/proc/<pid>/stat`` — тики с загрузки системы."""
+    fields = _proc_stat(int(pid))
+    if not fields or len(fields) < 20:
+        return None
+    try:
+        return int(fields[19])
+    except (TypeError, ValueError):
+        return None
+
+
+def _instantiation_epoch() -> str:
+    """``"<boot_id>:<start время PID 1>"`` — меняется на каждой перезагрузке
+    и на пересоздании контейнера, поэтому fingerprint не переживает ребут."""
+    boot_id = pid1 = ""
+    try:
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="utf-8").strip()
+    except OSError:
+        pass
+    start = _proc_start_time(1)
+    if start is not None:
+        pid1 = str(start)
+    return f"{boot_id}:{pid1}" if (boot_id or pid1) else ""
+
+
+def _process_fingerprint(pid) -> Optional[str]:
+    start = _proc_start_time(pid)
+    if start is None:
+        return None
+    return f"{_instantiation_epoch()}|{start}"
+
+
+def _worker_state(pid, started_at, claim_lock) -> str:
+    """``alive`` | ``dead`` | ``remote`` | ``unknown`` — что говорит ОС.
+
+    ``unknown`` (спавн без fingerprint) намеренно не ``alive``: о таком
+    процессе известно только то, что pid занят, и называть его нашим воркером
+    было бы догадкой.
+    """
+    if not str(claim_lock or "").startswith(_host_prefix()):
+        return "remote"
+    if not _pid_alive(pid):
+        return "dead"
+    if started_at is None or started_at == "":
+        return "alive"                    # легаси-строка: только существование
+    if started_at == _UNVERIFIED_FINGERPRINT:
+        return "unknown"
+    if isinstance(started_at, str) and "|" in started_at:
+        return "alive" if _process_fingerprint(pid) == started_at else "dead"
+    # Строки до boot-witness хранят только start-time.
+    try:
+        return "alive" if _proc_start_time(pid) == int(started_at) else "dead"
+    except (TypeError, ValueError):
+        return "alive"
+
+
+def _worker_rows(board: str) -> List[dict]:
+    """Живые воркеры одной доски — по одной записи на процесс.
+
+    Источник — ``task_runs``, а не ``tasks``: при терминальном переходе
+    (``complete_task``) ядро обнуляет ``tasks.worker_pid``, но ОСТАВЛЯЕТ pid и
+    fingerprint в закрытой строке run'а именно как улику о процессе, который
+    пережил свой переход. Искать «доделывающего» воркера больше негде.
+
+    ``phase``:
+      ``running`` — карточка в running, процесс жив (норма);
+      ``after``   — карточка уже НЕ в running, а процесс жив дольше
+                    ``_AFTER_GRACE_S``: тот самый случай «ушёл из in progress,
+                    а всё ещё работает»;
+      ``stale``   — карточка в running, а процесса нет и heartbeat молчит:
+                    «running» врёт.
+
+    ``since_s`` — сколько секунд длится это состояние (для running — сколько
+    идёт запуск). Ответ пустой список при любой проблеме: панель не должна
+    падать из-за нечитаемой доски.
+    """
+    db_path = _board_db_path(board)
+    if not db_path.exists():
+        return []
+    try:
+        con = _ro_connect(db_path)
+    except sqlite3.Error:
+        return []
+    now = int(time.time())
+    rows: list = []
+    last_status: dict = {}
+    try:
+        rows = con.execute(
+            """
+            SELECT r.id AS run_id, r.task_id, r.profile, r.status AS run_status,
+                   r.outcome, r.claim_lock, r.worker_pid, r.worker_started_at,
+                   r.last_heartbeat_at, r.started_at, r.ended_at,
+                   t.title, t.status AS task_status
+              FROM task_runs r
+              JOIN tasks t ON t.id = r.task_id
+             WHERE r.ended_at IS NULL
+                OR (r.worker_pid IS NOT NULL AND r.ended_at >= ?)
+            """,
+            (now - _WORKER_LOOKBACK_S,),
+        ).fetchall()
+        ids = sorted({r["task_id"] for r in rows})
+        if ids:
+            marks = ",".join("?" * len(ids))
+            # Когда карточка в последний раз меняла состояние — от этого
+            # считается «сколько уже доделывает», если run остался открытым.
+            for ev in con.execute(
+                f"SELECT task_id, MAX(created_at) AS ts FROM task_events "
+                f"WHERE kind = 'status' AND task_id IN ({marks}) GROUP BY task_id",
+                ids,
+            ):
+                last_status[ev["task_id"]] = _to_int(ev["ts"])
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+
+    out: List[dict] = []
+    for r in rows:
+        pid = _to_int(r["worker_pid"]) or None
+        state = _worker_state(pid, r["worker_started_at"], r["claim_lock"])
+        open_run = r["ended_at"] is None
+        task_status = r["task_status"] or ""
+        started = _to_int(r["started_at"]) or None
+        ended = _to_int(r["ended_at"]) or None
+        heartbeat = _to_int(r["last_heartbeat_at"]) or None
+        entry = {
+            "board": board,
+            "task_id": r["task_id"],
+            "title": r["title"] or r["task_id"],
+            "task_status": task_status,
+            "profile": r["profile"] or "",
+            "run_id": _to_int(r["run_id"]),
+            "run_status": r["run_status"] or "",
+            "outcome": r["outcome"] or "",
+            "pid": pid,
+            "started_at": started,
+            "ended_at": ended,
+            "last_heartbeat_at": heartbeat,
+            "state": state,           # что ответила ОС: alive | unknown | remote | dead
+        }
+        if state in ("alive", "unknown"):
+            if open_run and task_status == "running":
+                entry["phase"] = "running"
+                entry["since_s"] = now - (started or now)
+            else:
+                left_at = ended or last_status.get(r["task_id"]) or started or now
+                since = now - left_at
+                if since < _AFTER_GRACE_S:
+                    continue          # обычный выход: процесс ещё закрывает файлы
+                entry["phase"] = "after"
+                entry["since_s"] = since
+            out.append(entry)
+        elif state == "remote" and open_run:
+            # Воркер на другой машине: отсюда не проверить, но доска говорит,
+            # что он работает — показываем честно помеченным.
+            entry["phase"] = "running"
+            entry["since_s"] = now - (started or now)
+            out.append(entry)
+        elif state == "dead" and open_run and task_status == "running":
+            idle = now - (heartbeat or started or now)
+            if idle < _STALE_WORKER_S:
+                continue              # только спавнился / только что умер
+            entry["phase"] = "stale"
+            entry["since_s"] = idle
+            out.append(entry)
+    order = {"after": 0, "stale": 1, "running": 2}
+    out.sort(key=lambda w: (order.get(w["phase"], 9), -(w.get("since_s") or 0),
+                            w["task_id"]))
+    return out
+
+
 @router.get("/tasks/all")
 async def list_all_tasks():
     """Every task on every board, merged and sorted, each tagged with its
     `board` slug. A board whose db is missing/unreadable is skipped so one
-    broken board never hides the rest."""
+    broken board never hides the rest.
+
+    ORDER: the merged pool is sorted by ``_sort_key`` — the SAME rule the
+    single-board view uses: status group first (running, ready, scheduled,
+    blocked, review, triage, todo, done, archived), then the key that group is
+    ordered by (priority for open cards, completion time for closed ones). A
+    board slug is only a LATE tiebreak, so two cards of one board with the same
+    priority stay next to each other and the list is stable across polls.
+
+    Boards used to be concatenated (each board's rows pre-sorted, then
+    extended), which made "все доски" read as a stack of boards — every status
+    appeared once per board, and a running card from the last board sat below a
+    done card from the first. Grouping by status is what a single board does,
+    and it is what the operator asked the merged view to do as well.
+
+    Also returns ``workers`` — the processes that are alive RIGHT NOW, which is
+    not the same thing as the cards in ``running`` (see ``_worker_rows`` for the
+    two ways they disagree).
+    """
     def _run():
         tasks: List[dict] = []
+        workers: List[dict] = []
         for slug in _board_slugs():
             rows, err = _task_rows(slug)
             if err:
@@ -440,8 +787,116 @@ async def list_all_tasks():
             tasks.extend(
                 _row_to_task(r, slug, counts.get(r["id"], 0)) for r in rows
             )
+            workers.extend(_worker_rows(slug))
+        # One pool, one rule: the same `_sort_key` a single board gets.
         tasks.sort(key=_sort_key)
-        return {"tasks": tasks}
+        return {"tasks": tasks, "workers": workers, "now": int(time.time())}
+
+    return await asyncio.to_thread(_run)
+
+
+# --- Гейтвей: состояние и управление --------------------------------------
+#
+# The messaging gateway is a ``systemd --user`` unit, NOT a child of the
+# dashboard, so "остановить гейтвей" can only mean ``systemctl --user stop``:
+# nothing in the dashboard's own process tree can be signalled for it, and a
+# plain ``kill`` would leave systemd to restart it (Restart=on-failure).
+#
+# The unit is an ALLOWLIST and the route takes an ACTION, never a unit name.
+# A route shaped ``POST /service/{name}/{verb}`` would let any caller stop any
+# user service through the dashboard — the endpoint is reachable with the same
+# session cookie as the rest of the panel.
+_GATEWAY_UNIT = "hermes-gateway.service"
+_GATEWAY_ACTIONS = ("start", "stop", "restart")
+_SYSTEMCTL_TIMEOUT_S = 30
+
+
+def _systemctl(*args: str):
+    """``(returncode, stdout, stderr)`` — never raises.
+
+    A missing ``systemctl`` (a container, a non-systemd host) and a timeout are
+    ordinary answers here: the header must be able to say "не знаю" instead of
+    the whole route blowing up.
+    """
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", *args],
+            capture_output=True, text=True, timeout=_SYSTEMCTL_TIMEOUT_S,
+            check=False,
+        )
+        return proc.returncode, (proc.stdout or "").strip(), (proc.stderr or "").strip()
+    except FileNotFoundError:
+        return 127, "", "systemctl not found"
+    except subprocess.TimeoutExpired:
+        return -1, "", f"systemctl timed out after {_SYSTEMCTL_TIMEOUT_S}s"
+    except OSError as e:
+        return -1, "", str(e)
+
+
+def _gateway_state() -> dict:
+    """One ``systemctl show`` for load/active state — a single call, so the
+    answer cannot be stitched from two moments that disagree."""
+    rc, out, err = _systemctl(
+        "show", "-p", "LoadState", "-p", "ActiveState", "-p", "SubState",
+        _GATEWAY_UNIT,
+    )
+    props = {}
+    for line in out.splitlines():
+        key, _, value = line.partition("=")
+        if key:
+            props[key.strip()] = value.strip()
+    load = props.get("LoadState", "")
+    state = props.get("ActiveState", "")
+    sub = props.get("SubState", "")
+    known = bool(state) and load not in ("", "not-found")
+    return {
+        "unit": _GATEWAY_UNIT,
+        "load": load,
+        "state": state or ("unknown" if rc != 0 else ""),
+        "sub": sub,
+        "active": state == "active",
+        "known": known,
+        "checked_at": int(time.time()),
+        "error": "" if known else (err or f"unit {_GATEWAY_UNIT} is not installed"),
+    }
+
+
+@router.get("/gateway")
+async def gateway_status():
+    """State of the messaging-gateway unit (the header's start/stop buttons)."""
+    return await asyncio.to_thread(_gateway_state)
+
+
+@router.post("/gateway/{action}")
+async def gateway_control(action: str):
+    """Start / stop / restart the messaging gateway.
+
+    Answers with the state read AFTER the action, in the same call: the button
+    can then show what actually happened instead of assuming the command
+    worked, and the unit's own words (§``Method``/§``Result``) travel in
+    ``stdout``/``stderr``.
+    """
+    act = (action or "").strip().lower()
+    if act not in _GATEWAY_ACTIONS:
+        return JSONResponse(
+            {"error": f"unknown gateway action {action!r}",
+             "allowed": list(_GATEWAY_ACTIONS)},
+            status_code=400,
+        )
+
+    def _run():
+        rc, out, err = _systemctl(act, _GATEWAY_UNIT)
+        body = {
+            "ok": rc == 0,
+            "action": act,
+            "returncode": rc,
+            "stdout": out,
+            "stderr": err,
+        }
+        body.update(_gateway_state())
+        if rc != 0 and not body.get("error"):
+            body["error"] = err or out or f"systemctl {act} failed (rc {rc})"
+        return body
 
     return await asyncio.to_thread(_run)
 
@@ -508,17 +963,290 @@ def _rw_connect(db_path: Path) -> sqlite3.Connection:
     return con
 
 
-def _resolve_board_slug(board: Optional[str]):
+def _resolve_board_slug(board: Optional[str]) -> "tuple[str, Optional[JSONResponse]]":
     """Normalize a board slug; returns (slug, error_response_or_None)."""
     try:
         return _normalize_board(board), None
     except ValueError as e:
-        return None, JSONResponse({"error": str(e)}, status_code=400)
+        return "", JSONResponse({"error": str(e)}, status_code=400)
+
+
+def _task_assignee(con: sqlite3.Connection, task_id: str):
+    """``(found, assignee)`` for one task row.
+
+    ``found=False`` means the id is not on this board. The lookup tolerates a
+    missing ``tasks`` table (a synthetic/fixture board): the comment thread is
+    then reported with an unknown assignee instead of a 500.
+    """
+    try:
+        row = con.execute(
+            "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+    except sqlite3.Error:
+        return True, None
+    if row is None:
+        return False, None
+    return True, row["assignee"]
 
 
 class CommentBody(BaseModel):
     body: str
     author: Optional[str] = "dashboard"
+
+
+# --- Was a comment delivered to the worker? --------------------------------
+#
+# A comment reaches a worker by ONE OF TWO paths, and BOTH leave the comment
+# TEXT in the worker's own session transcript:
+#
+#   spawn    ``kanban_db.build_worker_context`` renders the thread into the
+#            worker's first prompt ("## Comment thread" →
+#            ``kanban_db_context._ctx_comments``: "comment from worker
+#            `<author>` at <stamp>:" followed by the body);
+#   mid_run  the live bridge ``tools.kanban_tools.inject_new_comments_from_env``
+#            polls every ~6 s at a tool boundary and STEERS the worker with
+#            "New note on your kanban task from the operator (delivered
+#            mid-run). … - <author>: <body>".
+#
+# So "did the agent see this" is answerable without guessing: read the store
+# the plugin already serves the transcript from (``_owner_admitted`` → the
+# owner profile's ``state.db``). Body found ⇒ delivered. Body absent from every
+# session of the card ⇒ it has not reached a worker yet, and deleting it before
+# the next poll/spawn genuinely cancels the delivery.
+#
+# Two caveats, both on the "not found" side and both documented in the README:
+# the spawn path TRUNCATES a long comment (``_ctx_cap``), which is why the
+# needle is only the first ``_DELIVERY_NEEDLE_CHARS`` characters; and a
+# heavily compacted session may no longer carry the old text.
+_DELIVERY_NEEDLE_CHARS = 160
+
+# How much of an old-scheme worker log the delivery check reads (its tail).
+_WORKER_LOG_TAIL_BYTES = 8 * 1024 * 1024
+
+
+def _compact(text) -> str:
+    """Drop every whitespace character.
+
+    A worker log WRAPS and hyphen-breaks long text — it renders "и почему-то"
+    as "и поч / ему-то", and a reasoning block breaks lines mid-sentence. Both
+    are invisible to a plain substring search, which would read a comment the
+    worker clearly saw as "not delivered". Comparing without any whitespace is
+    what makes a re-wrapped quote still match.
+    """
+    return "".join((text or "").split())
+
+
+def _delivery_needle(body) -> str:
+    """The part of a comment body that must show up in the transcript.
+
+    Whitespace-free (see ``_compact``), 160 characters long — specific enough
+    that the flip side (a needle matching unrelated text) is not a practical
+    concern.
+    """
+    return _compact(body)[:_DELIVERY_NEEDLE_CHARS]
+
+
+def _card_sessions(con: sqlite3.Connection, task_id: str):
+    """``[(session_id, store_or_None)]`` — every owner session of the card.
+
+    One ``owner_admitted`` event per attempt, newest first; the same session is
+    never listed twice. An empty list means no owner gateway ever took the card
+    (never started, or the pre-v0.22.3 scheme where the worker was a child
+    process and the log, not a store, held the transcript).
+    """
+    rows = con.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'owner_admitted' ORDER BY id DESC",
+        (task_id,),
+    ).fetchall()
+    seen, out = set(), []
+    for r in rows:
+        try:
+            payload = json.loads(r["payload"] or "")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        session_id = (payload.get("session_id") or "").strip()
+        if not session_id or session_id in seen:
+            continue
+        seen.add(session_id)
+        out.append((session_id, (payload.get("db") or "").strip() or None))
+    return out
+
+
+def _session_turns(store: Optional[str], session_id: str):
+    """``[(content, timestamp)]`` of one session's user/system turns.
+
+    ``None`` means "could not read it" — a missing/relative store path, an
+    unreadable db, or a store without a ``messages`` table. The caller turns
+    that into "delivery unknown" rather than pretending the comment is pending.
+    User and system turns are all that matter: the spawn prompt and the steer
+    note are both user turns, while tool output (the bulk of a store) is never
+    one of them.
+    """
+    if not store:
+        return None
+    path = Path(store).expanduser()
+    if not path.is_absolute() or not path.exists():
+        return None
+    try:
+        con = _ro_connect(path)
+    except sqlite3.Error:
+        return None
+    try:
+        cols = _message_columns(con)
+        if not cols:
+            return None
+        rows = con.execute(
+            "SELECT content, timestamp FROM messages "
+            "WHERE session_id = ? AND role IN ('user', 'system') ORDER BY id ASC",
+            (session_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+    return [((r["content"] or ""), r["timestamp"]) for r in rows]
+
+
+def _worker_log_text(board: str, task_id: str):
+    """The card's old-scheme worker log (child process stdout), or ``None``.
+
+    Same layout the core uses (``kanban_db.worker_logs_dir``): the default board
+    keeps its logs in ``<root>/kanban/logs/``, a named board in
+    ``<root>/kanban/boards/<slug>/logs/``. Only the tail is read — a long run's
+    log reaches the rotation cap, and the interesting part (what the worker did
+    with a comment) is never the first megabyte.
+    """
+    root = _kanban_root()
+    if board == "default":
+        path = root / "kanban" / "logs" / f"{task_id}.log"
+    else:
+        path = root / "kanban" / "boards" / board / "logs" / f"{task_id}.log"
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            if size > _WORKER_LOG_TAIL_BYTES:
+                fh.seek(size - _WORKER_LOG_TAIL_BYTES)
+            return fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+_OPERATOR_AUTHORS = frozenset({"dashboard", "operator", "ui", "user"})
+
+# Author of a comment that the WORKER writes: `kanban_comment` stamps the
+# running profile's name on it (kanban.py `_profile_author`), so on a card
+# assigned to `executor-cloud` a note from a `default`-profile worker lands as
+# author "default". Those are not messages FOR anybody — they ARE the worker's
+# output — so a delivery chip on them ("не доставлен") reports the wrong thing:
+# nobody was ever supposed to deliver them. Only the explicit operator
+# identities above are treated as messages whose delivery is tracked.
+def _is_operator_comment(author: str, assignee: str) -> bool:
+    author = (author or "").strip()
+    if not author:
+        return True              # unknown author: keep the old delivery logic
+    if author == (assignee or "").strip():
+        return False             # the card's own assignee writing a comment
+    return author.lower() in _OPERATOR_AUTHORS
+
+
+def _comment_delivery(con: sqlite3.Connection, task_id: str, board: str, assignee, comments):
+    """``{comment_id: {delivery, channel, at}}`` for the task's comment rows.
+
+    ``delivery`` is one of:
+      ``delivered``  the text is in the card's transcript — channel says how
+                     (``spawn`` / ``mid_run`` / ``worker_log``), ``at`` is the
+                     message time (None for the old log scheme);
+      ``pending``    nothing that could carry the comment has it, so no worker
+                     has read it: safe to delete, the delivery is cancelled;
+      ``own``        written by a worker rather than by the operator (the
+                     card's assignee, or any other agent profile): a worker
+                     comment is never "delivered", it IS the worker's output;
+      ``unknown``    the card ran, but nothing could be read.
+    """
+    sessions = _card_sessions(con, task_id)
+    turns, unreadable = [], False
+    for session_id, store in sessions:
+        got = _session_turns(store, session_id)
+        if got is None:
+            unreadable = True
+            continue
+        turns.extend(got)
+    try:
+        ran = bool(sessions) or bool(con.execute(
+            "SELECT 1 FROM task_runs WHERE task_id = ? LIMIT 1", (task_id,)
+        ).fetchone())
+    except sqlite3.Error:
+        ran = bool(sessions)
+    # The last moment a worker could have read anything: a comment created
+    # AFTER it cannot have been seen by anyone.
+    try:
+        row = con.execute(
+            "SELECT MAX(COALESCE(ended_at, started_at)) AS t FROM task_runs "
+            "WHERE task_id = ?", (task_id,),
+        ).fetchone()
+        last_run_end = (row["t"] if row is not None else None)
+    except sqlite3.Error:
+        last_run_end = None
+    # No owner session at all: the card ran under the pre-v0.22.3 scheme, where
+    # the worker was a child process and the card's LOG is its transcript. The
+    # log is not a dialogue, so a body found there proves the worker dealt with
+    # that text rather than proving the exact turn it arrived in.
+    log_text = _worker_log_text(board, task_id) if (ran and not sessions) else None
+    compact_turns = [(_compact(content), ts) for content, ts in turns]
+    compact_log = _compact(log_text) if log_text else None
+    assignee = (assignee or "").strip()
+    out = {}
+    for c in comments:
+        author = (c["author"] or "").strip()
+        needle = _delivery_needle(c["body"])
+        entry: "dict[str, object]" = {"delivery": None, "channel": None, "at": None}
+        if not _is_operator_comment(author, assignee):
+            entry["delivery"] = "own"
+        elif not needle:
+            entry["delivery"] = "pending"
+        else:
+            hit_at, hit_channel = None, None
+            for content, ts in compact_turns:
+                if needle not in content:
+                    continue
+                if "deliveredmid-run" in content:
+                    channel = "mid_run"
+                elif ("commentfromworker`" + _compact(author) + "`") in content:
+                    channel = "spawn"
+                else:
+                    continue
+                stamp = ts or 0
+                if hit_at is None or stamp < hit_at:
+                    hit_at, hit_channel = stamp, channel
+            if hit_at is not None:
+                entry.update(delivery="delivered", channel=hit_channel, at=hit_at)
+            elif compact_log and needle in compact_log:
+                entry.update(delivery="delivered", channel="worker_log", at=None)
+            elif not ran:
+                entry["delivery"] = "pending"
+            elif log_text is not None:
+                # The old child-process scheme: the card has ONE log per task,
+                # REWRITTEN by every attempt, so a body missing from it may
+                # still have been read by an earlier attempt. Only a comment
+                # written after the last attempt ended is provably unread.
+                when = c["created_at"] or 0
+                if last_run_end is None or when > last_run_end:
+                    entry["delivery"] = "pending"
+                else:
+                    entry["delivery"] = "unknown"
+            elif unreadable or (not compact_turns and compact_log is None):
+                # The card ran, but there is nothing to read: a store that
+                # cannot be opened, or a run whose transcript is gone. Calling
+                # that "not delivered" would be a guess, and a guess must not be
+                # what enables a delete.
+                entry["delivery"] = "unknown"
+            else:
+                entry["delivery"] = "pending"
+        out[c["id"]] = entry
+    return out
 
 
 @router.get("/tasks/{task_id}/comments")
@@ -537,14 +1265,14 @@ async def list_comments(task_id: str, board: str = Query(default="default")):
         except sqlite3.Error as e:
             return JSONResponse({"error": f"cannot open {db_path}: {e}"}, status_code=500)
         try:
-            if not con.execute(
-                "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
-            ).fetchone():
+            found, assignee = _task_assignee(con, task_id)
+            if not found:
                 return JSONResponse({"error": f"unknown task {task_id}"}, status_code=404)
             rows = con.execute(
                 "SELECT id, author, body, created_at FROM task_comments "
                 "WHERE task_id = ? ORDER BY id ASC", (task_id,)
             ).fetchall()
+            delivery = _comment_delivery(con, task_id, slug, assignee, rows) if rows else {}
         except sqlite3.Error as e:
             return JSONResponse({"error": f"query failed: {e}"}, status_code=500)
         finally:
@@ -557,9 +1285,130 @@ async def list_comments(task_id: str, board: str = Query(default="default")):
                     "author": r["author"],
                     "body": r["body"],
                     "created_at": _to_int(r["created_at"]),
+                    # Whether the WORKER has seen this comment: `delivered` /
+                    # `pending` / `own` / `unknown` (see _comment_delivery).
+                    "delivery": delivery.get(r["id"], {}).get("delivery") or "unknown",
+                    "delivered_channel": delivery.get(r["id"], {}).get("channel"),
+                    "delivered_at": delivery.get(r["id"], {}).get("at"),
                 }
                 for r in rows
             ],
+        }
+
+    return await asyncio.to_thread(_run)
+
+
+def _drop_commented_event(con: sqlite3.Connection, task_id: str, comment) -> bool:
+    """Remove the ``commented`` activity row that belongs to a deleted comment.
+
+    The write side (``kanban_db.add_comment`` and this plugin's POST) writes the
+    comment row AND a ``commented`` event, both stamped with the same
+    ``created_at`` and the event's payload carrying ``author`` + ``len(body)``.
+    Leaving the event behind would keep a phantom "комментарий добавлен" line in
+    the bundled plugin's activity feed for a comment that no longer exists.
+    Body length is the discriminator; if the row came from a caller that stamped
+    a different ``len`` (the CLI passes the unstripped body), the newest event
+    with the same author in that second is used instead.
+    """
+    rows = con.execute(
+        "SELECT id, payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'commented' AND created_at = ? "
+        "ORDER BY id DESC",
+        (task_id, int(comment["created_at"] or 0)),
+    ).fetchall()
+    author = (comment["author"] or "").strip()
+    length = len((comment["body"] or "").strip())
+    fallback = None
+    for r in rows:
+        try:
+            payload = json.loads(r["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if (payload.get("author") or "").strip() != author:
+            continue
+        if int(payload.get("len") or 0) == length:
+            con.execute("DELETE FROM task_events WHERE id = ?", (r["id"],))
+            return True
+        if fallback is None:
+            fallback = r["id"]
+    if fallback is not None:
+        con.execute("DELETE FROM task_events WHERE id = ?", (fallback,))
+        return True
+    return False
+
+
+@router.delete("/tasks/{task_id}/comments/{comment_id}")
+async def delete_comment(
+    task_id: str,
+    comment_id: int,
+    board: str = Query(default="default"),
+    force: bool = Query(default=False),
+):
+    """Delete one comment of a task (its paired ``commented`` event as well).
+
+    A comment the worker has ALREADY seen is refused with 409 unless ``force``
+    is passed: deleting it then only rewrites history — the text is in the
+    agent's context and will not be taken back, so the caller has to say it
+    knows that. A still-``pending`` comment is deleted without ceremony, which
+    is the point of the route: the next comment poll / worker spawn will not see
+    it at all.
+    """
+    def _run():
+        if not _TASK_ID_RE.match(task_id):
+            return JSONResponse({"error": f"bad task id: {task_id!r}"}, status_code=400)
+        slug, err = _resolve_board_slug(board)
+        if err:
+            return err
+        db_path = _board_db_path(slug)
+        if not db_path.exists():
+            return JSONResponse({"error": f"board '{slug}' not found"}, status_code=404)
+        try:
+            con = _rw_connect(db_path)
+        except sqlite3.Error as e:
+            return JSONResponse({"error": f"cannot open {db_path}: {e}"}, status_code=500)
+        try:
+            with con:  # one transaction; rolled back on any error
+                found, assignee = _task_assignee(con, task_id)
+                if not found:
+                    return JSONResponse(
+                        {"error": f"unknown task {task_id}"}, status_code=404)
+                comment = con.execute(
+                    "SELECT id, author, body, created_at FROM task_comments "
+                    "WHERE task_id = ? AND id = ?", (task_id, int(comment_id)),
+                ).fetchone()
+                if not comment:
+                    return JSONResponse(
+                        {"error": f"unknown comment {comment_id} on {task_id}"},
+                        status_code=404)
+                delivery = _comment_delivery(
+                    con, task_id, slug, assignee, [comment]
+                ).get(int(comment_id), {"delivery": "unknown"})
+                if delivery.get("delivery") == "delivered" and not force:
+                    return JSONResponse(
+                        {
+                            "error": "the worker has already seen this comment; "
+                                     "pass force=1 to remove it from the history only",
+                            "needs_force": True,
+                            "delivery": delivery,
+                        },
+                        status_code=409,
+                    )
+                con.execute(
+                    "DELETE FROM task_comments WHERE task_id = ? AND id = ?",
+                    (task_id, int(comment_id)),
+                )
+                event_removed = _drop_commented_event(con, task_id, comment)
+        except sqlite3.Error as e:
+            return JSONResponse({"error": f"write failed: {e}"}, status_code=500)
+        finally:
+            con.close()
+        return {
+            "ok": True,
+            "id": int(comment_id),
+            "delivery": delivery,
+            "event_removed": event_removed,
         }
 
     return await asyncio.to_thread(_run)
@@ -1363,5 +2212,247 @@ async def get_transcript(
         if log_err:
             payload["events_error"] = log_err
         return payload
+
+    return await asyncio.to_thread(_run)
+
+
+# ── живой поток модели (токены текущего вызова) ──────────────────────────────
+#
+# Пока модель печатает, в сторе нет ни строки: строка ассистента появляется на
+# ГРАНИЦЕ вызова. Токены при этом есть — ядро раздаёт их подписчикам потока
+# (agent/plugin_stream_hooks.py), и плагин среди них: его __init__.py пишет их
+# в plugin-data профиля-владельца. Здесь этот файл собирается обратно в текст
+# текущего вызова: рассуждение и видимый ответ.
+#
+# Каталог — из plugin_storage-конвенции ядра (<hermes home>/plugin-data/<имя>/),
+# а не из каталога установки плагина: тот удаляется при `remove` и
+# перезаписывается при `update`.
+_LIVE_DATA_DIR = "hermes-logs-viewer"
+# Файл перезаписывается на каждый новый вызов модели, так что он мал по
+# построению. Всё, что больше, — чужой файл или старая версия плагина: читаем
+# хвост и не притворяемся, что видели начало.
+_LIVE_MAX_BYTES = 1024 * 1024
+# Сколько ждём после последней записи, прежде чем назвать поток мёртвым.
+_LIVE_STALE_S = 90.0
+
+
+def _live_spool_path(store: Optional[str], session_id: str) -> Optional[Path]:
+    """Файл потока этой сессии, выведенный из пути стора профиля-владельца."""
+    if not store or not session_id:
+        return None
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", session_id).strip(".-")[:150]
+    if not safe:
+        return None
+    home = Path(str(store)).expanduser().parent
+    return home / "plugin-data" / _LIVE_DATA_DIR / "live" / (safe + ".ndjson")
+
+
+def _read_live_stream(path: Path):
+    """``(state, error)`` — текущий вызов модели, собранный из NDJSON-файла.
+
+    ``state`` всегда словарь: нечитаемый файл — это ``available: False`` с
+    причиной, а не 500. Неразобранные строки (файл пишется параллельно)
+    пропускаются: обрывок последней строки — норма, а не ошибка.
+    """
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            if size > _LIVE_MAX_BYTES:
+                fh.seek(size - _LIVE_MAX_BYTES)
+                fh.readline()  # первая строка хвоста — обрывок
+            raw = fh.read()
+    except OSError as e:
+        return {"available": False, "reason": f"файл потока не читается: {e}"}, str(e)
+
+    reasoning_parts: List[str] = []
+    text_parts: List[str] = []
+    start = None
+    end = None
+    updated = None
+    for line in raw.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        when = rec.get("t")
+        if isinstance(when, (int, float)):
+            updated = when
+        ev = rec.get("ev")
+        if ev == "start":
+            # Новый вызов модели: всё, что было до него, уже закрыто и
+            # попало в транскрипт отдельной строкой.
+            start = rec
+            end = None
+            reasoning_parts = []
+            text_parts = []
+        elif ev == "d":
+            piece = rec.get("text")
+            if not isinstance(piece, str) or not piece:
+                continue
+            if rec.get("kind") == "reasoning":
+                reasoning_parts.append(piece)
+            else:
+                text_parts.append(piece)
+        elif ev == "end":
+            end = rec
+    if start is None:
+        return {
+            "available": False,
+            "reason": "файл потока есть, но вызова модели в нём нет",
+        }, None
+
+    age = None
+    if isinstance(updated, (int, float)):
+        age = max(0.0, time.time() - float(updated))
+    return {
+        "available": True,
+        "reason": "",
+        "turn_id": str(start.get("turn") or ""),
+        "iteration": _to_int(start.get("iter")),
+        "model": str(start.get("model") or ""),
+        "provider": str(start.get("provider") or ""),
+        "surface": str(start.get("surface") or ""),
+        "reasoning": "".join(reasoning_parts),
+        "text": "".join(text_parts),
+        "ended": end is not None,
+        "finished": bool(end.get("finished")) if isinstance(end, dict) else False,
+        "stream_error": (end.get("error") if isinstance(end, dict) else None),
+        "updated_at": updated,
+        "age_s": age,
+        "streaming": end is None and (age is None or age < _LIVE_STALE_S),
+    }, None
+
+
+# Почему потока нет: у каждой причины свой ответ, чтобы оператор знал, что чинить.
+# Значения читаются из config.yaml профиля-владельца ТЕКСТОВО: плагин —
+# отдельный процесс и не должен зависеть от того, что рядом лежит hermes_cli
+# (это же требование тестового стенда, см. шапку файла). Обе величины лежат в
+# одном маленьком блоке `plugins:`, и их видно построчно.
+_LIVE_ENABLED_RE = re.compile(r"^\s*-\s*[\"']?hermes-logs-viewer[\"']?\s*$", re.M)
+_LIVE_FLAG_RE = re.compile(r"^\s*stream_reasoning_deltas:\s*[\"']?(true|yes|on|1)[\"']?\s*$", re.M | re.I)
+
+
+def _live_config_state(store: str):
+    """``(plugin_enabled, reasoning_enabled)`` — что включено в профиле-владельце.
+
+    Обе величины нужны панели, чтобы отличить «модель ничего не думала» от
+    «рассуждения не доходят до плагина»: во втором случае живой блок покажет
+    только видимый текст, и читатель должен понимать, почему.
+    """
+    home = Path(str(store)).expanduser().parent
+    cfg_path = home / "config.yaml"
+    try:
+        text = cfg_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False, False
+    return bool(_LIVE_ENABLED_RE.search(text)), bool(_LIVE_FLAG_RE.search(text))
+
+
+def _live_plugin_installed(home: Path) -> bool:
+    """Есть ли каталог плагина в профиле.
+
+    ``plugins.enabled`` его не ставит: discovery обходит ``$HERMES_HOME/plugins``
+    (и бандл), поэтому запись в конфиге без каталога — «включено то, чего нет».
+    Хуки ``on_stream_*`` тогда не подписаны, и файла потока не будет никогда.
+    Ссылка из чужого каталога (как у общего плагина) — это тоже каталог.
+    """
+    return (home / "plugins" / "hermes-logs-viewer").is_dir()
+
+
+def _profile_label(home: Path) -> str:
+    """Имя профиля для человека.
+
+    Домашний каталог профиля ``default`` — это ``~/.hermes``, и его ``name``
+    (``.hermes``) в сообщении читался бы как обрывок пути. Такой профиль
+    называется по своему имени в дашборде.
+    """
+    name = home.name
+    return name if name and not name.startswith(".") else "default (%s)" % home
+
+
+def _live_diagnosis(store: str) -> str:
+    """Строка для оператора: почему файла потока нет."""
+    home = Path(str(store)).expanduser().parent
+    cfg_path = home / "config.yaml"
+    profile = _profile_label(home)
+    plugin_on, reasoning_on = _live_config_state(store)
+    if not cfg_path.exists():
+        return ("файла потока нет: в профиле %s нечего читать (%s не открывается)"
+                % (profile, cfg_path.name))
+    if not plugin_on:
+        return ("файла потока нет: плагин hermes-logs-viewer не включён в профиле %s "
+                "(plugins.enabled в %s)" % (profile, cfg_path))
+    if not _live_plugin_installed(home):
+        return ("файла потока нет: плагин hermes-logs-viewer не установлен в профиле %s — "
+                "запись в plugins.enabled его не устанавливает, нужен каталог %s"
+                % (profile, home / "plugins" / "hermes-logs-viewer"))
+    if not reasoning_on:
+        return ("файла потока нет: в профиле %s выключены рассуждения — "
+                "нужно plugins.stream_reasoning_deltas: true" % profile)
+    return ("файла потока нет: настройки профиля %s в порядке — либо агент сейчас "
+            "не вызывает модель, либо воркер запущен раньше, чем плагин появился "
+            "(следующая задача подхватит его сама)" % profile)
+
+
+@router.get("/tasks/{task_id}/live")
+async def get_live_stream(
+    task_id: str,
+    board: str = Query(default="default"),
+):
+    """Токены текущего вызова модели — живой блок вкладки «транскрипт».
+
+    Ничего не бросает: нет owner-сессии, нет файла, файл не разбирается —
+    ответ 200 с ``available: false`` и причиной, потому что панель не должна
+    падать от того, что поток ещё не начался.
+    """
+    def _run():
+        if not _TASK_ID_RE.match(task_id or ""):
+            return JSONResponse({"error": f"bad task id: {task_id!r}"}, status_code=400)
+        try:
+            slug = _normalize_board(board)
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+
+        session_id, store, err = _owner_admitted(slug, task_id)
+        base = {
+            "task_id": task_id, "board": slug, "session_id": session_id,
+            "available": False, "streaming": False, "reason": "",
+            "turn_id": "", "iteration": 0, "model": "", "reasoning": "",
+            "text": "", "age_s": None, "updated_at": None, "ended": False,
+            "reasoning_enabled": False,
+        }
+        if err:
+            base["reason"] = err
+            return base
+        if not session_id:
+            base["reason"] = ("у карточки нет owner-сессии — она ещё не "
+                              "передана профилю-владельцу")
+            return base
+        if not store:
+            base["reason"] = "в событии owner_admitted нет пути к стору профиля"
+            return base
+        path = _live_spool_path(store, session_id)
+        if path is None:
+            base["reason"] = "не удалось вывести имя файла потока из сессии"
+            return base
+        state, read_err = _read_live_stream(path)
+        if state.get("available"):
+            base.update(state)
+            # Доходят ли до плагина РАССУЖДЕНИЯ (а не только видимый текст):
+            # без этого флага пустое рассуждение выглядело бы как «модель
+            # ничего не думала».
+            base["reasoning_enabled"] = _live_config_state(store)[1]
+            return base
+        # Файла нет — объясняем, что именно не настроено; файл есть, но не
+        # разобрался — говорим его собственную причину.
+        base["reason"] = (
+            (state.get("reason") or read_err) if path.exists() else _live_diagnosis(store)
+        ) or _live_diagnosis(store)
+        return base
 
     return await asyncio.to_thread(_run)

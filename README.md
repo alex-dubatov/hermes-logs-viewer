@@ -2,1044 +2,1341 @@
 
 # hermes-logs-viewer
 
-**Живой лог воркера рядом со списком задач — отдельной вкладкой в дашборде Hermes.**
+**The worker's live log next to the task list — as a tab of the Hermes dashboard.**
 
 [![plugin](https://img.shields.io/badge/dashboard--plugin-Kanban%20Logs-3fb97d)](dashboard/manifest.json)
-[![tests](https://img.shields.io/badge/tests-184%2F184%20live-4a8cd1)](tests/render_test.js)
+[![tests](https://img.shields.io/badge/tests-253%2F253%20live-4a8cd1)](tests/render_test.js)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
 </div>
 
 ---
 
-![Панель Kanban Logs: список задач слева, живой лог справа](docs/panel.png)
+![The Kanban Logs pane: task list on the left, live log on the right](docs/panel.png)
 
-Вкладка **Kanban Logs** открывается в web-дашборде Hermes (`hermes dashboard`, порт 9119)
-и показывает две половины одной работы: **слева** — все задачи всех досок, **справа** —
-лог выбранной задачи, который догоняется вживую, пока вы не прокрутили вверх.
+The **Kanban Logs** tab opens in the Hermes web dashboard (`hermes dashboard`, port 9119)
+and shows two halves of the same work: **on the left** every task of every board, **on the
+right** the log of the selected task, catching up live as long as you have not scrolled up.
 
-Ничего из этого не нужно настраивать: плагин не рисует ничего своего, кроме двух
-панелей, и берёт доски, задачи, профили и лог из **встроенного плагина kanban**.
-
----
-
-## Содержание
-
-- [Что умеет](#что-умеет)
-  - [Поиск по названию, описанию и номеру задачи](#поиск-по-названию-описанию-и-номеру-задачи)
-  - [Живой лог](#живой-лог)
-  - [Живой транскрипт](#живой-транскрипт)
-  - [Вкладка «основное»: карточка задачи целиком](#вкладка-основное-карточка-задачи-целиком)
-  - [Комментарии](#комментарии)
-  - [Новая задача](#новая-задача)
-  - [Порядок задач в списке](#порядок-задач-в-списке)
-  - [Мобильный вид](#мобильный-вид)
-  - [Что показывает строка задачи](#что-показывает-строка-задачи)
-  - [Доски и статусы](#доски-и-статусы)
-- [Установка](#установка)
-- [Скриншоты](#скриншоты)
-- [Как это устроено](#как-это-устроено)
-- [Проверка](#проверка)
-- [Ограничения](#ограничения)
-- [Лицензия](#лицензия)
+None of this needs configuring: the plugin draws nothing of its own beyond the two
+panes, and takes boards, tasks, profiles and the log from the **bundled kanban plugin**.
 
 ---
 
-## Что умеет
+## Contents
 
-### Поиск по названию, описанию и номеру задачи
+- [What it does](#what-it-does)
+  - [Search by title, description and task id](#search-by-title-description-and-task-id)
+  - [Live log](#live-log)
+  - [Live transcript](#live-transcript)
+  - [Main tab: the whole task card](#main-tab-the-whole-task-card)
+  - [Comments](#comments)
+  - [The runs tab: run history](#the-runs-tab-run-history)
+  - [The files tab: card attachments](#the-files-tab-card-attachments)
+  - [New task](#new-task)
+  - [Task order in the list](#task-order-in-the-list)
+  - [Live workers: processes, not cards](#live-workers-processes-not-cards)
+  - [Mobile view](#mobile-view)
+  - [What a task row shows](#what-a-task-row-shows)
+  - [Boards and statuses](#boards-and-statuses)
+- [Installation](#installation)
+- [Screenshots](#screenshots)
+- [How it works](#how-it-works)
+  - [Live model stream: why it needs an agent hook](#live-model-stream-why-it-needs-an-agent-hook)
+- [Verification](#verification)
+- [Limitations](#limitations)
+- [License](#license)
 
-![Поиск: список сузился до одной задачи](docs/search.png)
+---
 
-Над списком задач — строка поиска. Фильтр срабатывает **на каждое нажатие клавиши**:
-ни Enter, ни debounce не нужны.
+## What it does
 
-- ищет по **названию**, по **описанию** (`tasks.body`) и по **номеру задачи**,
-  регистр не важен;
-- **номер (`t_2d2e4f8f`) — полное совпадение по подстроке**, а не точное: номер
-  пишут по памяти и копируют кусками, поэтому `t_2d2e` находит карточку
-  `t_2d2e4f8f`. Номер не требует индекса — попадание видно на первом же
-  нажатии, без ожидания `/board`;
-- описание берётся из маршрута `/board` встроенного плагина — это единственный
-  маршрут, который отдаёт тело целиком (в списке карточек лежит превью в 200 символов).
-  Индекс строится один раз на доску и кэшируется, поэтому набор текста не ждёт сеть;
-- пока запрос не пустой, индекс подтягивается раз в 15 с — правка описания или
-  новая карточка не останутся «невидимыми» для поиска;
-- пустой результат объясняется отдельной строкой («по запросу «…» ничего не найдено»),
-  её нельзя спутать с пустой доской;
-- крестик справа в поле очищает запрос.
+### Search by title, description and task id
 
-### Живой лог
+![Search: the list narrowed down to one task](docs/search.png)
 
-Правая панель — хвост `~/.hermes/kanban/logs/<task_id>.log` (для именованной доски —
+Above the task list sits a search box. The filter fires **on every keystroke**: no Enter,
+no debounce.
+
+- it searches the **title**, the **description** (`tasks.body`) and the **task id**,
+  case-insensitively;
+- the **id (`t_2d2e4f8f`) matches on a substring**, not exactly: people type ids from
+  memory and paste them in pieces, so `t_2d2e` finds the card `t_2d2e4f8f`. The id needs
+  no index — the hit shows up on the very first keystroke, without waiting for `/board`;
+- the description comes from the bundled plugin's `/board` route — the only route that
+  returns the body in full (the card list carries a 200-character preview). The index is
+  built once per board and cached, so typing never waits on the network;
+- while the query is non-empty the index is refreshed every 15 s — an edited description
+  or a new card does not stay invisible to search;
+- an empty result is spelled out on its own line (“nothing found for ‘…’”), so it cannot
+  be mistaken for an empty board;
+- the cross on the right of the box clears the query.
+
+### Live log
+
+The right pane is the tail of `~/.hermes/kanban/logs/<task_id>.log` (for a named board —
 `…/kanban/boards/<board>/logs/`).
 
-- догружается инкрементально и **автопрокручивается вниз, пока вы не прокрутили вверх**;
-- размер показан **точными байтами** («740 029 Б»), а не округлёнными мегабайтами:
-  окно лога осмысленно только рядом с истинным размером файла. Человекочитаемый вид
-  остался в подсказке;
-- **«развернуть ⤢»** убирает `tail` — роут отдаёт весь файл с байта 0. Над окном
-  появляется пометка «начало файла отсечено (показан хвост)», кнопка превращается
-  в «свернуть ⤡»;
-- в развёрнутом виде лимит строк выше (40 000 вместо 3 000) — окно растёт от начала
-  файла, а не с хвоста;
-- **состояние скролла запоминается на задачу**: были прижаты к низу — вернётесь к низу,
-  читали определённое место — вернётесь к тому же отступу, и автопрокрутка не будет
-  дёргать (появится кнопка «Вниз ↓»);
-- пока первый кусок грузится — прелоадер, а не надпись «файла лога пока нет».
+- it loads incrementally and **auto-scrolls down as long as you have not scrolled up**;
+- the size is shown in **exact bytes** (“740 029 B”), not in rounded megabytes: the log
+  window only means something next to the true file size. The human-readable form stays
+  in the tooltip;
+- **“expand ⤢”** drops `tail` — the route returns the whole file from byte 0. A note above
+  the window says “start of file cut off (tail shown)”, and the button becomes
+  “collapse ⤡”;
+- the expanded view has a higher line limit (40 000 instead of 3 000) — the window grows
+  from the start of the file rather than from the tail;
+- **the scroll position is remembered per task**: if you were pinned to the bottom you
+  come back to the bottom; if you were reading a particular spot you come back to the same
+  offset, and auto-scroll will not yank you (a “Down ↓” button appears);
+- while the first chunk is loading you get a preloader, not the “no log file yet” line.
 
-### Живой транскрипт
+### Live transcript
 
-Вторая вкладка правой панели — **живой транскрипт карточки**: что говорит агент и
-что отвечают его инструменты. Каждое сообщение — блок с ролью и временем
-(`--- assistant #63846`), тело — в моноширинном блоке.
+The second tab of the right pane is the **live transcript of the card**: what the agent
+says and what its tools answer. Every message is a block with the role and time
+(`--- assistant #63846`), the body in a monospaced block.
 
-Зачем он нужен: начиная с **v0.22.3** карточку выполняет **owner-гейтвей
-профиля**, а диспетчер поднимает только тонкого клиента, который ждёт receipt.
-Клиент пишет в лог карточки **одну строку** (`Session: local-<sha256>`) — то
-есть файл лога, который раньше БЫЛ полным транскриптом, теперь почти пуст, хотя
-работа идёт полным ходом. Транскрипт при этом никуда не делся: он лежит в
-**сторе профиля-владельца**, и карточка указывает на него событием
-`owner_admitted` (в payload — `session_id` и путь к стору).
+Why it is needed: from **v0.22.3** on, a card is executed by the **profile's owner
+gateway**, and the dispatcher only starts a thin client that waits for a receipt. That
+client writes **one line** into the card's log (`Session: local-<sha256>`) — so the log
+file that used to BE the full transcript is now almost empty, even though the work is in
+full swing. The transcript has not gone anywhere: it lives in the **owner profile's
+store**, and the card points at it with the `owner_admitted` event (its payload carries
+`session_id` and the store path).
 
-- **новый режим** (owner исполняет карточку): транскрипт берётся из стора
-  профиля-владельца — это и есть настоящий текст работы карточки;
-- **старый режим** (карточку выполнял отдельный процесс воркера): транскрипт
-  остался в логе, и панель прямо говорит об этом и отсылает на вкладку «лог»;
-- **вывод читаемый**: tool-результат в сторе лежит JSON-обёрткой
-  (`{"output": "…"}`), и в таком виде читатель видел скобки, кавычки и переводы
-  строк, написанные двумя символами `\n`. Панель разворачивает обёртку и
-  показывает сам payload — с **настоящими переводами строк**. Если payload
-  структурный (объект/массив), он печатается построчно, а не как одна строка
-  JSON; хвост после JSON-документа (например, контекст найденного
-  подкаталога) сохраняется;
-- **рассуждения агента видны** — то, что раньше стримилось в лог воркера. В
-  новой схеме это отдельная колонка стора, и панель показывает её блоком
-  «рассуждения» под сообщением;
-- **рассуждения раскрыты все и всегда** — каждый блок открыт по умолчанию,
-  без клика на каждый ход. Раньше в логе рамка `┌─ Reasoning ─┐` печаталась
-  в потоке и была открыта, так что закрывать её вручную не нужно: блок
-  раскрывается при появлении и остаётся раскрытым. Перерисовка панели
-  (опрос живой ленты) его не закрывает, но и не открывает заново — читатель
-  может свернуть рассуждение сам, и оно останется свёрнутым;
-- **рассуждения не обрезаются** — блок размышления приходит из стора целиком
-  и показывается целиком. Раньше он обрезался на 4000 символах, и рядом
-  стояла пометка «обрезано»; обрезанное рассуждение говорит не то, что
-  думала модель, поэтому лимит снят. **Обычные** сообщения и вывод
-  инструментов по-прежнему ограничены — там пометка «обрезано» остаётся;
-- **шаги не от агента свёрнуты** — всё, что не assistant (реплика
-  пользователя, ответ инструмента), показано свёрнутым блоком с короткой
-  сводкой; раскрыть его можно кликом. Транскрипт — в основном вывод
-  инструментов, и открытые блоки забивают то самое рассуждение, ради
-  которого его и открывают; собственный ход агента (его сообщения,
-  рассуждения и вызовы инструментов) остаётся раскрытым;
-- **живая полоса сверху** — что агент делает **прямо сейчас** и след запуска.
-  Транскрипт — это **история**: строка сообщения появляется, когда
-  завершился вызов модели, который её породил, поэтому между двумя
-  сообщениями (а вызов на локальной модели идёт десятки секунд) панель
-  выглядит замершей, хотя агент работает. Полоса показывает:
-  - **активность сессии** из стора — то, что owner-гейтвей пишет
-    mid-turn: `receiving stream response`, `terminal command running (40s
-    elapsed)`, `context compression in progress`, плюс счётчики вызовов
-    модели и инструментов, модель и возраст последней активности;
-  - **след запуска** — строки журнала профиля-владельца по этой сессии
-    (`agent.log` рядом со стором): вызовы модели с их задержкой и
-    токенами, отработавшие инструменты, сжатия контекста, ошибки.
-    Служебные строки («Re-anchored stale …») отфильтрованы, чтобы след
-    читался, а не превращался в шум.
+- **new mode** (the owner executes the card): the transcript comes from the owner
+  profile's store — that is the real text of the card's work;
+- **old mode** (a separate worker process executed the card): the transcript stayed in
+  the log, and the pane says so and points at the “log” tab;
+- **the output is readable**: a tool result in the store is wrapped in JSON
+  (`{"output": "…"}`), and in that shape the reader saw braces, quotes and line breaks
+  written as the two characters `\n`. The pane unwraps it and shows the payload itself —
+  with **real line breaks**. If the payload is structural (object/array) it is printed
+  line by line instead of as one JSON string; the tail after the JSON document (for
+  example the context of a found subdirectory) is preserved;
+- **the agent's reasoning is visible** — what used to stream into the worker log. In the
+  new scheme it is a separate column of the store, and the pane shows it as a
+  “reasoning” block under the message;
+- **every reasoning block is expanded, always** — each one is open by default, with no
+  click per turn. The log used to print a `┌─ Reasoning ─┐` frame inline and it was open,
+  so nothing has to be opened by hand: the block expands when it appears and stays
+  expanded. A pane re-render (the live-feed poll) neither closes it nor reopens it — the
+  reader may fold a reasoning block and it stays folded;
+- **reasoning is not truncated** — the thinking block comes from the store in full and is
+  shown in full. It used to be cut at 4000 characters with a “truncated” note next to it;
+  a truncated thought says something other than what the model thought, so the limit is
+  gone. **Ordinary** messages and tool output are still limited — their “truncated” note
+  remains;
+- **steps not from the agent are folded** — everything that is not an assistant turn (the
+  user's message, a tool answer) shows as a folded block with a short summary; a click
+  opens it. A transcript is mostly tool output, and open blocks drown out the very
+  reasoning people open it for; the agent's own turn (its messages, reasoning and tool
+  calls) stays expanded;
+- **a live strip on top** — what the agent is doing **right now**, plus the run trail.
+  The transcript is **history**: a message line appears when the model call that produced
+  it has finished, so between two messages (and a call on a local model takes tens of
+  seconds) the pane looks frozen while the agent is working. The strip shows:
+  - the **session activity** from the store — what the owner gateway writes mid-turn:
+    `receiving stream response`, `terminal command running (40s elapsed)`,
+    `context compression in progress`, plus the model and tool call counters, the model
+    and the age of the last activity;
+  - the **run trail** — the owner profile's log lines for this session (`agent.log` next
+    to the store): model calls with their latency and tokens, tools that ran, context
+    compressions, errors. Service lines (“Re-anchored stale …”) are filtered out so the
+    trail reads instead of turning into noise.
 
-  Полоса **прилипает к верху** панели: панель прокручена к хвосту, и без
-  `position: sticky` полоса уезжала на десятки тысяч пикселей вверх и была
-  не видна вовсе. След запуска — короткое окно с прокруткой, прижатое к
-  своей новейшей строке; если читатель прокрутил след вверх сам, полоса
-  больше не перетягивает его вниз.
+  The strip **sticks to the top** of the pane: the pane is scrolled to the tail, and
+  without `position: sticky` the strip rode tens of thousands of pixels up and was not
+  visible at all. The run trail is a short scrolling window pinned to its newest line; if
+  the reader scrolled the trail up themselves, the strip no longer pulls them back down;
+- **reasoning in the stream** — the last block of the list updates before your eyes: the
+  tokens of the current model call arrive in the plugin from the core
+  (`on_stream_start` / `on_stream_delta` / `on_stream_end`) and are collected in the owner
+  profile's `plugin-data`, and the pane shows them as a separate block under the history.
+  The transcript is history (an assistant line appears on the BOUNDARY of a call), so
+  until now the pane looked frozen between two messages; now you can see the model think
+  in between. The block is labelled `--- assistant (stream)`, its header says “writing…”
+  and the call number; when the call is over it shows “answer finished” for a few seconds
+  and then gives way to the same line, already arrived from the store.
 
-  **Чего полоса не делает:** она не показывает рассуждения *в потоке*. В
-  новой схеме рассуждение пишется в стор **вместе с готовой строкой
-  ассистента** — отдельной «живой» записи рассуждений в сторе нет (проверено
-  опросом живой сессии: существующие строки не меняются на месте, заглушек
-  «в полёте» в сторе нет). Поток по токенам раньше был виден потому, что лог
-  карточки был stdout'ом отдельного CLI-процесса, который печатал рамку
-  `┌─ Reasoning ─┐` по мере поступления токенов; сейчас карточку исполняет
-  owner-гейтвей, и печатать рамку больше некому. Поэтому рассуждение
-  появляется в транскрипте на границе вызова модели, а полоса показывает, что
-  агент в этот момент делает;
-- **ход агента виден**: у сообщения-ассистента, который только вызывал
-  инструменты, тело пустое (вызовы лежат в своей колонке) — панель показывает
-  сами вызовы («→ terminal …»), иначе такая строка выглядела бы пустой;
-- **опрос идёт только пока вкладка открыта** (как и вкладка «основное»): чтение
-  стора дёшево, а вот отрисовка сотен сообщений раз в 2 с отбирала бы кадры у
-  той вкладки, которую читают. Вкладка грузится при открытии и остаётся живой,
-  пока открыта;
-- опрос — раз в **2 с**, сообщения догружаются по монотонному `id` (курсор),
-  так что панель только растёт и ничего не перечитывает заново;
-- **автопрокрутка вниз**, пока вы не прокрутили вверх (как у лога), с кнопкой
-  «Вниз ↓». Прижатие к низу происходит **после отрисовки** новых сообщений, а
-  не в момент ответа — иначе панель осталась бы на экран позади последнего
-  сообщения. Режим прокрутки **свой у каждой карточки»: прокрутив вверх на
-  одной, вы не «распираете» следующую — она открывается со своего хвоста и
-  следует за ним. Панель переприжимается к хвосту каждые 0,5 с, так что
-  подхватывает и рост содержимого, не добавляющего сообщений;
-- в DOM держится не больше **500 последних сообщений**: курсор при этом
-  проходит по **всем** id, так что ничего не пропускается — просто старые
-  сообщения уходят из вида;
-- содержимое tool-сообщений обрезается до **4000 символов**, и обрезка
-  помечена в шапке сообщения — молчаливого обрезания нет;
-- в шапке панели — session id и путь к стору, из которого читалось.
+  The stream **requires two settings in the owner profile**: the plugin enabled in
+  `plugins.enabled` (otherwise its hooks are not subscribed) and
+  `plugins.stream_reasoning_deltas: true` (without it the core does not broadcast
+  reasoning to stream subscribers, and only visible text arrives). If the setting is
+  missing the pane does not go silent: the block says what is missing and names the
+  profile. If the agent simply is not calling the model right now, it says that honestly
+  too instead of showing emptiness;
 
-Роут `GET /api/plugins/hermes-logs-viewer/transcript?board=…&task_id=…&after=…&limit=…`
-читает **только** (`mode=ro`) и никогда не пишет в БД. Если доски, события или
-сессии нет — ответ `source: "none"` с пустым списком, а не 500.
+  What the block **does not do:** it does not stay in the list as history. The live block
+  describes ONE current call: the next call overwrites it, and by then the previous text
+  is already in the store as its own line;
+- **the strip collapses** with the “collapse” button in its header: one line remains —
+  what the agent is doing and whether the stream is running — while the run trail and the
+  counters hide (their full text stays in the tooltip). The choice is stored in
+  `localStorage` and applies to every card: it is a reading preference, not a property of
+  the task. The same button expands it again;
+- **the agent's turn is visible**: an assistant message that only called tools has an
+  empty body (the calls live in their own column) — the pane shows the calls themselves
+  (“→ terminal …”), because otherwise such a line would look empty;
+- **polling runs only while the tab is open** (same as the “main” tab): reading the store
+  is cheap, but rendering hundreds of messages every 2 s would steal frames from the tab
+  being read. The tab loads when opened and stays live while open;
+- the poll runs every **2 s**, and messages are fetched by monotonic `id` (a cursor), so
+  the pane only grows and never re-reads anything;
+- **auto-scroll down** until you scroll up (like the log), with a “Down ↓” button. The
+  pin to the bottom happens **after** the new messages are rendered, not when the reply
+  arrives — otherwise the pane would stay a screen behind the last message. The scroll
+  mode is **per card**: scrolling up on one card does not push the next one down — it
+  opens at its own tail and follows it. The pane re-pins to the tail every 0.5 s, so it
+  also catches content growth that adds no messages;
+- the DOM holds at most the **last 500 messages**: the cursor still walks **all** ids, so
+  nothing is skipped — old messages simply leave the view;
+- tool message bodies are truncated at **4000 characters**, and the truncation is marked
+  in the message header — there is no silent cutting;
+- the pane header carries the session id and the store path that was read.
 
-### Вкладка «основное»: карточка задачи целиком
+The route `GET /api/plugins/hermes-logs-viewer/transcript?board=…&task_id=…&after=…&limit=…`
+**only** reads (`mode=ro`) and never writes to the DB. If the board, the events or the
+sessions are missing, the answer is `source: "none"` with an empty list, not a 500.
 
-![Вкладка с редактированием описания — на снимке она ещё называлась «дескрипшен»](docs/description.png)
+### Main tab: the whole task card
 
-Третья вкладка правой панели — вся карточка в одном месте: заголовок, шапка,
-приоритет, состояние и тело задачи. Раньше эти вещи были размазаны по двум
-вкладкам («дескрипшен» и «прочее»): чтобы поменять состояние, надо было
-переключиться на соседнюю вкладку, а тело и заголовок правились в третьей.
-Теперь всё, что можно менять у карточки, лежит рядом, и вкладка называется
-**«основное»**.
+![The tab with the description editor — in the screenshot it was still called “дескрипшен”](docs/description.png)
 
-> Снимок выше сделан до слияния вкладок — на нём ещё старое имя «дескрипшен».
-> Переснять его нельзя без разрешения владельца репозитория (см. «Скриншоты»),
-> поэтому картинка остаётся прежней, а подпись говорит, что на ней изображено.
+The last tab of the right pane holds the whole card in one place: the title, the header,
+the priority, the state and the body of the task. These things used to be spread over two
+tabs (“дескрипшен” and “прочее”): changing the state meant switching to the neighbouring
+tab, while the body and the title were edited in a third one. Now everything that can be
+changed on a card sits together, and the tab is called **“main”**.
 
-Почти все правки идут через `PATCH /api/plugins/kanban/tasks/{id}` встроенного
-плагина, поэтому для них новый роут не нужен и вкладка работает без
-перезапуска дашборда. Исключение — «время выполнения» (см. ниже): у
-встроенного плагина это поле есть только при создании карточки.
+> The screenshot above was taken before the tabs were merged — it still shows the old name
+> “дескрипшен”. It cannot be re-shot without the repository owner's permission (see
+> “Screenshots”), so the picture stays as it is and the caption says what it depicts.
 
-- **Заголовок** правится **карандашом рядом с ним**: `✎` открывает поле,
-  `✓` сохраняет, `✕` отменяет. **Enter** — сохранить, **Esc** — отменить.
-  Пустой заголовок **отклоняется** («заголовок не может быть пустым») — карточка
-  не остаётся с безымянной заготовкой;
-- **Описание** правится кнопкой «редактировать» — она превращает текст в
-  textarea; сохранение — `PATCH` с `{body}`. **Ctrl/Cmd+Enter** — сохранить,
-  **Esc** — отменить;
-- **Приоритет** правится карандашом рядом со значением (Ctrl+Enter — сохранить,
-  Esc — отмена). Нечисловое значение отклоняется с объяснением, а не молча
-  превращается в 0 поверх настоящего приоритета;
-- **Карандаш стоит справа от значения, которое правит** — у числа приоритета и
-  у заголовка, на той же строке. Так он читается как «этот карандаш правит это
-  число», а не как отдельная кнопка рядом;
-- **Состояние** — кнопки по одному на статус, который роут действительно
-  принимает: `triage`, `todo`, `ready`, `scheduled`, `blocked`, `review`, `done`,
-  `archived`. Кнопка текущего состояния **неактивна**: PATCH в то же самое
-  состояние — no-op, который всё равно пишет событие;
-- **`running` кнопки нет намеренно** — роут отвечает на него 400
-  («Cannot set status to 'running' directly», #19535): в `running` карточка
-  попадает только через claim диспетчера. Предлагать кнопку, которая может
-  только отказать, незачем;
-- **`done`, `blocked`, `archived` спрашивают подтверждение** — они отпускают
-  claim воркера. Ровно эти три подтверждает и встроенная вкладка;
-- **Отказ маршрута виден пользователю.** Например, `complete_task` не даёт
-  завершить карточку без `result`/`summary`
-  (`completion blocked: … has no result or summary evidence`) — панель показывает
-  этот текст, а не делает вид, что переход состоялся;
-- **Время выполнения** правится карандашом рядом со значением, в **минутах**.
-  Это таймаут, после которого диспетчер снимает воркера с карточки. В
-  строчном виде у него два лица: `∞` — ограничения нет, и число — сколько
-  минут отдано. **0 минут = без ограничения** (в базе это `NULL`, а не ноль
-  секунд: ноль секунд означал бы «снять немедленно»). Правка пишет
-  `tasks.max_runtime_seconds` и сразу действует на **текущую** карточку:
-  диспетчер читает эту колонку при каждой проверке, поэтому понижение лимита
-  обрывает уже идущий запуск, а не только следующий.
+Almost every edit goes through `PATCH /api/plugins/kanban/tasks/{id}` of the bundled
+plugin, so no route of our own is needed and the tab works without restarting the
+dashboard. The exception is “execution time” (see below): the bundled plugin only accepts
+that field when a card is created.
 
-  Этот параметр встроенный плагин умеет принять только при **создании**
-  карточки — в его `PATCH /tasks/{id}` поля `max_runtime_seconds` нет. Поэтому
-  здесь нужен свой роут: `PATCH /api/plugins/hermes-logs-viewer/tasks/{id}/runtime`
-  (тело — `{max_runtime_seconds}`, где `0` и `null` означают «без
-  ограничения»). Роут пишет колонку в транзакции и пишет событие правки.
+- **The title** is edited **with the pencil next to it**: `✎` opens the field, `✓` saves,
+  `✕` cancels. **Enter** saves, **Esc** cancels. An empty title is **refused** (“title
+  cannot be empty”) — a card is never left with a nameless stub;
+- **The description** is edited with the “редактировать” (“edit”) button, which turns the
+  text into a textarea; saving is a `PATCH` with `{body}`. **Ctrl/Cmd+Enter** saves,
+  **Esc** cancels. The editor opens **tall** (360 px by default, `resize: vertical` to
+  grow it further): the description is the one field people write paragraphs into, and a
+  short box showed four lines of it above the fold;
+- **The priority** is edited with the pencil next to the value (**Enter** saves, Esc
+  cancels; Ctrl+Enter works too). A non-numeric value is refused with an explanation
+  instead of silently becoming 0 over a real priority;
+- **The executor** is edited the same way, but its editor is a **combobox of installed
+  profiles** rather than a free-text field: a typo in a profile name leaves the card in
+  `ready` with nobody to run it. The list is the same one the create form offers, plus an
+  explicit “— не назначен —” (unassigned) entry, which is how a card is unassigned. The
+  write is the same bundled `PATCH` (`assignee`, an empty string clears it). If the card's
+  current executor is a profile that is no longer installed, it is kept as an option
+  marked “(не установлен)” so the closed control shows the real value instead of the first
+  entry of the list. **Enter** saves, **Esc** cancels;
+- **The pencil sits to the RIGHT of the value it edits** — next to the priority number,
+  the title, the runtime and the executor, on the same line. That is how it reads as
+  “this pencil edits this value” instead of as an unrelated button nearby;
+- **The state** — one button per status the route actually accepts: `triage`, `todo`,
+  `ready`, `scheduled`, `blocked`, `review`, `done`, `archived`. The button of the current
+  state is **disabled**: a PATCH to the same state is a no-op that still writes an event;
+- **there is deliberately no `running` button** — the route answers 400 for it (“Cannot
+  set status to 'running' directly”, #19535): a card only gets into `running` through the
+  dispatcher's claim. There is no point offering a button that can only refuse;
+- **`done`, `blocked` and `archived` ask for confirmation** — they release the worker's
+  claim. Exactly these three are confirmed by the bundled tab as well;
+- **a route's refusal is visible to the user.** For example, `complete_task` refuses to
+  finish a card without `result`/`summary`
+  (`completion blocked: … has no result or summary evidence`) — the pane shows that text
+  instead of pretending the transition happened;
+- **Execution time** is edited with the pencil next to the value, in **minutes**. It is the
+  timeout after which the dispatcher takes the worker off the card. In its inline form it
+  has two faces: `∞` — no limit, and a number — how many minutes were granted. **0 minutes
+  = no limit** (in the database that is `NULL`, not zero seconds: zero seconds would mean
+  “stop immediately”). The edit writes `tasks.max_runtime_seconds` and affects the
+  **current** card at once: the dispatcher reads that column on every check, so lowering
+  the limit cuts an already running attempt short, not just the next one.
 
-  **Из-за этого вкладка «основное» перестаёт работать без перезапуска
-  дашборда:** свой `plugin_api.py` монтируется при старте процесса, и новый
-  роут доезжает до браузера только после рестарта. Остальные правки
-  вкладки идут через встроенный `PATCH` и остаются живыми всегда.
+  The bundled plugin only accepts this parameter when a card is **created** — its
+  `PATCH /tasks/{id}` has no `max_runtime_seconds` field. That is why a route of our own is
+  needed here: `PATCH /api/plugins/hermes-logs-viewer/tasks/{id}/runtime` (body —
+  `{max_runtime_seconds}`, where `0` and `null` mean “no limit”). The route writes the
+  column in a transaction and records an `edited` event.
 
-Шапка карточки: заголовок, бейдж статуса, аджайник, воркспейс и лимит времени
-(`∞`, если 0 = бесконечно).
+  **Because of this the “main” tab stops working without a dashboard restart:** our own
+  `plugin_api.py` is mounted at process start, and a new route only reaches the browser
+  after a restart. The rest of the tab's edits go through the bundled `PATCH` and are
+  always live.
 
-**Открытый редактор не затирает опрос.** Описание обновляется раз в 5 с, и
-раньше проверка «не затирать открытый редактор» читала `descEdit` из замыкания
-эффекта, который намеренно не depend от этой переменной (иначе опрос
-перезапускался бы на каждом нажатии) — значение было заморожено на `false`
-с момента открытия вкладки, и каждый тик подставлял в textarea тело с
-сервера. Текст пропадал через 5 с, а на карточке с пустым описанием поле
-просто гасло. Теперь флаг читается через ref: актуальное значение, опрос
-сохраняет свою частоту. То же — для заголовка и приоритета.
+The card header: title, status badge, assignee, workspace and the time limit (`∞` when 0 =
+infinite).
+
+**An open editor is not overwritten by the poll.** The description is refreshed every 5 s,
+and the “do not clobber an open editor” check used to read `descEdit` from the effect's
+closure, which deliberately does not depend on that variable (otherwise the poll would
+restart on every keystroke) — the value was frozen at `false` since the tab was opened, and
+every tick pushed the server's body into the textarea. The text vanished within 5 s, and on
+a card with an empty description the field simply went blank. The flag is now read through
+a ref: the current value, and the poll keeps its cadence. The same goes for the title, the
+priority, the runtime and the executor.
 
 
-### Комментарии
+### Comments
 
-Вкладка «комментарии» — живая переписка по задаче: воркер пишет комментарии во время
-работы, они появляются в треде без перезагрузки. Свои комментарии можно отправлять
-из композера; на успешную отправку тред перечитывается сразу, не дожидаясь опроса.
+The “comments” tab is the live thread of the task: the worker writes comments while it
+works, and they appear in the thread without a reload. You can post your own comments from
+the composer; after a successful post the thread is re-read at once, without waiting for
+the poll.
 
-Отправка идёт **встроенным маршрутом** `POST /api/plugins/kanban/tasks/{id}/comments`,
-а не собственным роутом плагина: встроенный роутер смонтирован при старте процесса и
-живёт без перезагрузки дашборда (тот же довод, что для списка задач, лога и правок).
-Собственный `POST /tasks/{id}/comments` тоже работает, но привязан к старту процесса —
-и 2026-10-26 отправка сломалась именно на нём: у асинхронной обёртки потерялся
-`return await asyncio.to_thread(_run)`, обработчик отдавал `200 null` и ничего не писал,
-при этом чтение треда (GET) осталось рабочим — поэтому «отображение работает, отправка
-нет». Обе стороны закрыты тестами (`tests/test_transcript.py`, `tests/render_test.js`).
+Posting goes through the **bundled** route `POST /api/plugins/kanban/tasks/{id}/comments`,
+not through the plugin's own route: the bundled router is mounted at process start and
+lives without a dashboard reload (the same argument as for the task list, the log and the
+edits). The plugin's own `POST /tasks/{id}/comments` works too, but it is tied to process
+start — and on 2026-10-26 posting broke exactly on it: the async wrapper had lost its
+`return await asyncio.to_thread(_run)`, the handler answered `200 null` and wrote nothing,
+while reading the thread (GET) kept working — hence “display works, sending does not”. Both
+sides are covered by tests (`tests/test_transcript.py`, `tests/render_test.js`).
 
-### Новая задача
+#### Delivery state of a comment, and deleting one
 
-![Окно «Новая задача»](docs/new-task.png)
+Every comment carries a chip on its head line, because a comment is not the same thing
+before and after the worker reads it:
 
-Кнопка «+ Новая задача» в шапке открывает форму:
-
-| поле | что это |
+| chip | meaning |
 | --- | --- |
-| Заголовок | обязательное, **Enter** — создать |
-| Описание | тело карточки |
-| Профиль | select из установленных профилей; **обязателен** |
-| Приоритет | число, 0 = по умолчанию; выше — dispatcher берёт раньше |
-| Время, мин | лимит времени воркера **в минутах**; **0 = бесконечно** |
-| Состояние | `ready` (по умолчанию) / `todo` / `scheduled` / `triage` / `blocked` |
-| Доска | любая доска из списка; **обязательна, выбирается явно** |
-| Проект | **все проекты профиля**, с пометкой доски; свои — первыми; пусто = карточка без проекта; **открывается после выбора доски** |
-| Воркспейс | `scratch` / `dir` / `worktree` + путь; **открывается после выбора доски** |
+| **не доставлен** (yellow) | no worker has read this text yet |
+| **агент видел** | the text is already in the worker's context |
+| **от воркера** | the comment was written by the card's own assignee — the worker's own output |
+| **доставка ?** | the card ran, but its transcript could not be checked — an unreadable store, or a run of the pre-v0.22.3 child-process scheme (the text went to the worker's log, not to a store) |
 
-Девять решений, которые стоит знать:
+The `✕` button deletes the comment (and the `commented` row it left in the activity feed).
+What the chip says decides what that deletion *means*:
 
-- **Доска и профиль — обязательные.** Пока не выбраны, оба комбобокса обведены
-  красным, а кнопка «создать» неактивна. Выбранное значение снимает красную
-  рамку.
-- **Профиль обязателен, потому что без него карточка не выполняется.**
-  Диспетчер берёт из полосы `ready` только карточки с назначенным профилем
-  (`kanban_db_dispatch._lane_rows` + `_dispatch_lane_task`); неназначенная
-  карточка лежит в `ready` и ждёт вечно. На живом дашборде это видно в логе
-  gateway: «kanban dispatcher stuck: ready queue non-empty for N consecutive
-  ticks but 0 workers spawned». Если у вас настроен
-  `kanban.default_assignee`, неназначенные карточки всё же забираются — но это
-  настройка оператора, а не выбор формы, поэтому полагаться на неё нельзя.
-- **Доска требуется явно.** Форма открывается с пустым значением и без выбранной
-  доски не создаётся — задача не может молча упасть на `default` или на доску,
-  случайно оставленную в фильтре шапки.
-- **Воркспейс заблокирован, пока не выбрана доска.** Он выводится из доски
-  (`default_workdir` + `default_workspace_kind`), и выбор доски его
-  перезаписывает. Если бы поле было активно раньше, любой выбор пользователя
-  молча пропал бы через одно нажатие. Поэтому `select` и путь помечены
-  `disabled`, под полем стоит подсказка «доска не выбрана — воркспейс станет
-  доступен», а в `title` — «сначала выберите доску».
-- **Время в минутах, а API в секундах.** Поле «Время, мин» — это то, в чём человек
-  планирует; в БД уходит `max_runtime_seconds`, поэтому конвертация
-  (`минуты × 60`) делается один раз при отправке. 30 в поле = 1800 секунд лимита.
-  В форме это проверяется сквозным тестом, а не только на глаз.
-- **Вид воркспейса: доска задаёт базу, проект с репозиторием — перекрывает.** Стоит
-  выбрать доску, форма берёт её `default_workspace_kind` — `worktree`, если
-  каталог доски внутри git-репозитория, иначе `dir`, без каталога — `scratch`.
-  **Если выбран проект, у которого `primary_path` — git-репозиторий, вид
-  становится `worktree`**, даже если доска предлагала `dir`. Это важно для доски
-  `ff`: её `default_workdir` — контейнер `/home/alexander/src/ff`, а не
-  репозиторий, поэтому её `default_workspace_kind` всегда `dir`, и без этого
-  правила ни один её проект не предложил бы worktree, хотя ветки там создаются
-  прекрасно. Проект **без** репозитория оставляет вид как у доски.
-  Правило реализовано в `kindForProject` и действует только на значение **по
-  умолчанию** — вид всегда можно переключить руками. Смена доски пересчитывает вид
-  по доске, а затем, если проект остался выбран, применяет правило проекта.
-  Полная таблица пар «вид × наличие проекта» — ниже.
-- **Создание идёт через API встроенного плагина kanban**, поэтому карточка
-  неотличима от созданной во вкладке Kanban: своя строка в БД, событие `created`,
-  резолв воркспейса и проекта доски.
-- **`todo`, `scheduled` и `blocked` не создаются «из коробки»** — карточка сначала
-  появляется в `ready`, а потом переводится тем же `PATCH`, которым встроенная
-  вкладка двигает карточку перетаскиванием. Если перевод не прошёл с первой
-  попытки, плагин пробует ещё раз; если и это не помогло — **пишет в шапку, в
-  каком состоянии карточка на самом деле**, вместо молчаливого «создано».
-- **`scheduled` — это «отложена, но не сломана».** Карточка в этом состоянии
-  ждёт времени, а не человека: dispatcher её **не берёт** (в его полосах только
-  `ready` и `review`), claim с неё снимается, а вернуть её в работу можно
-  переводом в `ready` — ровно так же, как это делает встроенная вкладка
-  кнопкой «→ scheduled».
+- **не доставлен** — deleting really cancels the delivery. The row disappears before the
+  next poll, so the worker never sees it. This is the case the operator asked for: a
+  comment posted by mistake can be taken back.
+- **агент видел** — deleting only rewrites the record. The text is already in the agent's
+  context and will not be taken out of it, so the confirmation says exactly that, and the
+  **route refuses with `409`** unless `force=1` is passed. The UI asks the second, narrower
+  question and retries with `force=1`.
+- **от воркера** / **доставка ?** — deleting is allowed after a confirmation that states the
+  case; there is no delivery to cancel.
 
-#### Проект: список и якоря
+How “did the agent see it” is answered — not by guessing. A comment reaches a worker by one
+of two paths, and **both leave its text in the worker's session store**:
 
-**Проект не обязан быть привязан к доске.** `projects.board_slug` — это nullable
-колонка, и она означает «где проект используется», а не «где ему можно
-использоваться»:
+1. **spawn** — `kanban_db.build_worker_context` renders the thread into the worker's first
+   prompt (`## Comment thread`, and `kanban_db_context._ctx_comments` writes
+   `comment from worker \`<author>\` at <stamp>:` followed by the body);
+2. **mid run** — the live bridge `tools.kanban_tools.inject_new_comments_from_env` polls
+   every ~6 s at a tool boundary and steers the worker with “New note on your kanban task
+   from the operator (delivered mid-run)…”, one `- <author>: <body>` line per comment.
 
-- проект, созданный без `--board`, имеет `board_slug = NULL` — и под фильтром
-  «проекты этой доски» он был бы недостижим **на всех** досках сразу;
-- `kanban_db._resolve_project_link` **никак не проверяет принадлежность доске**,
-  поэтому карточку с проектом другой доски создать можно и нужно. Фильтр по
-  доске запрещал бы легальный вызов.
+So the backend (`_comment_delivery`) reads the stores of **every** `owner_admitted` session
+of the card — the same stores the transcript tab reads, `mode=ro` — and looks for the
+comment's text in the user/system turns. Found ⇒ delivered (the channel and the moment are
+reported too); absent from every session of a card that has run ⇒ not delivered yet.
 
-Поэтому список — **все проекты профиля**, упорядоченные по принадлежности:
+A card from the **pre-v0.22.3 scheme** has no owner session at all: the worker was a child
+process and its **log** (`<board>/logs/<task>.log`) was the transcript. For those the same
+search runs over the log. Two consequences, and they are stated in the chip rather than
+hidden: text found in the log ⇒ “агент видел”; text missing ⇒ “доставка ?”, *not* “не
+доставлен”, because that log is one file per task and every attempt rewrites it — an
+earlier attempt may well have read the comment. Only a comment written after the last
+attempt ended is provably unread, and only that one is reported as pending.
 
-1. проекты, привязанные к **этой** доске;
-2. проекты, привязанные к **другой** доске;
-3. непривязанные (`board_slug` пуст).
+The comparison drops **all whitespace** on both sides: a log wraps and hyphen-breaks long
+text (`и поч / ему-то`), and a plain substring search would read a comment the worker
+clearly saw as “not delivered”. Two further honest limits: the spawn prompt **truncates** a
+long comment (`_ctx_cap`), which is why only the first 160 characters are searched; and a
+heavily compacted session may no longer carry old text — both would read as “not
+delivered”. A card that never ran has no transcript at all, and every comment on it is
+`pending` — which is simply true.
 
-Каждый вариант помечен принадлежностью, иначе выбор нечитаем:
-`FF Front · ff`, `Hyper-Cube · hypercube`, `Что-то ещё · без доски`. Под полем
-пишется, сколько из них относится к другой доске. Поле заблокировано, пока не
-выбрана доска: без неё нечего сортировать. Пустое значение = карточка без проекта.
+Deletion is the plugin's own route (`DELETE /tasks/{id}/comments/{cid}`), not the bundled
+one: the bundled kanban plugin has no delete at all. It writes in one transaction, removes
+the paired `commented` event (matched by `created_at` + `author` + body length), and scopes
+both statements by `task_id`, so a comment id cannot be deleted through someone else's card.
 
-**Смена доски выбор не сбрасывает** — проект остаётся выбранным и переанкоривает
-путь на новой доске. Сбрасывается только проект, **исчезнувший из списка**
-(например, архивнутый посреди заполнения формы): в payload не должен уйти
-`id`, которого больше нет.
+### The runs tab: run history
 
-Проект — это **якорь**, и `kanban_db._resolve_project_link` трактует его по-разному
-в зависимости от вида воркспейса. Форма следует за ядром, иначе карточка выполнится
-не там, где показал селектор. Полная таблица — вид × наличие проекта:
+The attempt history used to be visible only in the bundled plugin (in the card's drawer)
+and was absent from this pane altogether. Now it is a **separate tab**: one row per attempt
+to take the card by a worker (`task_runs`).
 
-| воркспейс | проект выбран | проект не выбран |
+What a row carries:
+
+- **the outcome** — the word the dispatcher recorded (`completed`, `blocked`, `crashed`,
+  `timed_out`, `reclaimed`, `review_requested`, …), or “running” while the run is not
+  closed. The colour of the left edge is only a second signal (green/yellow/red); the word
+  itself is printed on the row;
+- **who ran it** (`@profile`) and **how long it took** (`42s`, `7m`, `2.4h`);
+- **when** — “2d ago” with the exact `dd.mm hh:mm` in the tooltip, plus a line of facts:
+  start, end, time limit, worker pid;
+- **the handoff summary** in full, untruncated — that is what the tab is for: the worker
+  reports through it, and it lives in `task_runs.summary`;
+- **the error** of the run, if there was one;
+- **metadata** — in a collapsible block; short metadata (≤300 characters) is expanded at
+  once, long metadata is folded so that one attempt does not fill the whole pane.
+
+The order is **newest first** (the route returns attempts in start order, the pane flips it
+once when reading). The tab itself carries the **number of runs**.
+
+The data comes from the same bundled `GET /api/plugins/kanban/tasks/{id}` as “main”: the
+route returns a `runs` array, so **there is no route of our own** and no dashboard restart
+is needed. The poll runs every 5 s and **only while one of the three “card” tabs is open**
+(“main”, “runs”, “files”): it is the same request, and the log and comments do not pay for
+it.
+
+### The files tab: card attachments
+
+A separate tab for attachments — with upload, download and delete. Before it there were no
+attachments in the pane at all.
+
+- **Upload** — the button opens a file picker (multiple files are allowed); the files go
+  **one at a time, sequentially**, so that a partial failure names the file it stopped on;
+- **Download** — a click on the **file name** (the name is the button: you click what you
+  get). The download goes through `authedFetch` into a blob and is handed to the browser as
+  an object URL: a plain `<a href>` carries no authorisation in the dashboard's token mode
+  and would answer 401;
+- **Delete** — `✕` on the right of the row, with a confirmation: the file is removed from
+  the disk as well;
+- a row carries the size and who uploaded it when;
+- after an upload or a delete the card is **re-read at once**, without waiting for a poll
+  tick.
+
+All three operations go through **bundled** routes: `POST` and `GET`
+`/api/plugins/kanban/tasks/{id}/attachments`, `GET` and `DELETE`
+`/api/plugins/kanban/attachments/{id}`. The tab has no backend of its own — for the same
+reason as the others: the bundled router is mounted at process start and is always alive.
+
+An uploaded file sits next to the card (`stored_path` in the answer), and the worker reads
+it with ordinary file tools — the tab hides nothing in a separate storage.
+
+### New task
+
+![The “New task” dialog](docs/new-task.png)
+
+The “+ Новая задача” (“+ New task”) button in the header opens a form:
+
+| field | what it is |
+| --- | --- |
+| Title | required, **Enter** — create |
+| Description | the card's body |
+| Profile | a select of installed profiles; **required** |
+| Priority | a number, 0 = default; higher — the dispatcher takes it earlier |
+| Time, min | the worker's time limit **in minutes**; **0 = infinite** |
+| State | `ready` (default) / `todo` / `scheduled` / `triage` / `blocked` |
+| Board | any board from the list; **required, chosen explicitly** |
+| Project | **every project of the profile**, tagged with its board; own ones first; empty = a card without a project; **enabled after a board is picked** |
+| Workspace | `scratch` / `dir` / `worktree` + a path; **enabled after a board is picked** |
+
+Nine decisions worth knowing:
+
+- **The board and the profile are both required.** Until they are picked, both comboboxes
+  are outlined in red and the “create” button is disabled. A picked value removes the red
+  outline.
+- **The profile is required because the card is not executed without it.** The dispatcher
+  takes only cards with an assigned profile from the `ready` lane
+  (`kanban_db_dispatch._lane_rows` + `_dispatch_lane_task`); an unassigned card sits in
+  `ready` and waits forever. On a live dashboard that shows up in the gateway log: “kanban
+  dispatcher stuck: ready queue non-empty for N consecutive ticks but 0 workers spawned”.
+  If `kanban.default_assignee` is configured, unassigned cards are still taken — but that
+  is an operator setting, not a choice of the form, so it cannot be relied on.
+- **The board is required explicitly.** The form opens with an empty value and does not
+  create without a picked board — a task must not silently land on `default` or on the
+  board accidentally left in the header filter.
+- **The workspace is locked until a board is picked.** It is derived from the board
+  (`default_workdir` + `default_workspace_kind`), and picking a board overwrites it. If the
+  field were active earlier, any user's choice would silently disappear after one click.
+  So the `select` and the path are marked `disabled`, a hint under the field says “no board
+  picked — the workspace will become available”, and the `title` says “pick a board first”.
+- **Time is in minutes, the API in seconds.** The “Time, min” field is what a human plans
+  in; what goes to the DB is `max_runtime_seconds`, so the conversion (`minutes × 60`) is
+  done once on submit. 30 in the field = a 1800-second limit. In the form this is covered
+  by an end-to-end test, not only by eye.
+- **Workspace kind: the board sets the base, a project with a repository overrides it.**
+  Once a board is picked, the form takes its `default_workspace_kind` — `worktree` if the
+  board's directory is inside a git repository, otherwise `dir`, and `scratch` without a
+  directory. **If a project whose `primary_path` is a git repository is picked, the kind
+  becomes `worktree`**, even if the board suggested `dir`. This matters for the `ff` board:
+  its `default_workdir` is the container `/home/alexander/src/ff`, not a repository, so its
+  `default_workspace_kind` is always `dir`, and without this rule none of its projects would
+  offer a worktree although branches are created there perfectly well. A project **without**
+  a repository leaves the kind as the board's. The rule is implemented in `kindForProject`
+  and applies only to the **default** value — the kind can always be switched by hand.
+  Changing the board recomputes the kind from the board, and then, if a project is still
+  picked, applies the project rule. The full table of “kind × project present” pairs is
+  below.
+- **Creation goes through the bundled kanban plugin's API**, so the card is
+  indistinguishable from one created in the Kanban tab: its own row in the DB, a `created`
+  event, resolution of the workspace and of the board's project.
+- **`todo`, `scheduled` and `blocked` are not created “out of the box”** — a card first
+  appears in `ready` and is then moved by the same `PATCH` the bundled tab uses when a card
+  is dragged. If the move does not go through on the first attempt, the plugin tries once
+  more; if that fails too, it **writes into the header which state the card is actually
+  in** instead of a silent “created”.
+
+- **`scheduled` means “postponed, but not broken”.** A card in this state waits for a
+  time, not for a person: the dispatcher **does not take it** (its lanes only carry
+  `ready` and `review`), the claim is released, and it can be put back to work by moving
+  it to `ready` — exactly what the bundled tab does with the “→ scheduled” button.
+
+#### Project: the list and the anchors
+
+**A project does not have to be tied to a board.** `projects.board_slug` is a nullable
+column, and it means “where the project is used”, not “where it may be used”:
+
+- a project created without `--board` has `board_slug = NULL` — and under the “projects of
+  this board” filter it would be unreachable on **all** boards at once;
+- `kanban_db._resolve_project_link` **does not check board membership at all**, so a card
+  with a project of another board can and should be created. A board filter would forbid a
+  legal call.
+
+That is why the list is **every project of the profile**, ordered by membership:
+
+1. projects tied to **this** board;
+2. projects tied to **another** board;
+3. untied ones (`board_slug` empty).
+
+Every entry is tagged with its membership, otherwise the choice is unreadable:
+`FF Front · ff`, `Hyper-Cube · hypercube`, `Something else · без доски` (“без доски” = no
+board). Under the field it says how many of them belong to another board. The field is
+locked until a board is picked: without a board there is nothing to sort by. An empty value
+= a card without a project.
+
+**Changing the board does not reset the choice** — the project stays picked and re-anchors
+the path onto the new board. Only a project that **disappeared from the list** is reset
+(for example one archived halfway through filling the form): an `id` that no longer exists
+must not go into the payload.
+
+A project is an **anchor**, and `kanban_db._resolve_project_link` treats it differently
+depending on the workspace kind. The form follows the core, otherwise the card would run
+somewhere other than where the selector showed. The full table — kind × project present:
+
+| workspace | project picked | no project picked |
 | --- | --- | --- |
-| `dir` | `project_id` + `workspace_path = primary_path` проекта → путь **каталога проекта** | `workspace_path` = `board.default_workdir` |
-| `worktree` | `project_id`, **без `workspace_path`** → ядро само создаёт `<primary>/.worktrees/<task-id>` и ветку `<slug>/<task-id>-<title>` | `workspace_path` = `board.default_workdir`, ветка — случайная `wt/<id>` |
-| `scratch` | **ничего** (явный opt-out из проекта, #106342) → `project_id` = NULL | **ничего** → `project_id` = NULL |
+| `dir` | `project_id` + `workspace_path = primary_path` of the project → the **project directory** | `workspace_path` = `board.default_workdir` |
+| `worktree` | `project_id`, **no `workspace_path`** → the core itself creates `<primary>/.worktrees/<task-id>` and the branch `<slug>/<task-id>-<title>` | `workspace_path` = `board.default_workdir`, branch — a random `wt/<id>` |
+| `scratch` | **nothing** (an explicit opt-out of the project, #106342) → `project_id` = NULL | **nothing** → `project_id` = NULL |
 
-Итого по приоритету: **проект перекрывает доску** в строке `dir` (путь) и в
-строке `worktree` (путь убирается целиком, корень и ветку задаёт проект); в
-`scratch` проект не отправляется вовсе.
+In short, by priority: **a project overrides the board** in the `dir` row (the path) and in
+the `worktree` row (the path is dropped entirely, the root and the branch are set by the
+project); under `scratch` the project is not sent at all.
 
-Почему именно так — доска `ff` как контрпример. Её `default_workdir` =
-`/home/alexander/src/ff` — это **контейнер, а не git-репозиторий**
-(`_git_toplevel` возвращает `None`); три репозитория лежат внутри него. Отсюда:
+Why exactly so — the `ff` board as a counter-example. Its `default_workdir` is
+`/home/alexander/src/ff` — a **container, not a git repository** (`_git_toplevel` returns
+`None`); three repositories live inside it. Hence:
 
-- **`project_id` не подставляет путь для вида `dir`.** Ядро берёт путь из
-  `board.default_workdir`. Карточка «проект `ff-front` + `dir`» без явного пути
-  выполнилась бы в `/home/alexander/src/ff`, а не в
-  `/home/alexander/src/ff/ff-front-v1`. Поэтому форма **подставляет
-  `workspace_path = project.primary_path`** — это не украшение, а условие того,
-  что выбор проекта вообще имеет смысл. Путь остаётся редактируемым: подстановка
-  задаёт значение по умолчанию, но ручная правка выигрывает.
-- **Для `worktree` путь убирается из payload, но не из поля.** Ядро материализует
-  `<primary>/.worktrees/<task-id>` только пока путь не прислан
-  (`_resolve_project_link` ставит `project_repo` под `workspace_path is None`).
-  Оставшийся от доски `default_workdir` перебил бы якорь — и worktree не
-  создался бы вовсе, потому что контейнер не репозиторий. Поэтому `workspace_path`
-  **не отправляется никогда**, а поле «Путь» показывает **предпросмотр** того, что
-  `create_task` создаст:
+- **`project_id` does not supply a path for the `dir` kind.** The core takes the path from
+  `board.default_workdir`. A card “project `ff-front` + `dir`” without an explicit path
+  would run in `/home/alexander/src/ff` instead of `/home/alexander/src/ff/ff-front-v1`.
+  That is why the form **supplies `workspace_path = project.primary_path`** — it is not a
+  decoration but a condition for the project choice to make any sense at all. The path
+  stays editable: the substitution sets the default, but a manual edit wins.
+- **For `worktree` the path is dropped from the payload, but not from the field.** The core
+  materialises `<primary>/.worktrees/<task-id>` only while no path is sent
+  (`_resolve_project_link` sets `project_repo` under `workspace_path is None`). The
+  `default_workdir` left from the board would override the anchor — and no worktree would
+  be created at all, because the container is not a repository. That is why
+  `workspace_path` is **never sent**, while the “Path” field shows a **preview** of what
+  `create_task` will create:
 
   ```
-  /home/alexander/src/ff/ff-mobile/.worktrees/<id-задачи>
+  /home/alexander/src/ff/ff-mobile/.worktrees/<task-id>
   ```
 
-  Поле помечено «Путь (предпросмотр)», отдаётся `readOnly` (не `disabled`, чтобы
-  значение можно было прочитать и скопировать), а в `title` и подсказке сказано,
-  что значение в задачу не уходит и вводить своё нельзя. Раньше поле было пустым с
-  одной текстовой подсказкой — это читалось как «не задано», и естественная
-  реакция (вписать каталог доски) ломала якорь. Предпросмотр убирает саму
-  причину: видно, что значение уже есть и его незачем вводить.
+  The field is labelled “Path (preview)”, is rendered `readOnly` (not `disabled`, so the
+  value can be read and copied), and both its `title` and the hint say that the value does
+  not go into the task and that nothing of your own can be typed in. The field used to be
+  empty with a single line of hint text — that read as “not set”, and the natural reaction
+  (typing the board's directory) broke the anchor. The preview removes the cause itself:
+  you see that the value is already there and need not be typed.
 
-  Правило «не отправлять» продублировано в `submitCreate`, а не держится только на
-  read-only: якорь worktree не должен зависеть от того, что поле кто-то не
-  отредактирует. Обратный случай — **worktree без проекта** — оставлен как был: там
-  путь это репозиторий, от которого ветвятся, и его отправлять нужно.
-- **Механизм не срабатывает в другую сторону:** у `dir` ветки нет вовсе
-  (`branch_name` = NULL) — она выводится только для `worktree`.
+  The “do not send” rule is duplicated in `submitCreate` instead of resting on read-only
+  alone: the worktree anchor must not depend on someone not editing the field. The opposite
+  case — **a worktree without a project** — is left as it was: there the path is the
+  repository to branch from, and it must be sent.
+- **The mechanism does not work the other way:** `dir` has no branch at all
+  (`branch_name` = NULL) — a branch is derived only for `worktree`.
 
-**Форма не полагается на `board.json.project_id`.** Ядро подставляет проект доски
-автоматически, когда `project_id is None` и вид не `scratch`. У доски `ff` это
-поле сейчас `null`, но полагаться на это нельзя: заполни его — и явный выбор
-проекта в форме начнёт молча перебиваться. Поэтому выбранный проект уходит
-**явным `project_id`**, а пустой выбор — **полным отсутствием ключа** в payload
-(не `null`, не `""`). Так карточка без проекта остаётся без проекта независимо от
-настройки доски.
+**The form does not rely on `board.json.project_id`.** The core substitutes the board's
+project automatically when `project_id is None` and the kind is not `scratch`. On the `ff`
+board that field is currently `null`, but that cannot be relied on: fill it in and an
+explicit project choice in the form would start being silently overridden. So a picked
+project goes as an **explicit `project_id`**, while an empty choice goes as a **complete
+absence of the key** in the payload (not `null`, not `""`). That way a card without a
+project stays without one regardless of the board's setting.
 
-**`scratch` — это явный opt-out из проекта** (#106342), и решение зафиксировано:
-при виде `scratch` проект **не отправляется вообще**, селектор проекта при этом
-**блокируется**, а под ним показывается подсказка «воркспейс scratch — проект не
-привязывается, карточка одноразовая». Отправлять и проект, и `scratch` нельзя:
-ядро прочитает проект как «привяжи меня к этому репозиторию» и либо повысит вид
-до `worktree`, либо выдумает worktree — то есть UI показал бы одно, а карточка
-сделала бы другое. Проект без `primary_path` — единственный случай, где корень
-неизвестен, поэтому форма отказывается создавать карточку и объясняет почему.
+**`scratch` is an explicit opt-out of the project** (#106342), and the decision is
+recorded: with the `scratch` kind the project is **not sent at all**, the project selector
+is **disabled**, and a hint under it says “scratch workspace — no project is attached, the
+card is disposable”. Sending both a project and `scratch` is impossible: the core would read
+the project as “tie me to this repository” and either raise the kind to `worktree` or invent
+a worktree — that is, the UI would show one thing and the card would do another. A project
+without `primary_path` is the only case where the root is unknown, so the form refuses to
+create the card and explains why.
 
-Всё это проверяется двумя способами:
+All of this is verified in two ways:
 
-- `tests/render_test.js` — **что уходит в payload**: пересборка списка и сброс
-  чужого проекта, `dir` → `workspace_path` проекта (и что он **не** равен
-  `default_workdir` доски), `worktree` → `workspace_path` **отсутствует**,
-  пустой проект → `project_id` **не отправляется вовсе**;
-- `tools/anchor_probe.py` — **что ядро делает с этим payload**: вызывает
-  `create_task` напрямую и читает строку обратно, сверяя
-  `<primary>/.worktrees/<task-id>`, детерминированную ветку и то, что
-  `project_id` не подставился из доски.
+- `tests/render_test.js` — **what goes into the payload**: rebuilding the list and resetting
+  a foreign project, `dir` → the project's `workspace_path` (and that it is **not** equal
+  to the board's `default_workdir`), `worktree` → `workspace_path` **absent**, an empty
+  project → `project_id` **not sent at all**;
+- `tools/anchor_probe.py` — **what the core does with that payload**: it calls `create_task`
+  directly and reads the row back, matching `<primary>/.worktrees/<task-id>`, the
+  deterministic branch, and that `project_id` was not substituted from the board.
 
-### Порядок задач в списке
+### Task order in the list
 
-Порядок групп статусов — `running`, `ready`, `scheduled`, `blocked`, `review`,
-`triage`, `todo`, `done`, `archived`. **`scheduled` стоит после `ready` намеренно:**
-отложенная карточка ждёт времени и воркером не берётся (`schedule_task`), поэтому
-она не должна читаться как «следующая в очереди».
+The order of the status groups is `running`, `ready`, `scheduled`, `blocked`, `review`,
+`triage`, `todo`, `done`, `archived`. **`scheduled` sits after `ready` on purpose:** a
+postponed card waits for a time and is not taken by a worker (`schedule_task`), so it must
+not read as “next in the queue”.
 
-Внутри одного статуса карточки стоят не по свежести heartbeat, а по тому, что
-реально важно для этого статуса:
+Inside one status the cards stand not by heartbeat freshness but by what actually matters
+for that status:
 
-| статусы | порядок внутри группы |
+| statuses | order within the group |
 | --- | --- |
-| `ready` | **как в диспетчере: `priority DESC, created_at ASC`** |
-| `running` | **по приоритету, затем кто стартовал раньше** |
-| `done`, `archived` (завершённые) | **по времени завершения, свежие сверху** |
-| остальные (`todo`, `blocked`, `review`, `triage`, `scheduled`) | **по приоритету, больший сверху** |
+| `ready` | **as in the dispatcher: `priority DESC, created_at ASC`** |
+| `running` | **by priority, then whoever started earlier** |
+| `done`, `archived` (finished) | **by completion time, newest first** |
+| the rest (`todo`, `blocked`, `review`, `triage`, `scheduled`) | **by priority, higher first** |
 
-- **`ready` — это очередь запуска, и она показывает настоящий порядок запуска.**
-  Взято буквально из `kanban_db_dispatch._lane_rows`:
-  `ORDER BY priority DESC, created_at ASC`. Общее правило «по приоритету, при
-  равенстве — свежая активность» для `ready` давало бы обратный порядок, и список
-  обещал бы in-progress, которого диспетчер не выполнит. Первая строка `ready` —
-  это та карточка, которая следующей уйдёт в работу.
-- **`running` не переставляется от heartbeat.** Раньше вторичным ключом был
-  `last_heartbeat_at`, а он меняется каждый heartbeat: две карточки с одинаковым
-  приоритетом менялись местами, когда одна из воркеров просто что-то отвечала, и
-  список перетасовывался под курсором на живой доске. Теперь у `running`
-  вторичный ключ — `started_at`: стабилен весь запуск и тоже осмыслен (кто дольше
-  работает — тот выше).
-- у завершённой карточки приоритет уже ничего не решает — она не в очереди,
-  поэтому «что закончилось последним» полезнее, чем «что было важнее»;
-- у остальных живых карточек при равном приоритете решает свежесть активности,
-  затем `board` и `id` — порядок стабилен и не «прыгает» между опросами.
+- **`ready` is the run queue, and it shows the real run order.** Taken literally from
+  `kanban_db_dispatch._lane_rows`: `ORDER BY priority DESC, created_at ASC`. The general
+  rule “by priority, on a tie the freshest activity” would give `ready` the reverse order,
+  and the list would promise an in-progress state the dispatcher will not deliver. The
+  first `ready` row is the card that goes to work next.
+- **`running` is not reshuffled by heartbeats.** The secondary key used to be
+  `last_heartbeat_at`, which changes on every heartbeat: two cards with the same priority
+  swapped places whenever one of the workers answered something, and the list shuffled
+  under the cursor on a live board. Now the secondary key for `running` is `started_at`: it
+  is stable for the whole run and also meaningful (whoever has been working longer is
+  higher).
+- a finished card's priority no longer decides anything — it is not in the queue, so “what
+  finished last” is more useful than “what was more important”;
+- for the other live cards, equal priorities are decided by activity freshness, then
+  `board` and `id` — the order is stable and does not jump between polls.
 
-Правило одно и то же в бэкенде (`_sort_key` в `plugin_api.py`) и во фронтенде
-(`taskSortKey`), поэтому карточка, вставленная сразу после создания, попадает
-туда же, куда её поставил бы следующий опрос. Обе реализации проверяются
-собственным набором тестов, который сравнивает результат с `ORDER BY`
-диспетчера, а не с повторной реализацией того же правила.
+**«Все доски» is ordered by the same rule, not by board.** The merged list used to be
+built board by board (each board's rows sorted, then concatenated), which repeated every
+status once per board: `running, ready, done` of board A, then the same for board B. On
+one board the reader gets status groups, and that is what the merged view gives too —
+status group first, then the group's own key across **all** boards; the board slug is only
+a late tiebreak (after priority / completion time, before `id`). So a high-priority `ready`
+card of the last board genuinely sits above a low-priority `ready` card of the first, and
+each row's board badge says where it came from.
 
-### Мобильный вид
+The rule is the same in the backend (`_sort_key` in `plugin_api.py`) and in the frontend
+(`taskSortKey`), so a card inserted right after creation lands where the next poll would put
+it. Both implementations are checked by their own set of tests, which compare the result
+with the dispatcher's `ORDER BY` rather than with a second implementation of the same rule.
 
-На узком экране список задач становится **горизонтальным** — и вариант зависит
-от ширины: **выше 380px это список**, а **на 380px и уже — карусель**.
+### Live workers: processes, not cards
 
-![390px: горизонтальный список, в кадре несколько карточек](docs/mobile-list.png)
+Next to `5 running · 41 queued · 160 archived` sits a second counter: **how many worker
+processes are alive right now, and on how many cards** — `2 воркера на 2 задачах`.
 
-![360px: карусель, одна карточка, следующая выглядывает](docs/mobile-carousel.png)
+The two numbers are not the same thing, and that is the point. The left one counts
+**cards** in `running`, i.e. what the board intends. The right one counts **processes**,
+i.e. what the machine is really running. They disagree in both directions:
 
-Общая часть (медиазапрос `max-width: 1023px`) у них одна:
+- **a worker outlives its card.** A card can leave `running` (done, review, blocked) while
+  its process is still finishing the job — sometimes for minutes. The badge then reads
+  `… · 1 доделывает` (“1 is still finishing”), the card's row carries the same label, and
+  the panel says how long it has been going since the transition;
+- **a card outlives its worker.** The process is gone (claim expired, the reap has not
+  caught up) while the card still says `running`. The badge reads `… · 1 без воркера`
+  (“1 without a worker”).
 
-- прокрутка идёт **по X** (`overflow-x: auto`), по Y она заблокирована;
-- **автоскролл списка работает по той оси, по которой список реально скроллится**
-  (`isCarousel()` → `scrollLeft` вместо `scrollTop`), поэтому выбор карточки
-  на телефоне долистывает её вбок, а не пытается сдвинуть список вверх;
-- на десктопе медиазапрос не действует и список остаётся вертикальной колонкой.
+Clicking the badge opens **“Кто сейчас работает”** — one row per process: the card's title,
+the phase, the duration, the profile, the card's status and board, the pid. Disagreements
+are sorted first, and clicking a row opens that card (switching the board filter when the
+card lives on another board).
 
-Чем варианты отличаются и почему граница именно такая:
+Liveness is decided by asking `/proc`, not the board: the pid must be alive **and** its
+restart-stable fingerprint (boot/instantiation epoch + process start time) must match the
+one recorded at spawn, so a recycled pid is never read as “our worker”. Pid and fingerprint
+are kept on the **closed** `task_runs` row — that is exactly why the kernel keeps them —
+so a worker that outlived its own completion is still visible. A row whose claim lock
+belongs to another host is reported as `remote`: it cannot be verified from here, and it is
+never counted as verified.
 
-| ширина списка | вариант | карточка | scroll-snap |
+On a narrow screen the second half of the label shortens to `· 3 задачи` (the same pair of
+numbers in fewer characters) and the details stay behind a tap, because a phone has no
+hover.
+
+One more difference is worth naming, because it looks like a bug otherwise: the header
+counter counts `scheduled` cards as `running` (that is its older behaviour), while a parked
+card has no process and should not have one. When scheduled cards exist, the panel says so
+in its own line — “the `N running` counter includes the scheduled ones: N of them”.
+
+### Mobile view
+
+On a narrow screen the task list becomes **horizontal** — and the variant depends on the
+width: **above 380px it is a list**, and **at 380px and narrower it is a carousel**.
+
+![390px: a horizontal list, several cards in frame](docs/mobile-list.png)
+
+![360px: a carousel, one card, the next one peeking out](docs/mobile-carousel.png)
+
+The shared part (the `max-width: 1023px` media query) is the same for both:
+
+- scrolling goes **along X** (`overflow-x: auto`), along Y it is locked;
+- **the list autoscrolls along the axis it actually scrolls** (`isCarousel()` →
+  `scrollLeft` instead of `scrollTop`), so picking a card on a phone scrolls it sideways
+  instead of trying to move the list up;
+- on the desktop the media query does not apply and the list stays a vertical column.
+
+How the variants differ, and why the boundary is exactly there:
+
+| list width | variant | card | scroll-snap |
 | --- | --- | --- | --- |
-| **> 380px** | горизонтальный **список** | `clamp(200px, 45%, 320px)` — в кадре несколько карточек | выключен (`none`) |
-| **≤ 380px** | **карусель** | `82%` — одна карточка, следующая выглядывает | `x mandatory`, примагничивание к левому краю |
+| **> 380px** | a horizontal **list** | `clamp(200px, 45%, 320px)` — several cards in frame | off (`none`) |
+| **≤ 380px** | a **carousel** | `82%` — one card, the next one peeking out | `x mandatory`, snapping to the left edge |
 
-- **«одна карточка на экран» — это не универсально хорошая форма.** На 390px
-  она съедала всю строку: одна задача, лог уезжал под сгиб, а листать нужно
-  было по одной карточке. Выше 380px в ту же строку влезает несколько
-  карточек — и список читается как список;
-- **ниже 380px вторая карточка была бы обрезком** вроде «Скиллы для…», и
-  постраничное листание честнее: карточка читается целиком, палец знает, что
-  справа есть ещё;
-- у карточек в обоих вариантах **чипы мета-строки переносятся**, а не
-  обрезаются: статус, приоритет, доска, профиль, комментарии и время не
-  помещались в одну строку, и хвост исчезал за `overflow: hidden` без всякой
-  подсказки.
+- **“one card per screen” is not universally good.** At 390px it ate the whole row: one
+  task, the log pushed below the fold, and paging one card at a time. Above 380px several
+  cards fit into the same row — and the list reads as a list;
+- **below 380px the second card would be a stub** like “Скиллы для…”, and paging is more
+  honest: the card is read in full and the finger knows there is more to the right;
+- in both variants the **meta-line chips wrap** instead of being cut: the status, priority,
+  board, profile, comment count and time did not fit one line, and the tail vanished behind
+  `overflow: hidden` with no hint at all.
 
-Правило проверяется в **настоящем Chromium** на трёх вьюпортах — 390px (список),
-360px (карусель) и 1440px (вертикальная колонка): `tests/carousel_test.js`.
+The rule is verified in **real Chromium** at three viewports — 390px (list), 360px
+(carousel) and 1440px (vertical column): `tests/carousel_test.js`.
 
-### Что показывает строка задачи
+### What a task row shows
 
-Под заголовком карточки идёт мета-строка: **статус, приоритет, доска, профиль,
-число комментариев, «сколько минут назад»**.
+Under the card's title sits a meta line: **status, priority, board, profile, comment count,
+“how many minutes ago”**.
 
-- **приоритет подписан у каждой карточки**, включая `прио 0`. Список отсортирован
-  именно по нему, поэтому число, по которому выстроен порядок, обязано быть
-  видно; `0` — тоже значение («явного приоритета нет»), а не «данных нет», и
-  прятать его было бы тем же несоответствием;
-- подпись берётся из `sortInputs(t)` — того же значения, по которому считается
-  порядок и пишется `data-priority`, поэтому бейдж не может разойтись с
-  позицией карточки;
-- стенд сверяет подпись с `data-priority` **и** с живой доской (`/board`), а не
-  с константой из самого плагина.
+- **the priority is labelled on every card**, including `прио 0` (short for “приоритет 0”,
+  priority 0). The list is sorted by exactly that, so the number the order is built on must
+  be visible; `0` is a value too (“no explicit priority”), not “no data”, and hiding it
+  would be the same kind of mismatch;
+- the label comes from `sortInputs(t)` — the same value the order is computed from and
+  `data-priority` is written from, so the badge cannot drift away from the card's position;
+- the stand compares the label with `data-priority` **and** with the live board (`/board`),
+  not with a constant from the plugin itself.
 
-### Доски и статусы
+### Boards and statuses
 
-- селектор доски в шапке фильтрует список; первым идёт «Все доски» (слитый вид).
-  Выбор помнится в `localStorage` и переживает перезагрузку; пропала доска —
-  фильтр сам возвращается к «Все доскам»;
-- **подпись доски видна целиком.** Раньше селектор был ограничен 180px, а
-  нативный `<select>` не ставит многоточие, а просто обрезает текст: на этих
-  данных `hlv-mem — Bench (memory)` не помещался на 23px, а
-  `hypercube — Hyper-Cube` — на 8px, и закрытый селектор читался как
-  «hypercube — Hyp…» — то есть как сломанный переключатель. Теперь у него
-  свой класс `.hlv-board-select` (`width: auto; max-width: 100%`), и полная
-  подпись дублируется в `title` на случай, когда места правда не хватает;
-  фактическое обрезание меряется в браузере относительно неограниченного
-  двойника того же селектора (`tools/board_label_fit.js`), а не «на глаз»;
-- чекбокс **«archived»** живёт под селектором досок, в одном блоке;
-- у каждого из **9 статусов свой цвет бейджа** — палитра взята из встроенного
-  плагина kanban (`.hermes-kanban-dot-*`), а не придумана здесь;
-- счётчики в шапке считают **то, что показано** (при выбранной доске — её задачи);
-- активные задачи (`running` → `scheduled` → `ready` → …) сверху, `archived` внизу,
-  а внутри группы — по правилу из
-  [«Порядок задач в списке»](#порядок-задач-в-списке).
+- the board selector in the header filters the list; “All boards” (the merged view) comes
+  first. The choice is remembered in `localStorage` and survives a reload; if a board
+  disappears, the filter returns to “All boards” by itself;
+- **the board label is shown in full.** The selector used to be capped at 180px, and a
+  native `<select>` does not ellipsize — it just cuts the text: on this data
+  `hlv-mem — Bench (memory)` did not fit by 23px and `hypercube — Hyper-Cube` by 8px, and
+  the closed selector read as “hypercube — Hyp…” — that is, as a broken switcher. It now has
+  its own class `.hlv-board-select` (`width: auto; max-width: 100%`), and the full label is
+  duplicated in `title` for the case when the room really is short; the actual clipping is
+  measured in the browser against an uncapped
+ twin of the same selector (`tools/board_label_fit.js`), not “by eye”;
+- the **“archived”** checkbox lives under the board selector, in the same block;
+- each of the **9 statuses has its own badge colour** — the palette is taken from the
+  bundled kanban plugin (`.hermes-kanban-dot-*`), not invented here;
+- the counters in the header count **what is shown** (with a board picked — its tasks);
+- active tasks (`running` → `scheduled` → `ready` → …) on top, `archived` at the bottom,
+  and inside a group — by the rule from
+  [“Task order in the list”](#task-order-in-the-list).
 
 ---
 
-## Установка
+## Installation
 
-Нужен установленный Hermes с плагином kanban (он ставится вместе с дашбордом).
+You need an installed Hermes with the kanban plugin (it ships with the dashboard).
 
 ```bash
 git clone https://github.com/alex-dubatov/hermes-logs-viewer.git
 cd hermes-logs-viewer
 
-# 1. положить плагин в ~/.hermes/plugins/
+# 1. put the plugin into ~/.hermes/plugins/
 cp -r dashboard ~/.hermes/plugins/hermes-logs-viewer
 
-# 2. включить его (без этого не смонтируется backend)
+# 2. enable it (without this the backend is not mounted)
 hermes plugins enable hermes-logs-viewer
 
-# 3. открыть дашборд
+# 3. open the dashboard
 hermes dashboard --no-open
 ```
 
-Вкладка **Kanban Logs** появится в левой навигации дашборда.
+The **Kanban Logs** tab appears in the dashboard's left navigation.
 
-**Обновление.** Правки **frontend** (`dist/`) подхватываются перезагрузкой страницы —
-ассеты отдаются с `no-store`, перезапуск дашборда не нужен. Правка
-`plugin_api.py` (добавление/удаление роутов) требует
-`systemctl --user restart hermes-dashboard`.
+**The live reasoning stream** (the last block of the “transcript” tab) requires the plugin
+to be installed and enabled in **the profile that executes the card** — not only in the one
+where the dashboard is open. Every profile has its own plugin directory, so for the other
+profiles the plugin is installed as a symlink to the same copy:
+
+```bash
+# for every profile whose cards you look at (the name comes from `hermes profile list`)
+ln -s ~/.hermes/plugins/hermes-logs-viewer \
+      ~/.hermes/profiles/<profile>/plugins/hermes-logs-viewer
+
+# enable the plugin in that profile and allow it the model's reasoning
+hermes --profile <profile> config set plugins.enabled \
+  '["homeassistant","prompt-notes","vk-platform","hermes-logs-viewer"]'
+hermes --profile <profile> config set plugins.stream_reasoning_deltas true
+```
+
+Without the second key the core gives the plugin only the visible answer text, without
+reasoning; the pane then says so right under the block. Details are in
+“[Live model stream](#live-model-stream-why-it-needs-an-agent-hook)”.
+
+**Upgrading.** **Frontend** edits (`dist/`) are picked up by reloading the page — the assets
+are served with `no-store`, so no dashboard restart is needed. Editing `plugin_api.py`
+(adding or removing routes) requires `systemctl --user restart hermes-dashboard`.
 
 ---
 
-## Скриншоты
+## Screenshots
 
-> **Не обновлять скриншоты без разрешения владельца репозитория** (правка от
-> 2026-10-19, усилена 2026-10-21). Нижеперечисленные команды **перезаписывают**
-> committed PNG в `docs/`, а `seed_demo.js` вдобавок создаёт **настоящую** доску
-> на живом дашборде. Обе вещи делать без спроса нельзя — владелец обнаружил это
-> сам, по факту. Даже если новая функция явно «просится» на картинку: спросить
-> заранее дешевле, чем объясняться постфактум. Если разрешение получено —
-> обязательно закончить `seed_demo.js --clean`, чтобы не оставить доску.
+> **Do not refresh the screenshots without the repository owner's permission** (rule from
+> 2026-10-19, tightened on 2026-10-21). The commands below **overwrite** the committed PNGs
+> in `docs/`, and `seed_demo.js` additionally creates a **real** board on the live
+> dashboard. Neither may be done without asking — the owner found out the hard way. Even if
+> a new feature obviously “asks” for a picture: asking in advance is cheaper than
+> explaining afterwards. If permission is granted, always finish with
+> `seed_demo.js --clean` so no board is left behind.
 >
-> **Не создавать задачи ради скриншотов** (2026-10-21). Правило касается и
-> подготовки данных, а не только самой съёмки: демо-карточки для картинок не
-> создаются без спроса. Для проверки функциональности задачи на живом дашборде
-> не нужны — есть стенды (`tests/render_test.js`, `tests/carousel_test.js`),
-> которые проверяют DOM и поведение. Полное правило для агентов —
-> [`AGENTS.md`](AGENTS.md).
+> **Do not create tasks for the sake of screenshots** (2026-10-21). The rule covers
+> preparing data as well, not just shooting: demo cards for pictures are not created
+> without asking. Verifying functionality needs no live-dashboard tasks — there are stands
+> (`tests/render_test.js`, `tests/carousel_test.js`) that check the DOM and the behaviour.
+> The full rule for agents is in [`AGENTS.md`](AGENTS.md).
 
-Все картинки в этом README сняты с **живого дашборда** и показывают
-**фиктивные данные** — доска `hlv-demo`, которая создаётся скриптом и удаляется
-вместе с логами. Ни одно настоящее название задачи в репозиторий не попадает.
+Every picture in this README was taken from the **live dashboard** and shows **fake data** —
+the `hlv-demo` board, created by a script and deleted together with its logs. No real task
+title ever lands in the repository.
 
 ```bash
-# 1. живую сессию дашборда в cookie jar
+# 1. a live dashboard session into a cookie jar
 curl -s -c /tmp/hlv.cookies -X POST http://127.0.0.1:9119/auth/password-login \
   -H 'Content-Type: application/json' \
   -d '{"provider":"basic","username":"<user>","password":"<pass>"}'
 
-# 2. фиктивные задачи на одноразовой доске hlv-demo
+# 2. fake tasks on the disposable hlv-demo board
 node tools/seed_demo.js
 
-# 3. снимки в docs/
+# 3. shots into docs/
 node tools/screenshots.js
-node tools/narrow_shots.js        # оба варианта узкой вёрстки (список и карусель)
+node tools/narrow_shots.js        # both narrow-layout variants (list and carousel)
 
-# 4. убрать доску вместе с логами
+# 4. remove the board together with the logs
 node tools/seed_demo.js --clean
 ```
 
-`tools/check_screenshots.js` прогоняет тот же сценарий и **проверяет DOM** в каждой
-точке съёмки — что в кадре действительно демо-доска, что поиск сузил список, что
-лог непустой. Так утверждения README проверяются, а не предполагаются:
+`tools/check_screenshots.js` runs the same scenario and **checks the DOM** at every shooting
+point — that the frame really shows the demo board, that search narrowed the list, that the
+log is not empty. That is how the README's claims are verified rather than assumed:
 
 ```bash
-node tools/check_screenshots.js     # 20/20 проверок кадра
+node tools/check_screenshots.js     # 20/20 frame checks
 ```
 
-`tools/narrow_shots.js` снимает обе узкие вёрстки и **сам себя проверяет**: на
-390px он ждёт в кадре больше одной карточки при выключенном snap, на 360px —
-`x mandatory`, и снимок делается только если сценарий совпал. Иначе старая
-картинка в README расходилась бы с CSS молча.
+`tools/narrow_shots.js` shoots both narrow layouts and **checks itself**: at 390px it waits
+for more than one card in frame with snapping off, at 360px for `x mandatory`, and the shot
+is taken only if the scenario matched. Otherwise the old picture in the README would
+silently disagree with the CSS.
 
-Путь до Playwright и Chromium переопределяется переменными `PLAYWRIGHT_PATH`
-и `CHROME_PATH`.
+The Playwright and Chromium paths can be overridden with the `PLAYWRIGHT_PATH` and
+`CHROME_PATH` variables.
 
 ---
 
-## Как это устроено
+## How it works
 
 ```
 ~/.hermes/plugins/hermes-logs-viewer/
+├── plugin.yaml           # manifest: the tab + the model-stream subscription (hooks)
+├── __init__.py           # on_stream_* hooks: tokens of the current call → plugin-data
 ├── dashboard/
-│   ├── manifest.json     # регистрация вкладки
-│   ├── plugin_api.py     # свой backend: только то, чего нет у kanban
+│   ├── manifest.json     # tab registration
+│   ├── plugin_api.py     # own backend: only what kanban does not have
 │   └── dist/
-│       ├── index.js      # весь фронтенд, один IIFE без сборки
-│       └── style.css     # только CSS-переменные дашборда, скруглений нет
-├── tests/render_test.js  # стенд: jsdom + живой дашборд, клики по настоящему UI
-├── tools/                # демо-данные, скриншоты и anchor_probe.py для README
-└── docs/                 # картинки README
+│       ├── index.js      # the whole frontend, one IIFE with no build step
+│       └── style.css     # dashboard CSS variables only, no rounded corners
+├── tests/render_test.js  # stand: jsdom + live dashboard, clicks on the real UI
+├── tools/                # demo data, screenshots, browser checks
+└── docs/                 # README pictures
 ```
 
-**Фронтенд** — один IIFE-скрипт без сборки. Он берёт React и `fetchJSON` из
-`window.__HERMES_PLUGIN_SDK__` и регистрирует вкладку через
+**The frontend** is a single IIFE script with no build step. It takes React and `fetchJSON`
+from `window.__HERMES_PLUGIN_SDK__` and registers the tab through
 `window.__HERMES_PLUGINS__.register`.
 
-**Почти всё backend-а своего плагина не имеет.** Списки досок, профили, создание
-задачи, описание и сам лог берутся из `/api/plugins/kanban/…`. Это не оптимизация,
-а требование доступности: роутер встроенного плагина монтируется при старте процесса
-и потому **всегда живой**, тогда как новый роут здесь доезжает до браузера только
-после `systemctl --user restart hermes-dashboard` — а перезапуск из headless-режима
-недоступен. Своя копия этих эндпоинтов ещё и расходилась бы с оригиналом.
+**Almost no backend of its own.** Board lists, profiles, task creation, the description and
+the log itself come from `/api/plugins/kanban/…`. That is not an optimisation but an
+availability requirement: the bundled plugin's router is mounted at process start and is
+therefore **always live**, whereas a new route here only reaches the browser after
+`systemctl --user restart hermes-dashboard` — and a restart is unavailable from headless
+mode. A copy of those endpoints here would also drift away from the original.
 
-Свой `plugin_api.py` отдаёт ровно то, чего у встроенного плагина нет:
+Our own `plugin_api.py` serves exactly what the bundled plugin lacks:
 
-| маршрут | зачем |
+| route | what for |
 | --- | --- |
-| `GET /tasks/all` | все задачи **всех досок** слитым списком; доска с битой/отсутствующей БД пропускается, чтобы одна сломанная доска не скрыла остальные |
-| `GET/POST /tasks/{id}/comments` | комментарии: вставка в `task_comments` + событие `commented`, как в `kanban_db.add_comment` |
-| `GET /projects[?board=]` | проекты с их `board_slug` и `primary_is_repo` — то, чего у встроенного плагина нет (см. ниже) |
-| `GET /transcript` | живой транскрипт карточки из стора профиля-владельца (см. ниже) |
+| `GET /tasks/all` | all tasks of **all boards** as one merged list; a board with a broken/missing DB is skipped, so one broken board does not hide the others |
+| `GET/POST /tasks/{id}/comments` | comments: insert into `task_comments` + a `commented` event, like `kanban_db.add_comment`; the GET also reports, per comment, whether the worker has already read it |
+| `DELETE /tasks/{id}/comments/{cid}` | delete one comment (+ its paired `commented` event); `409` when the worker has already seen it, unless `force=1` |
+| `GET /projects[?board=]` | projects with their `board_slug` and `primary_is_repo` — what the bundled plugin lacks (see below) |
+| `GET /transcript` | the card's live transcript from the owner profile's store (see below) |
+| `GET /tasks/{id}/live` | tokens of the **current** model call: the live reasoning block (see below) |
 
-**Транскрипт — единственный маршрут, который смотрит в чужое хранилище.**
-Встроенный плагин его не может: путь к стору профиля-владельца живёт в
-событии `owner_admitted` карточки, а доска и стор — разные базы. Роут читает
-событие, берёт из его payload `session_id` и `db` (путь уже абсолютный и
-точный — угадывать профиль не надо) и открывает **стор в режиме `mode=ro`**:
-живой WAL-стор гейтвея читается из другого процесса, но писать в него нельзя.
+**The transcript is the only route that looks into someone else's storage.** The bundled
+plugin cannot: the path to the owner profile's store lives in the card's `owner_admitted`
+event, and the board and the store are different databases. The route reads the event, takes
+`session_id` and `db` from its payload (the path is already absolute and exact — no guessing
+of the profile), and opens the **store in `mode=ro`**: the gateway's live WAL store can be
+read from another process, but it must not be written to.
 
-Ответ `/transcript` несёт три части:
+The `/transcript` answer carries three parts:
 
-| поле | что это |
+| field | what it is |
 | --- | --- |
-| `messages` | история диалога: строки стора по `session_id`, начиная с курсора `after` |
-| `live` | что агент делает **прямо сейчас**: `last_activity_description`, `last_activity_at`, `activity_age`, счётчики `api_call_count`/`tool_call_count`/`input_tokens`/`output_tokens`, `model`, `ended_at`/`end_reason`, `running` |
-| `events` | след запуска: строки журнала профиля-владельца (`<профиль>/logs/agent.log`) по этой сессии — `{"time", "level", "kind", "short", "text"}`, где `kind` ∈ `start`/`api`/`tool`/`error`/`warn`/`compress`/`turn`, а `short` — короткая сводка для показа |
+| `messages` | the dialogue history: store rows by `session_id`, starting at the `after` cursor |
+| `live` | what the agent is doing **right now**: `last_activity_description`, `last_activity_at`, `activity_age`, the `api_call_count`/`tool_call_count`/`input_tokens`/`output_tokens` counters, `model`, `ended_at`/`end_reason`, `running` |
+| `events` | the run trail: the owner profile's log lines (`<profile>/logs/agent.log`) for this session — `{"time", "level", "kind", "short", "text"}`, where `kind` ∈ `start`/`api`/`tool`/`error`/`warn`/`compress`/`turn`, and `short` is a short summary to display |
 
-`live` и `events` — **не обязательные**: стор без таблицы `sessions` (старый
-Hermes) или профиль без журнала дают пустые части, а не ошибку. Журнал
-читается **хвостом** (128 КБ, последние 40 строк по сессии): файл растёт до
-мегабайтов и ротируется, а живому панели нужны только новейшие строки.
-Ротированный `agent.log.1` читается, только если в текущем файле по сессии
-ничего нет.
+`live` and `events` are **not mandatory**: a store without a `sessions` table (an old
+Hermes) or a profile without a journal yields empty parts instead of an error. The journal is
+read **by tail** (128 KB, the last 40 lines for the session): the file grows to megabytes and
+rotates, while the live pane only needs the newest lines. A rotated `agent.log.1` is read
+only if the current file has nothing for the session.
 
-**Проекты пришлось добавить здесь, и это не обход.** Встроенный плагин не умеет
-отвечать на вопрос «проекты какой доски»:
+### Live model stream: why it needs an agent hook
 
-- `GET /api/plugins/kanban/boards` отдаёт `project_name` — **имя одного** проекта,
-  а именно того, что прописан в самой `board.json.project_id` доски (у `ff` это поле
-  `null`, так что приходит `null`);
-- `GET /api/plugins/kanban/projects` перечисляет все проекты, но **без
-  `board_slug`** — в ключах ответа его нет вовсе, и **без признака «репозиторий»**.
+The transcript is **history**: an assistant line lands in the store when the model call has
+already finished. While the model thinks (tens of seconds on a local model) the store holds
+nothing, and the pane would look frozen. The tokens do exist though — the Hermes core hands
+them to stream subscribers (`agent/plugin_stream_hooks.py`, the `on_stream_start` /
+`on_stream_delta` / `on_stream_end` hooks).
 
-Связь доска↔проекты (`projects.board_slug` в per-profile `projects.db`) не
-отдаётся ни одним из них, поэтому селектор проектов на них построить нельзя.
-Роут читает эту колонку напрямую.
+The problem is where those subscribers live: the card is executed by the profile's
+**owner gateway** process, while the tab's plugin is the **dashboard** process. All they share
+is the file system, so the plugin is two-sided:
 
-`primary_is_repo` считается самим роутом: `git -C <primary_path> rev-parse
---show-toplevel`, с кэшем по пути и таймаутом в 5 секунд (поллинг идёт раз в
-15 с, без кэша это был бы процесс на каждый ответ). Поле необязательное:
-отсутствие или `null` читается как «не репозиторий», и форма откатывается к
-рекомендации доски. «Репозиторий» — свойство файловой системы, а не строки в БД,
-поэтому колонки в `projects` для этого быть не может.
+- `__init__.py` + `plugin.yaml` at the plugin's root are the **agent** half: they subscribe
+  to the stream and write every delta token as an NDJSON line into
+  `<hermes home>/plugin-data/hermes-logs-viewer/live/<session_id>.ndjson`. The file is
+  **overwritten** on `on_stream_start`, so it always holds the current call rather than the
+  session's history; abandoned files are removed when a stream starts (older than 3 hours);
+- `GET /tasks/{id}/live` is the **dashboard** half: it takes `session_id` from the
+  `owner_admitted` event (like `/transcript`), derives the owner profile's `plugin-data`
+  from the store path, reads the file and assembles it into
+  `{reasoning, text, streaming, turn_id, iteration, model, age_s, ...}`. A torn last line
+  (the file is written concurrently) is skipped instead of breaking the parse.
 
-Что стоит поправить **в `hermes_cli`**: добавить `board_slug` **и** признак
-репозитория в ответ встроенного `GET /projects` — тогда отпадает и этот роут, и
-лишний перезапуск дашборда.
+Why not “just poll the store”: there is no separate “live” reasoning record in the store —
+the `reasoning` column is filled together with the finished assistant row. Verified by
+polling a live session: existing rows do not change in place.
 
-Проекты — **per-profile** база (`$HERMES_HOME/projects.db`), в отличие от досок,
-которые по замыслу общие для всех профилей. Поэтому роут ищет её по `HERMES_HOME`
-и намеренно **не** переиспользует `_kanban_root()`: тот для `<root>/profiles/<name>`
-поднимается на два уровня и указал бы на чужой профиль. `project_folders` не
-читается — якорь всегда строится на `primary_path`, лишние папки форме нечего
-показать.
+**What has to be enabled** (otherwise the block honestly says what is missing):
 
-Чтение канбан-БД и `projects.db` — только `mode=ro`. Запись — только комментарий.
-`hermes_cli` не импортируется вовсе, что держит тестовый стенд автономным.
+1. the plugin enabled in the profile that **executes** the card —
+   `plugins.enabled: [..., hermes-logs-viewer]`. Every profile has its own plugin directory
+   (`<hermes home>/plugins`), so “installing the plugin” = putting it there; a symlink to a
+   shared copy is the working and least duplicating way. **Enabled is not installed:** a name
+   in `plugins.enabled` without the directory under `<profile home>/plugins/` loads nothing —
+   the hooks are never subscribed and no stream file is ever written, no matter what the
+   config says. The route checks the directory too and says so in words;
+2. `plugins.stream_reasoning_deltas: true` in the same profile. Without explicit consent the
+   core does not broadcast **reasoning** to plugins (the visible answer text always
+   arrives) — this is a deliberate core limitation, not plugin behaviour.
 
-Частота опроса: список задач 2 с, лог 1.2 с, **транскрипт 2 с**, комментарии 5 с,
-доски 15 с, профили 30 с, сторожевой таймер автоскролла 0.5 с.
+The route itself reads those two keys from the owner profile's `config.yaml` and returns
+`reasoning_enabled`, so the pane can tell “the model thought nothing” from “the reasoning
+does not arrive”. The reasons for a missing stream are spelled out in words
+(`available: false` + `reason`): no owner session, the plugin is not enabled, the plugin is
+not installed in the profile, reasoning is off, or the settings are fine but the worker was
+started before the plugin appeared (a worker process reads its plugins at start — the next
+task picks them up). The pane prints that reason on a **running** card instead of leaving an
+empty space where the live block was expected.
+
+**Projects had to be added here, and it is not a workaround.** The bundled plugin cannot
+answer the question “which projects belong to which board”:
+
+- `GET /api/plugins/kanban/boards` returns `project_name` — the name of **one** project,
+  namely the one written in the board's own `board.json.project_id` (on `ff` that field is
+  `null`, so `null` comes back);
+- `GET /api/plugins/kanban/projects` lists every project, but **without `board_slug`** — the
+  key is not in the answer at all — and **without a “is a repository” flag**.
+
+The board↔projects link (`projects.board_slug` in the per-profile `projects.db`) is served by
+neither, so a project selector cannot be built on them. The route reads that column directly.
+
+`primary_is_repo` is computed by the route itself: `git -C <primary_path> rev-parse
+--show-toplevel`, cached per path with a 5-second timeout (polling runs every 15 s; without
+a cache this would be a process per answer). The field is optional: absent or `null` reads as
+“not a repository”, and the form falls back to the board's suggestion. “Is a repository” is a
+property of the file system, not of a DB row, which is why there can be no such column in
+`projects`.
+
+What is worth fixing **in `hermes_cli`**: add `board_slug` **and** the repository flag to the
+bundled `GET /projects` answer — then this route and the extra dashboard restart go away.
+
+Projects are a **per-profile** database (`$HERMES_HOME/projects.db`), unlike boards, which
+are shared by every profile by design. That is why the route looks it up by `HERMES_HOME` and
+deliberately does **not** reuse `_kanban_root()`: for `<root>/profiles/<name>` that one climbs
+two levels up and would point at a foreign profile. `project_folders` is not read — the anchor
+is always built on `primary_path`, and the form has nothing to show for extra folders.
+
+Reading the kanban DB and `projects.db` is `mode=ro` only. Writing is limited to comments.
+`hermes_cli` is not imported at all, which keeps the test stand self-contained.
+
+Poll frequencies: the task list 2 s, the log 1.2 s, **the transcript 2 s**, **the model stream
+1 s** (the only thing that changes with every token), comments 5 s, boards 15 s, profiles
+30 s, the autoscroll watchdog 0.5 s.
 
 ---
 
-## Проверка
+## Verification
 
-`tests/render_test.js` — стенд, который грузит `dist/index.js` в **jsdom**,
-поднимает настоящий React и ходит в **живой дашборд**, после чего кликает по
-реальному UI. **181 проверок**: раскладка шапки (включая то, что подпись доски
-помещается в селектор и у него есть `title`), правила бейджа для всех 9 статусов,
-отсутствие скруглений, поиск (по названию, по описанию, **по номеру задачи и по
-его началу**, пустой результат, крестик), вкладка «основное» с живым
-round-trip правки описания и **проверкой, что опрос не затирает набираемый
-текст** (стенд ждёт 6.5 с — дольше периода опроса в 5 с — и убеждается, что
-textarea цела; правка отменяется, карточка остаётся нетронутой), форма новой
-задачи (пустая доска по умолчанию, отказ создать без доски, **блокировка
-воркспейса до выбора доски и её снятие после**, **время в минутах → 1800 секунд
-в БД**, состояние ready, предложение worktree/dir/scratch по доске, перевод
-созданной карточки в `todo` и отсутствие вранья в результате создания), а также
-выбор проекта: список содержит **все** проекты профиля, порядок «свои → чужие →
-непривязанные», подписи с принадлежностью (`· ff`, `· без доски`), **выбор
-сохраняется при смене доски**, непривязанный и «чужой» проекты доступны и
-реально создают карточку с правильным якорем — и, главное, **payload, который
-реально ушёл в `POST /tasks`** (`dir` → путь проекта и что он не равен
-`default_workdir` доски, `worktree` → пути нет вовсе, пустой проект →
-`project_id` не отправляется, `scratch` → проект не отправляется).
+`tests/render_test.js` is a stand that loads `dist/index.js` into **jsdom**, boots a real
+React and talks to the **live dashboard**, then clicks on the real UI. **276 checks**: the
+header layout (including that the board label fits the selector and that the selector carries
+a `title`), the badge rules for all 9 statuses, the absence of rounded corners, search (by
+title, by description, **by task id and by its beginning**, an empty result, the clear
+button), the “main” tab with a live round-trip of a description edit and **a check that the
+poll does not clobber the text being typed** (the stand waits 6.5 s — longer than the 5 s poll
+period — and makes sure the textarea is intact; the edit is cancelled and the card is left
+untouched), the new-task form (an empty board by default, a refusal to create without a board,
+**the workspace locked until a board is picked and unlocked after**, **time in minutes → 1800
+seconds in the DB**, the ready state, the worktree/dir/scratch suggestion from the board,
+moving the created card to `todo` and no lying in the creation result), and the project
+choice: the list contains **all** projects of the profile, the order “own → foreign →
+untied”, membership tags (`· ff`, `· без доски`), **the choice survives a board change**,
+untied and “foreign” projects are reachable and really create a card with the right anchor —
+and above all **the payload that actually went into `POST /tasks`** (`dir` → the project's
+path and that it is not the board's `default_workdir`, `worktree` → no path at all, an empty
+project → `project_id` not sent, `scratch` → the project not sent).
 
-Обязательность доски и профиля проверяется отдельно и **двумя путями**: кликом
-по неактивной кнопке и **Enter**, который идёт мимо кнопки прямо в
-`submitCreate`. Для обоих путей стенд смотрит не только на текст ошибки, но и
-на то, что `POST /tasks` **не ушёл** вообще, иначе отказ мог бы быть
-декоративным. Отдельно проверяется, что красная рамка (`hlv-required`) есть у
-обоих комбобоксов до выбора и **снимается** после него.
+**The “runs” and “files” tabs are verified against the server, not against our own markup.**
+The run history is matched with `GET /tasks/{id}`: the number of rows, `data-run-id` (newest
+first), the outcome and the summary text. For a stand card nobody has taken, the tab must say
+“no runs yet” **in words** instead of showing an empty block. Attachments go a full circle:
+a file is picked in a real `<input type="file">`, goes multipart to the bundled route,
+**really appears on the card** (read back from `/attachments`), is visible in the list
+without waiting for a poll, is downloaded — and the stand matches the **bytes**, not the fact
+of a click — then deleted, and the row disappears both from the board and from the list. The
+priority is checked separately with a **plain Enter** (and that the field closes).
 
-Состояние `scheduled` проверено сквозным round-trip: карточка создаётся в
-`ready`, состояние ставится тем же `PATCH`, что и во встроенной вкладке, и
-карточка **реально оказывается в `scheduled`** — без claim и без run, то есть
-диспетчер её не подхватит. Там же проверяется, что на карточке стоит именно
-тот профиль, который форма обязала выбрать.
+The “main” tab's in-place editors are covered one by one: the priority round-trip, the
+runtime in minutes (7 minutes must land as 420 seconds, and 0 must land as a NULL column),
+the **executor combobox** (the closed value matches the board, the opened control is a
+`<select>` listing every installed profile plus an explicit “unassigned” entry, the picked
+profile really lands on the card through the bundled `PATCH`, and an empty pick really clears
+it), the title (including the refusal of an empty one), and the refusal of a non-numeric
+priority.
 
-Карточки, которые создаёт стенд, получают профиль **`default`** и состояние
-**`triage`**. Состояние — здесь главное: `triage` это create-time состояние,
-которое не берёт ни одна полоса диспетчера (`_lane_rows` вызывается только
-для `ready` и `review`), поэтому карточка стенда не может быть забрана
-диспетчером и поднять настоящего воркера.
+The geometry of the two new tabs is verified in **real Chromium** —
+`tools/runs_files_layout_check.js`: jsdom does no layout, so “tabs in one line”, “run rows one
+under another” and “the upload button collapsed” are invisible there. The same run performs a
+**real upload** (the browser assembles the multipart itself), a **real download** (bytes and
+file name are matched) and a delete through the confirmation dialog.
 
-Почему не `ready` (состояние формы по умолчанию): карточка в `ready` с
-живым профилем уходит диспетчеру в течение одного тика (60 с) и **реально
-выполняется**. Стенд карточку тут же удаляет — и воркер остаётся работать над
-карточкой, которой уже нет. Это не теория: 2026-10-26 стенд породил так
-четыре фантомных воркера (`t_ead9cb3a`, `t_42cb81f1`, `t_e57e6df8`,
-`t_78d0d004`), и каждый из них падал на «task not found».
+**The live-worker counter is verified on three levels.** `tests/test_workers.py` pins the
+backend against fake board databases and **real processes**: a live process on a running
+card, a live process on a card that already left `running` (including the grace window that
+stops every normal completion from flashing a warning), a dead pid with stale and with fresh
+heartbeats, a legacy row without a fingerprint, a recycled pid and a claim lock from another
+host. The jsdom stand checks that the badge counts exactly what the live route returns, that
+the wording/plurals are right, and — through a synthetic `workers` payload — that both
+disagreements reach the screen: the badge flag, the label on the card's row, and the panel
+with one row per process (a live board cannot be asked to produce a worker that outlives its
+card on demand). The **narrow layout** and the phone-side tap are measured in real Chromium
+by `tests/carousel_test.js`: at 360px only the short form of the label is shown and the badge
+stays inside the viewport, at 1440px the long form sits on the counters' line.
 
-Почему не `todo`: форма создаёт карточку в `ready` и переводит её в `todo`
-следующим `PATCH` — тик диспетчера может попасть в это окно.
+```bash
+HLV_LIVE_TASK=<id of a card with a run and an attachment> \
+  PLAYWRIGHT_PATH=... CHROME_PATH=... node tools/runs_files_layout_check.js
+```
 
-Почему не «профиль `default`, под ним воркер не крутится» (так было
-написано раньше): это перестало быть правдой с v0.22.3 — у каждого профиля
-теперь есть гейтвей, и диспетчер забирает карточки, назначенные `default`,
-тоже. Спасает именно состояние, а не профиль.
+The geometry of the “main” tab — and of the executor combobox and the description editor —
+is measured in real Chromium by `tools/pane_layout_check.js`: the combobox must open as a
+`<select>`, carry the installed profiles, stay inside the pane's right edge and sit on its own
+field row; the description editor must open **tall** (≥320 px, `resize: vertical`) instead of
+the old 180 px sliver.
 
-И стенд это **проверяет**, а не полагается на аккуратность: каждая созданная
-карточка читается обратно с сервера перед удалением, и если диспетчер успел
-её забрать (появились claim или run) — прогон падает на проверке 13 и
-называет карточку. Раньше такой случай был полностью немым: карточка
-удалялась, доска выглядела чистой, а воркер падал на «task not found» — и
-это стоило четырёх фантомных воркеров на живой доске `ff`.
+```bash
+PLAYWRIGHT_PATH=... CHROME_PATH=... node tools/pane_layout_check.js
+```
 
-Профиль в форме всё равно обязателен: без него карточка навсегда осталась бы
-в `ready` без исполнителя.
+The board and profile being required is checked separately and **in two ways**: by clicking
+the disabled button and by **Enter**, which bypasses the button straight into `submitCreate`.
+For both paths the stand looks not only at the error text but also at the fact that
+`POST /tasks` **did not go out at all**, otherwise the refusal could be decorative. It is
+also checked that the red outline (`hlv-required`) is present on both comboboxes before the
+choice and **goes away** after it.
 
-Отдельно проверяется **подпись приоритета**: у каждой строки она есть, число
-совпадает с `data-priority` и с живой доской (`/board`), и `прио 0` показан
-явно — иначе «приоритет подписан» проходило бы на сборке, где бейджа нет вовсе.
+The `scheduled` state is covered by an end-to-end round trip: the card is created in `ready`,
+the state is set by the same `PATCH` as in the bundled tab, and the card **really ends up in
+`scheduled`** — without a claim and without a run, that is, the dispatcher will not pick it up.
+The same place checks that the card carries exactly the profile the form forced you to pick.
 
-Узкая вёрстка проверяется по самой таблице стилей (jsdom медиазапросы не
-применяет): общая часть задаёт ось и не задаёт ширину карточки, вариант
-`381px…1023px` — список без постраничного snap, вариант `≤380px` — карусель с
-`82%` и `x mandatory`.
+The cards the stand creates get the profile **`default`** and the state **`triage`**. The
+state is the point here: `triage` is a create-time state that no dispatcher lane takes
+(`_lane_rows` is called only for `ready` and `review`), so a stand card cannot be claimed by
+the dispatcher and cannot raise a real worker.
 
-Вид воркспейса и предпросмотр пути покрыты отдельно: доска с нерепозиторным
-workdir + проект с репозиторием → вид `worktree`; без проекта вид остаётся как у
-доски; проект без репозитория → вид доски; поле пути при `worktree` — `readOnly`
-с предпросмотром `<primary>/.worktrees/`, который пересчитывается при смене
-проекта; и главное — **`workspace_path` в payload не появляется, хотя поле
-заполнено**, а карточка в БД получает якорь проекта.
+Why not `ready` (the form's default state): a card in `ready` with a live profile goes to the
+dispatcher within one tick (60 s) and **is really executed**. The stand deletes the card
+immediately — and the worker is left working on a card that no longer exists. This is not
+theory: on 2026-10-26 the stand spawned four phantom workers this way (`t_ead9cb3a`,
+`t_42cb81f1`, `t_e57e6df8`, `t_78d0d004`), and each of them died on “task not found”.
 
-Непривязанного проекта в живых данных может не быть, поэтому стенд **засевает**
-его на время прогона и удаляет после: иначе «непривязанные доступны» проверялось
-бы на пустом множестве и проходило не по той причине. Так же засевается проект
-**без репозитория** — иначе «вид остаётся как у доски» было бы нечем проверять.
+Why not `todo`: the form creates the card in `ready` and moves it to `todo` with the next
+`PATCH` — a dispatcher tick can land in that window.
 
-`tools/anchor_probe.py` проверяет вторую половину контракта — что **ядро** делает
-с этим payload. Он вызывает `kanban_db.create_task` напрямую теми же телами,
-которые отправляет форма, читает строку обратно и сверяет `<primary>/.worktrees/
-<task-id>`, детерминированную ветку `<slug>/<task-id>-<title>` и то, что
-`project_id` не подставился из `board.json.project_id`. Отдельно проверяется
-**проект с чужой или пустой `board_slug`**: карточка принимается, привязывается к
-проекту, и якорь остаётся за проектом, а не за доской — ради этого сценария
-непривязанный проект засевается и удаляется, как и в стенде. Созданные карточки и
-засеянный проект удаляет за собой.
+Why not “profile `default`, no worker runs under it” (as this README used to say): that
+stopped being true in v0.22.3 — every profile now has a gateway, and the dispatcher takes
+cards assigned to `default` as well. The state is what saves you, not the profile.
+
+And the stand **checks** this instead of relying on care: every created card is read back
+from the server before deletion, and if the dispatcher managed to claim it (a claim or a run
+appeared) the run fails on that check and names the card. That case used to be completely
+silent: the card was deleted, the board looked clean, and the worker died on “task not
+found” — which cost four phantom workers on the live `ff` board.
+
+The profile in the form is required anyway: without it the card would stay in `ready` forever
+without an executor.
+
+The **priority label** is checked separately: every row has one, the number matches
+`data-priority` and the live board (`/board`), and `прио 0` is shown explicitly — otherwise
+“the priority is labelled” would also pass on a build where there is no badge at all.
+
+The narrow layout is checked against the stylesheet itself (jsdom does not apply media
+queries): the shared part sets the axis and does not set the card width, the `381px…1023px`
+variant is a list without paging snap, the `≤380px` variant is a carousel with `82%` and
+`x mandatory`.
+
+The workspace kind and the path preview are covered separately: a board with a
+non-repository workdir + a project with a repository → the `worktree` kind; without a project
+the kind stays as the board's; a project without a repository → the board's kind; the path
+field under `worktree` is `readOnly` with a `<primary>/.worktrees/` preview that is
+recomputed when the project changes; and, most importantly, **`workspace_path` does not
+appear in the payload although the field is filled**, while the card in the DB gets the
+project's anchor.
+
+Live data may have no untied project, so the stand **seeds** one for the run and deletes it
+afterwards: otherwise “untied projects are reachable” would be checked against an empty set
+and would pass for the wrong reason. A project **without a repository** is seeded the same
+way — otherwise there would be nothing to check “the kind stays as the board's” with.
+
+`tools/anchor_probe.py` checks the second half of the contract — what the **core** does with
+that payload. It calls `kanban_db.create_task` directly with the same bodies the form sends,
+reads the row back and matches `<primary>/.worktrees/<task-id>`, the deterministic branch
+`<slug>/<task-id>-<title>` and that `project_id` was not substituted from
+`board.json.project_id`. A **project with a foreign or empty `board_slug`** is checked
+separately: the card is accepted, is tied to the project, and the anchor stays with the
+project rather than the board — for that scenario an untied project is seeded and deleted, as
+in the stand. The cards it creates and the project it seeds are removed afterwards.
 
 ```bash
 env -u HERMES_HOME python3 tools/anchor_probe.py ff ff-front
 ```
 
-Отдельно проверяется **порядок списка**: стенд идёт по отрисованным строкам и
-требует, чтобы внутри статуса `done`/`archived` время завершения шло по убыванию,
-а внутри остальных — приоритет. Проверка не самообманывается:
+The **list order** is checked separately: the stand walks the rendered rows and requires that
+inside the `done`/`archived` statuses the completion time decreases, and inside the others the
+priority does. The check does not fool itself:
 
-- у неё есть **негативный контроль** — заведомо неверный порядок должен быть
-  пойман (иначе инвертированное сравнение проходило бы вечно);
-- она **сверяется с доской**: значения `data-priority` / `data-completed-at` в
-  строках сравниваются с тем, что отдаёт встроенный `/board`, так что список не
-  может быть «правильно отсортирован по выдуманным константам».
+- it has a **negative control** — a deliberately wrong order must be caught (otherwise an
+  inverted comparison would pass forever);
+- it **matches the board**: the `data-priority` / `data-completed-at` values in the rows are
+  compared with what the bundled `/board` returns, so the list cannot be “correctly sorted by
+  invented constants”.
 
 ```bash
 curl -s -c /tmp/hlv.cookies -X POST http://127.0.0.1:9119/auth/password-login \
   -H 'Content-Type: application/json' \
   -d '{"provider":"basic","username":"<user>","password":"<pass>"}'
 
-node tests/render_test.js                                # исходники
-node tests/render_test.js /tmp/served/dist/index.js      # то, что реально отдаёт дашборд
+node tests/render_test.js                                # the sources
+node tests/render_test.js /tmp/served/dist/index.js      # what the dashboard really serves
 ```
 
-`tests/carousel_test.js` — вторая половина проверки, **настоящий Chromium**:
-jsdom не применяет медиазапросы и не верстает, поэтому горизонтальные варианты
-можно доказать только в браузере. **21 проверка**, три вьюпорта:
+`tests/carousel_test.js` is the second half of the check, in **real Chromium**: jsdom neither
+applies media queries nor lays out, so the horizontal variants can only be proven in a
+browser. **21 checks**, three viewports:
 
-- **390px** — горизонтальный **список**: `flex-direction: row`, `overflow-x: auto`,
-  по Y заблокировано, полоса шире экрана, `scroll-snap-type: none`, **в кадре
-  больше одной карточки**, карточка заметно уже экрана; выбор карточки двигает
-  `scrollLeft` (а `scrollTop` остаётся нулём) и карточка попадает в кадр;
-- **360px** — **карусель**: карточка чуть уже экрана, примагничивание к левому
-  краю, `scroll-snap-type: x mandatory`;
-- **1440px** — список возвращается вертикальной колонкой (защита от регрессии).
+- **390px** — a horizontal **list**: `flex-direction: row`, `overflow-x: auto`, locked along
+  Y, the strip wider than the screen, `scroll-snap-type: none`, **more than one card in
+  frame**, the card noticeably narrower than the screen; picking a card moves `scrollLeft`
+  (while `scrollTop` stays zero) and the card lands in frame;
+- **360px** — a **carousel**: the card slightly narrower than the screen, snapping to the
+  left edge, `scroll-snap-type: x mandatory`;
+- **1440px** — the list returns to a vertical column (a regression guard).
 
-Там же проверяется **подпись приоритета** в отрисованных карточках (её нет ни
-на одной, число совпадает с `data-priority`) и **поиск по номеру задачи**
-(ровно одно совпадение). Отдельно — **обрезка подписи доски**: она измеряется
-относительно неограниченного двойника того же селектора, а не «на глаз» и не по
-зашитой ширине стрелки; именно на этом проверялась правка `.hlv-board-select`.
+The same place checks the **priority label** on the rendered cards (every one has it, the
+number matches `data-priority`) and **search by task id** (exactly one match). Separately —
+**board label clipping**: it is measured against an uncapped twin of the same selector, not
+“by eye” and not against a hard-coded arrow width; that is exactly what the
+`.hlv-board-select` fix was verified with.
 
 ```bash
-PLAYWRIGHT_PATH=<путь к playwright> CHROME_PATH=<путь к chrome> \
+PLAYWRIGHT_PATH=<path to playwright> CHROME_PATH=<path to chrome> \
   node tests/carousel_test.js          # 21/21 checks passed
 ```
 
-**Геометрия вкладки «основное»** проверяется отдельно — `tools/pane_layout_check.js`
-(настоящий Chromium, живой дашборд). jsdom не верстает, поэтому в нём не видно
-сломанной коробки, а сломана она была: панель и обёртка макета носили **один
-класс** `hlv-main`, и правило обёртки (`display: flex` + строка) раскладывало
-четыре элемента карточки (шапка, приоритет, состояние, тело) **в одну строку**
-вместо стопки. Проба меряет геометрию: элементы панели идут сверху вниз, панель
-занимает только правую половину, обёртка осталась строкой, и ни один элемент
-не вылезает за пределы своей панели. Панель ищется **структурно** (по строке
-заголовка внутри неё), а не по классу: класс панели — ровно то, в чём был баг,
-и поиск по классу нашёл бы панель только когда бага нет. Тот же замер идёт и на
-узком экране (390px), где макет переключается в колонку: стопка должна
-остаться стопкой.
+**The “main” tab's geometry** is checked separately — `tools/pane_layout_check.js` (real
+Chromium, live dashboard). jsdom does no layout, so a broken box is invisible there — and
+broken it was: the pane and the layout wrapper carried **one class** `hlv-main`, and the
+wrapper's rule (`display: flex` + row) laid the card's four elements (head, priority, state,
+body) **out in a single line** instead of a stack. The probe measures the geometry: the pane's
+elements go top to bottom, the pane occupies only the right half, the wrapper is still a row,
+and no element runs outside its own pane. The pane is located **structurally** (by the title
+row inside it), not by class: the pane's class is exactly what the bug was about, and a
+class-based search would only find the pane when the bug is absent. The same measurement runs
+on a narrow screen (390px), where the layout switches to a column: the stack must stay a
+stack.
 
-Там же меряется **место карандаша**: он стоит **справа от значения**, которое
-правит, — справа от числа приоритета и справа от заголовка, на той же строке.
-Это обещание вёрстки, и jsdom его не видит: карандаш, съехавший влево или на
-свою строку, перестал бы читаться как «этот карандаш правит это число».
-Негативный контроль на месте: с карандашом, сдвинутым влево, проба падает
-ровно на этой строке.
+The same probe measures **where the pencil sits**: it stands **to the right of the value** it
+edits — right of the priority number, the title and the executor, on the same line. That is a
+layout promise and jsdom cannot see it: a pencil that slid left or onto its own line would stop
+reading as “this pencil edits this value”. The negative control is in place: with a pencil
+shifted left, the probe fails on exactly that line.
 
 ```bash
-PLAYWRIGHT_PATH=<путь к playwright> CHROME_PATH=<путь к chrome> \
-  node tools/pane_layout_check.js      # 12/12 checks passed
+PLAYWRIGHT_PATH=<path to playwright> CHROME_PATH=<path to chrome> \
+  node tools/pane_layout_check.js      # 22/22 checks passed
 ```
 
-**Транскрипт** проверяется в двух стендах, потому что две его половины живут в
-разных местах.
+**The transcript** is checked in two stands, because its two halves live in different places.
 
-`tests/test_transcript.py` — **роут целиком, на поддельных базах**: стенд
-поднимает настоящий `router` плагина над файловой БД доски и поддельным стором
-профиля и проверяет контракт: сообщения приходят **в порядке id**, курсор
-`after` отсекает уже показанные, `next_after`/`has_more` описывают остаток,
-**карточка без события `owner_admitted` отдаёт `source: "worker_log"`** с пустым
-списком и **не 500**, отсутствующий стор и неизвестная доска дают
-`source: "none"`, огромный tool-результат **обрезан и обрезка помечена**, а сам
-стор после запроса **не изменился** (роут читает только). Отдельно: JSON-обёртка
-tool-результата **разворачивается** в `text` (с настоящими переводами строк),
-**рассуждения агента** возвращаются, ход агента (**вызовы инструментов**) виден,
-а стор **старой схемы** (без колонок `tool_calls`/`reasoning`) читается как есть.
-Стенд автономен: живого дашборда и `hermes_cli` ему не нужно.
+`tests/test_transcript.py` — **the route end to end, on fake databases**: the stand raises the
+plugin's real `router` over a file-based board DB and a fake profile store, and checks the
+contract: messages arrive **in id order**, the `after` cursor cuts off what was already shown,
+`next_after`/`has_more` describe the remainder, **a card without an `owner_admitted` event
+answers `source: "worker_log"`** with an empty list and **not a 500**, a missing store and an
+unknown board give `source: "none"`, a huge tool result is **truncated and the truncation is
+marked**, and the store itself **is unchanged** after the request (the route only reads).
+Separately: the JSON wrapper of a tool result is **unwrapped** into `text` (with real line
+breaks), the **agent's reasoning** is returned, the agent's turn (**tool calls**) is visible,
+and a store of the **old scheme** (without the `tool_calls`/`reasoning` columns) is read as it
+is. The stand is self-contained: it needs neither a live dashboard nor `hermes_cli`.
 
 ```bash
-python3 tests/test_transcript.py      # 43/43 checks passed
+python3 tests/test_transcript.py      # 116/116 checks passed
 ```
 
-`tools/transcript_check.js` — **живой дашборд в настоящем Chromium**: панель
-должна показать реальные сообщения карточки, пометить их ролью, назвать
-session id, прокручиваться по вертикали, **разложить своих детей в стопку**
-(ровно тот баг, который был у вкладки «основное») и остаться прижатой к
-последнему сообщению. Отдельно проверяется **старая схема**: панель объясняет,
-что транскрипт в логе, и не делает вид, что сообщений нет. И — что вкладка
-«лог» не сломалась и показывает лог как раньше.
+The same file checks the **live model stream** (`GET /tasks/{id}/live`): the stream file is
+assembled into the text of the current call, **a new call overwrites** the previous one (no
+history sticks), `end` flips `streaming` to `false`, a **torn line** does not break the parse,
+and a missing file turns into a **reason in words** instead of a 500: “the agent is not calling
+the model right now”, “the plugin is not enabled”, “reasoning is off”. The `reasoning_enabled`
+flag is read from the owner profile's `config.yaml`.
+
+`tools/transcript_check.js` — **the live dashboard in real Chromium**: the pane must show the
+card's real messages, label them with their role, name the session id, scroll vertically,
+**lay its children out in a stack** (exactly the bug the “main” tab had) and stay pinned to the
+last message. The **old scheme** is checked separately: the pane explains that the transcript
+is in the log and does not pretend there are no messages. And — that the “log” tab is not
+broken and shows the log as before.
 
 ```bash
-PLAYWRIGHT_PATH=<путь к playwright> CHROME_PATH=<путь к chrome> \
+PLAYWRIGHT_PATH=<path to playwright> CHROME_PATH=<path to chrome> \
   node tools/transcript_check.js      # 15/15 checks passed
 ```
 
-`tools/transcript_readable_check.js` — **читаемость и автопрокрутка** в
-настоящем Chromium: JSON-обёртка tool-результата развёрнута (в тексте нет
-ни одного сообщения, целиком экранированного в `\n`), переводы строк настоящие,
-**рассуждения агента видны** и раскрываются, **вызовы инструментов** видны, и —
-главное — панель **следует за хвостом**, пока читатель не прокрутил вверх;
-после прокрутки вверх она не прыгает обратно, а кнопка «вниз» возвращает её к
-хвосту.
+`tools/transcript_readable_check.js` — **readability and autoscroll** in real Chromium: the
+tool result's JSON wrapper is unwrapped (no message in the text is entirely escaped into
+`\n`), the line breaks are real, the **agent's reasoning is visible** and expands, the **tool
+calls** are visible, and — most importantly — the pane **follows the tail** until the reader
+scrolls up; after scrolling up it does not jump back, while the “down” button brings it back to
+the tail.
 
 ```bash
-PLAYWRIGHT_PATH=<путь к playwright> CHROME_PATH=<путь к chrome> \
+PLAYWRIGHT_PATH=<path to playwright> CHROME_PATH=<path to chrome> \
   node tools/transcript_readable_check.js      # 17/17 checks passed
 ```
 
-`tools/transcript_switch_check.js` — **смена карточки**: транскрипт принадлежит
-одной карточке, и пока новая не приехала, панель не имеет права показывать
-старую (читатель принял бы чужой текст за текст выбранной карточки). Проба
-переключает карточку и проверяет, что сессия сменилась и у второй карточки своя.
+`tools/transcript_switch_check.js` — **switching cards**: a transcript belongs to one card, and
+until the new one arrives the pane has no right to show the old one (the reader would take a
+foreign text for the selected card's). The probe switches the card and checks that the session
+changed and that the second card has its own.
 
 ```bash
-PLAYWRIGHT_PATH=<путь к playwright> CHROME_PATH=<путь к chrome> \
+PLAYWRIGHT_PATH=<path to playwright> CHROME_PATH=<path to chrome> \
   node tools/transcript_switch_check.js      # 6/6 checks passed
 ```
 
-`tools/hlv_curl.py` — **живой запрос к дашборду с авторизацией**: логин в
-`/auth/password-login`, cookie сессии и запрос по `/api/plugins/…`. Нужен,
-когда надо смотреть на живой ответ роута, а не на подделочный стенд.
+`tools/live_stream_check.js` — **the live stream and collapsing the strip** in real Chromium.
+The live block only exists while a model call is running, so the probe needs a card that is
+**working right now**: it waits for the block to appear (up to 4 minutes), makes sure the block
+is **last in the list**, that its text **grows** between two measurements, and that what streams
+is **reasoning** (not just the finished answer). Then the strip: the “collapse” button folds it
+into one line, the run trail disappears, the choice **survives a page reload**, and “expand”
+brings everything back.
+
+```bash
+HLV_LIVE_TASK_TITLE="live feed check" node tools/live_stream_check.js
+```
+
+If the card has already finished all its model calls, the probe **fails honestly** (“no
+reasoning in the stream during the observation window”) instead of passing on an empty screen.
+
+`tools/hlv_curl.py` — **a live request to the dashboard with authorisation**: a login at
+`/auth/password-login`, a session cookie and a request to `/api/plugins/…`. Needed when you
+want to look at a route's live answer rather than at a fake stand.
 
 ```bash
 python3 tools/hlv_curl.py '/api/plugins/hermes-logs-viewer/transcript?board=hypercube&task_id=t_5acc9c91'
 ```
 
-`tools/css_probe.js` — та же проверка **без браузера**: он грузит настоящую
-таблицу стилей в jsdom и спрашивает у CSS-движка, что панель вычисляется в
-(`display`/`flex-direction`). Быстрый, без живого дашборда.
+`tools/css_probe.js` — the same check **without a browser**: it loads the real stylesheet into
+jsdom and asks the CSS engine what the pane computes to (`display`/`flex-direction`). Fast, no
+live dashboard.
 
 ```bash
-node tools/css_probe.js                 # OK: панель «основное» — вертикальный поток
+node tools/css_probe.js                 # OK: the "main" pane is a vertical flow
 ```
 
-Отдельные пробы дашборда, которыми и находились причины:
+Separate dashboard probes, the ones that found the causes:
 
 ```bash
-node tools/board_probe.js      # что селектор вообще делает: значение, опции, фильтр, localStorage
-node tools/board_label_fit.js  # помещается ли подпись (сравнение с неограниченным двойником)
+node tools/board_probe.js      # what the selector actually does: value, options, filter, localStorage
+node tools/board_label_fit.js  # does the label fit (compared with an uncapped twin)
 ```
 
-Первая из них заодно объясняет, почему страницу надо открывать как
-`/hermes-logs-viewer?profile=default`: дашборд иначе уводит браузер на
-`/sessions?profile=<ваш профиль>` и вкладка не монтируется вовсе.
+The first of them also explains why the page has to be opened as
+`/hermes-logs-viewer?profile=default`: otherwise the dashboard redirects the browser to
+`/sessions?profile=<your profile>` and the tab is not mounted at all.
 
-Скриншоты проверяются отдельно — см. [«Скриншоты»](#скриншоты).
+The screenshots are checked separately — see [“Screenshots”](#screenshots).
 
 ---
 
-## Ограничения
+## Limitations
 
-- вкладка — отдельная страница дашборда (левая навигация, не канвас);
-- показываются логи текущего процесса воркера; после завершения задачи файл остаётся;
-- лог не ротируется плагином, но ядро ограничивает файл 2 МБ. Если файл всё же
-  длиннее лимита в 40 000 строк, показываются первые строки с пометкой, сколько
-  отброшено;
-- размер и смещение показаны в **байтах**; в подсказке — человекочитаемый вид и
-  число строк;
-- **файл лога карточки в новой схеме почти пуст** (одна строка `Session: …`):
-  карточку выполняет owner-гейтвей профиля, а воркер-клиент только ждёт receipt.
-  Полный текст работы лежит в сторе профиля-владельца, и его показывает
-  вкладка **«транскрипт»**; вкладка «лог» для таких карточек говорит об этом
-  прямо. Для карточек **старой схемы** всё как было: транскрипт в файле лога,
-  а панель транскрипта отсылает на вкладку «лог»;
-- **транскрипт читает чужое хранилище**: стор профиля-владельца. Он открывается
-  **только на чтение** (`mode=ro`), и если у карточки нет события
-  `owner_admitted` (старая схема) — панель не лезет ни в какие сторы;
-- backend плагина нужен только ради сквозного списка задач, комментариев и
-  транскрипта.
+- the tab is a separate dashboard page (left navigation, not a canvas);
+- it shows the logs of the current worker process; after a task finishes the file stays;
+- the log is not rotated by the plugin, but the core caps the file at 2 MB. If the file is
+  still longer than the 40 000-line limit, the first lines are shown with a note saying how
+  much was dropped;
+- the size and the offset are shown in **bytes**; the tooltip carries the human-readable form
+  and the line count;
+- **in the new scheme the card's log file is almost empty** (one line `Session: …`): the card
+  is executed by the profile's owner gateway, and the worker client only waits for a receipt.
+  The full text of the work lives in the owner profile's store, and the **“transcript”** tab
+  shows it; for such cards the “log” tab says so directly. For cards of the **old scheme**
+  everything is as it was: the transcript is in the log file, and the transcript pane points
+  at the “log” tab;
+- **the transcript reads someone else's storage**: the owner profile's store. It is opened
+  **read-only** (`mode=ro`), and if the card has no `owner_admitted` event (the old scheme),
+  the pane does not reach into any store;
+- the plugin's backend exists only for the cross-board task list, the comments and the
+  transcript.
 
 ---
 
-## Лицензия
+## License
 
 [MIT](LICENSE)

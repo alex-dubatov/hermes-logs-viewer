@@ -232,6 +232,72 @@ const probeList = (page) => page.evaluate(() => {
   check("на 360px листается по карточкам (scroll-snap)",
     /x\s+mandatory/.test(small.snapType), "scroll-snap-type: " + small.snapType);
 
+  // --- бейдж живых воркеров в узкой шапке -------------------------------
+  // На телефоне места в шапке нет, а число задач в предложном падеже
+  // («на 3 задачах») длинное: там показывается короткая форма («· 3 задачи»),
+  // переключаемая CSS, а сам бейдж обязан остаться в пределах экрана.
+  const narrowBadge = await page.evaluate(() => {
+    const b = document.querySelector(".hlv-header .hlv-workers");
+    if (!b) return null;
+    const cs = (sel) => {
+      const n = b.querySelector(sel);
+      return n ? getComputedStyle(n).display : "missing";
+    };
+    const r = b.getBoundingClientRect();
+    const header = document.querySelector(".hlv-header");
+    return {
+      text: b.textContent,
+      wide: cs(".hlv-workers-tasks-wide"),
+      compact: cs(".hlv-workers-tasks-compact"),
+      width: Math.round(r.width),
+      vw: window.innerWidth,
+      overflow: document.documentElement.scrollWidth > window.innerWidth + 1,
+      headerHeight: Math.round(header.getBoundingClientRect().height),
+      height: Math.round(r.height),
+    };
+  });
+  check("на 360px бейдж воркеров на месте", !!narrowBadge);
+  check("на 360px бейдж показывает короткую форму числа задач",
+    !!narrowBadge && narrowBadge.compact !== "none" && narrowBadge.wide === "none",
+    narrowBadge && ("wide: " + narrowBadge.wide + ", compact: " + narrowBadge.compact));
+  check("на 360px бейдж влезает в экран (страница не едет по горизонтали)",
+    !!narrowBadge && narrowBadge.width <= narrowBadge.vw && !narrowBadge.overflow,
+    narrowBadge && (narrowBadge.width + "px из " + narrowBadge.vw + "px"));
+
+  // Тап по бейджу на телефоне — единственный способ увидеть, КТО работает:
+  // наведения там нет, title не показывается.
+  await page.tap(".hlv-header .hlv-workers").catch(async () => {
+    await page.click(".hlv-header .hlv-workers");
+  });
+  await sleep(500);
+  const narrowModal = await page.evaluate(() => {
+    const m = document.querySelector(".hlv-workers-modal");
+    if (!m) return null;
+    const r = m.getBoundingClientRect();
+    return {
+      width: Math.round(r.width),
+      vw: window.innerWidth,
+      summary: (m.querySelector(".hlv-modal-hint") || {}).textContent || "",
+      rows: m.querySelectorAll(".hlv-worker-row").length,
+      title: (m.querySelector(".hlv-modal-title") || {}).textContent || "",
+    };
+  });
+  check("на 360px тап по бейджу открывает панель «кто работает»",
+    !!narrowModal, narrowModal && narrowModal.title);
+  check("панель влезает в узкий экран",
+    !!narrowModal && narrowModal.width <= narrowModal.vw,
+    narrowModal && (narrowModal.width + "px из " + narrowModal.vw + "px"));
+  check("в сводке панели есть числа процессов и задач",
+    !!narrowModal && /\d+ воркер/.test(narrowModal.summary),
+    narrowModal && narrowModal.summary);
+  const closeBtn = await page.$(".hlv-workers-modal .hlv-btn");
+  if (closeBtn) {
+    await closeBtn.click();
+    await sleep(300);
+  }
+  check("панель закрывается кнопкой",
+    !(await page.$(".hlv-workers-modal")));
+
   // --- desktop must stay a vertical column (regression guard) -----------
   await page.setViewportSize({ width: 1440, height: 900 });
   await sleep(2500);
@@ -242,6 +308,39 @@ const probeList = (page) => page.evaluate(() => {
   check("на десктопе список снова вертикальный",
     wide.dir === "column" && wide.overflowY === "auto",
     "flex-direction: " + wide.dir + ", overflow-y: " + wide.overflowY);
+
+  // На десктопе места хватает на длинную форму числа задач — ту, которую
+  // просил владелец: бейдж стоит справа от «N running · N queued · …».
+  const wideBadge = await page.evaluate(() => {
+    const b = document.querySelector(".hlv-header .hlv-workers");
+    if (!b) return null;
+    const cs = (sel) => {
+      const n = b.querySelector(sel);
+      return n ? getComputedStyle(n).display : "missing";
+    };
+    const r = b.getBoundingClientRect();
+    const counter = document.querySelector(".hlv-header .hlv-hints");
+    const cr = counter.getBoundingClientRect();
+    const hr = document.querySelector(".hlv-header").getBoundingClientRect();
+    const mid = (x) => (x.top + x.bottom) / 2;
+    return {
+      text: b.textContent,
+      wide: cs(".hlv-workers-tasks-wide"),
+      compact: cs(".hlv-workers-tasks-compact"),
+      right: Math.round(r.right),
+      headerRight: Math.round(hr.right),
+      // Одна строка со счётчиками: шапка выравнивает элементы по центру, а
+      // слева стоит высокая стопка доски — поэтому сравниваются середины, а
+      // не top.
+      sameRowAsCounters: Math.abs(mid(r) - mid(cr)) < 8,
+    };
+  });
+  check("на десктопе бейдж показывает длинную форму («на N задачах»)",
+    !!wideBadge && wideBadge.wide !== "none" && wideBadge.compact === "none",
+    wideBadge && ("wide: " + wideBadge.wide + ", compact: " + wideBadge.compact));
+  check("на десктопе бейдж стоит в строке счётчиков и не вылезает из шапки",
+    !!wideBadge && wideBadge.sameRowAsCounters && wideBadge.right <= wideBadge.headerRight,
+    wideBadge && (wideBadge.right + "px из " + wideBadge.headerRight + "px"));
 
   check("нет ошибок JS на странице", errors.length === 0, errors.slice(0, 2).join(" | "));
 

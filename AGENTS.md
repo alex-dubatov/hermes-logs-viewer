@@ -47,14 +47,19 @@ with no build step; backend: one Python route file (`dashboard/plugin_api.py`).
 
 | Command | Purpose |
 | ------- | ------- |
-| `node tests/render_test.js` | основной стенд: jsdom + живой дашборд, клики по настоящему UI |
-| `node tests/render_test.js /tmp/served/dist/index.js` | то же против задеплоенной копии |
+| `node tests/render_test.js` | основной стенд: jsdom + живой дашборд, клики по настоящему UI (по умолчанию — копия плагина рядом с тестом) |
+| `node tests/render_test.js /путь/dist/index.js` | то же против указанной (например, задеплоенной) копии |
+| `python3 tests/test_comments.py` | лента комментариев и их удаление: доставка воркеру (стартовый контекст / заметка в ходе работы), `pending` / `own` / `unknown`, 409 без `force`, снятие парного события |
 | `node tools/transcript_fold_check.js` | настоящий Chromium: все блоки рассуждений раскрыты, все не-assistant шаги свёрнуты, свёрнутое раскрывается по клику |
+| `HLV_LIVE_TASK_TITLE=… node tools/live_stream_check.js` | настоящий Chromium: живой блок рассуждений растёт в потоке и стоит последним, верхняя полоса сворачивается и помнит выбор (нужна работающая прямо сейчас карточка) |
 | `node tools/runtime_field_check.js` | настоящий Chromium: поле «время выполнения» в «основном» — 7 минут доезжают до доски как 420 секунд |
 | `PLAYWRIGHT_PATH=… CHROME_PATH=… node tests/carousel_test.js` | узкая вёрстка в настоящем Chromium |
-| `PLAYWRIGHT_PATH=… CHROME_PATH=… node tools/pane_layout_check.js` | геометрия вкладки «основное» в настоящем Chromium |
+| `PLAYWRIGHT_PATH=… CHROME_PATH=… node tools/pane_layout_check.js` | геометрия вкладки «основное» в настоящем Chromium: стопка, место карандашей, комбобокс исполнителя, высота поля описания |
+| `HLV_LIVE_TASK=… PLAYWRIGHT_PATH=… CHROME_PATH=… node tools/runs_files_layout_check.js` | настоящий Chromium: вкладки «запуски» и «файлы» — геометрия, настоящая загрузка файла, скачивание с проверкой байтов, удаление |
 | `node tools/css_probe.js` | та же проверка без браузера: CSS-движок над настоящей таблицей стилей |
+| `python3 tests/test_workers.py` | живой бейдж воркеров на бэкенде: настоящие процессы `/proc`, закрытые run'ы, чужие claim-локи, переиспользованный pid |
 | `node tools/board_probe.js` / `tools/board_label_fit.js` | пробы селектора досок |
+| `node tools/board_switch_check.js` | живой стенд левого списка: id и дата создания в строке, дубли на «все доски», порядок статус-группами по всем доскам, переключение досок без смешения, кнопки гейтвея |
 | `env -u HERMES_HOME python3 tools/anchor_probe.py ff ff-front` | якорь проекта на стороне ядра |
 
 Требуется живой дашборд на `127.0.0.1:9119` и cookie jar `/tmp/hlv.cookies`:
@@ -116,8 +121,9 @@ SIGKILL, с убором потомков), а `systemctl --user start` подн
 
 ## Conventions
 
-- **Язык:** код, комментарии и README — по-русски; сообщения коммитов — на
-  русском (см. историю `git log`).
+- **Язык:** **README — по-английски** (2026-10-29: владелец попросил английский как
+  язык документации плагина); код, комментарии и сообщения коммитов — по-русски (см.
+  историю `git log`).
 - **Один IIFE без сборки.** Не вводить бандлер, npm-зависимости или шаг
   сборки: фронтенд — `dashboard/dist/index.js` + `dashboard/dist/style.css`,
   оба подключаются как есть.

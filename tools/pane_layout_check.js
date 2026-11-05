@@ -216,6 +216,125 @@ const check = (name, ok, extra) => {
         (pencils.title.sameLine ? "" : " — на другой строке!")
       : "не нашлись заголовок и карандаш");
 
+  // --- Executor row ------------------------------------------------------
+  // The executor is edited IN PLACE like the priority: value, then its pencil,
+  // then a hint. The editor that opens is a COMBOBOX (a native <select>) of
+  // installed profiles, so the layout question is different from the number
+  // fields: the control must fit the pane instead of running past its right
+  // edge, and its options must actually be there (an empty <select> would
+  // still look like a working control).
+  const whoRow = await page.evaluate(() => {
+    const row = Array.from(document.querySelectorAll(".hlv-field-row"))
+      .find((r) => /исполнитель/.test(r.textContent || ""));
+    if (!row) return { found: false };
+    const v = row.querySelector(".hlv-assignee-value");
+    const p = row.querySelector(".hlv-pencil");
+    const out = { found: true, value: v ? (v.textContent || "").trim() : null };
+    if (v && p) {
+      const vr = v.getBoundingClientRect();
+      const pr = p.getBoundingClientRect();
+      out.valueRight = Math.round(vr.right);
+      out.pencilLeft = Math.round(pr.left);
+      out.rightOf = pr.left >= vr.right - 1;
+      out.sameLine = Math.abs(pr.top + pr.height / 2 - (vr.top + vr.height / 2)) < 6;
+    }
+    return out;
+  });
+  check("строка «исполнитель» есть в панели", whoRow.found,
+    whoRow.found ? "значение «" + whoRow.value + "»" : "нет .hlv-field-row с «исполнитель»");
+  check("карандаш у исполнителя стоит СПРАВА от значения",
+    !!whoRow.pencilLeft && whoRow.rightOf && whoRow.sameLine,
+    whoRow.pencilLeft
+      ? "значение до x=" + whoRow.valueRight + ", карандаш с x=" + whoRow.pencilLeft +
+        (whoRow.rightOf ? "" : " — СЛЕВА!") +
+        (whoRow.sameLine ? "" : " — на другой строке!")
+      : "не нашлись значение и карандаш");
+
+  // Open the executor editor and measure the combobox itself.
+  const whoPencil = page.locator(".hlv-field-row", { hasText: "исполнитель" })
+    .locator(".hlv-pencil").first();
+  await whoPencil.click();
+  await page.waitForSelector(".hlv-assignee-select", { timeout: 10000 });
+  await page.waitForTimeout(300);
+  const whoSel = await page.evaluate(() => {
+    const sel = document.querySelector(".hlv-assignee-select");
+    if (!sel) return { found: false };
+    const row = sel.closest(".hlv-field-row");
+    const pane = sel.closest(".hlv-log");
+    const r = sel.getBoundingClientRect();
+    const pr = pane ? pane.getBoundingClientRect() : null;
+    return {
+      found: true,
+      tag: sel.tagName,
+      kind: sel.type,
+      w: Math.round(r.width),
+      right: Math.round(r.right),
+      left: Math.round(r.left),
+      paneLeft: pr ? Math.round(pr.left) : null,
+      paneRight: pr ? Math.round(pr.right) : null,
+      paneW: pr ? Math.round(pr.width) : null,
+      options: Array.from(sel.options).map((o) => o.value),
+      selected: sel.value,
+      sameRowAsLabel: !!row && Math.abs(
+        row.querySelector(".hlv-field-label").getBoundingClientRect().top - r.top) < 24,
+    };
+  });
+  check("у исполнителя открылся комбобокс (select), а не текстовое поле",
+    whoSel.found && whoSel.tag === "SELECT",
+    whoSel.found ? whoSel.tag + " type=" + whoSel.kind : "нет .hlv-assignee-select");
+  check("комбобокс исполнителя не вылез за правый край панели",
+    whoSel.found && whoSel.paneRight != null && whoSel.right <= whoSel.paneRight + 2,
+    whoSel.found ? "select [" + whoSel.left + ".." + whoSel.right + "] панель до " +
+      whoSel.paneRight + " (ширина " + whoSel.paneW + ")" : "нет селекта");
+  check("комбобокс исполнителя стоит в своей строке, а не отдельной",
+    !!whoSel.sameRowAsLabel, String(whoSel.sameRowAsLabel));
+  check("в комбобоксе есть профили и пункт «не назначен»",
+    whoSel.found && whoSel.options.length >= 2 && whoSel.options.indexOf("") !== -1,
+    whoSel.found ? whoSel.options.length + " опций, выбрано «" + whoSel.selected + "»"
+                 : "нет селекта");
+  // Leave the card as it was: ✕ closes the editor without a write.
+  await page.locator(".hlv-pencil-cancel").first().click();
+  await page.waitForTimeout(300);
+
+  // --- Description editor height ----------------------------------------
+  // The description is the one paragraph-sized field of the card: the editor
+  // must open TALL (>= 320px of usable box), not as the 180px sliver that
+  // showed four lines. `resize: vertical` may stretch it further; the default
+  // is what is measured here.
+  const editBtn = page.locator('.hlv-desc-actions button', { hasText: "редактировать" }).first();
+  await editBtn.click();
+  await page.waitForSelector(".hlv-desc-editor", { timeout: 10000 });
+  await page.waitForTimeout(400);
+  const ed = await page.evaluate(() => {
+    const t = document.querySelector(".hlv-desc-editor");
+    if (!t) return { found: false };
+    const r = t.getBoundingClientRect();
+    const cs = getComputedStyle(t);
+    const pane = t.closest(".hlv-log");
+    const pr = pane ? pane.getBoundingClientRect() : null;
+    return {
+      found: true,
+      h: Math.round(r.height),
+      w: Math.round(r.width),
+      minHeight: cs.minHeight,
+      resize: cs.resize,
+      paneW: pr ? Math.round(pr.width) : null,
+      paneRight: pr ? Math.round(pr.right) : null,
+      right: Math.round(r.right),
+    };
+  });
+  check("поле описания открылось при редактировании", ed.found);
+  check("поле описания заметно выше прежних 180px",
+    ed.found && ed.h >= 320, ed.found ? "высота " + ed.h + "px (min-height " + ed.minHeight + ")" : "нет поля");
+  check("поле описания не вылезло за правый край панели",
+    ed.found && ed.paneRight != null && ed.right <= ed.paneRight + 2,
+    ed.found ? "поле [" + ed.w + "px] панель " + ed.paneW + "px" : "нет поля");
+  check("поле описания осталось растягиваемым по вертикали",
+    ed.found && ed.resize === "vertical", ed.found ? ed.resize : "нет поля");
+  // Cancel — the card must keep its description untouched.
+  await page.locator('.hlv-desc-actions button', { hasText: "отмена" }).first().click();
+  await page.waitForTimeout(300);
+
   // --- Narrow viewport --------------------------------------------------
   // Below 1023px the layout switches to a column (list on top, pane below).
   // The pane must keep its stacked layout there too — the media query turns

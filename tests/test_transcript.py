@@ -34,6 +34,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -661,6 +662,123 @@ def main() -> int:
                            ("t_new00001",)).fetchone()[0]
     con.close()
     check("комментарий: отказы ничего не записали", n_after == 1, n_after)
+
+    # --- живой поток модели (/tasks/{id}/live) ----------------------------
+    #
+    # Токены текущего вызова лежат в plugin-data профиля-владельца: их пишет
+    # __init__.py плагина, подписанный на поток ядра. Роут собирает файл в
+    # текст текущего вызова и НЕ ходит в стор.
+    live_dir = store_path.parent / "plugin-data" / "hermes-logs-viewer" / "live"
+    live_dir.mkdir(parents=True, exist_ok=True)
+    live_file = live_dir / (session_id + ".ndjson")
+
+    def write_live(records):
+        with open(live_file, "w", encoding="utf-8") as fh:
+            for rec in records:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    def get_live(task_id="t_new00001"):
+        return client.get("/tasks/%s/live" % task_id, params={"board": "hypercube"})
+
+    # Профиль без config.yaml: поток объясняется как «нечего читать», а не 500.
+    r_live = get_live()
+    body = r_live.json()
+    check("поток: ответ 200 без файла", r_live.status_code == 200, r_live.status_code)
+    check("поток: без файла available = False", body.get("available") is False,
+          body.get("available"))
+    check("поток: без файла есть причина", bool(body.get("reason")), body.get("reason"))
+
+    # Профиль настроен: плагин включён и рассуждения отдаются.
+    (store_path.parent / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - hermes-logs-viewer\n  stream_reasoning_deltas: true\n",
+        encoding="utf-8")
+    # ...но каталога плагина в профиле нет. `plugins.enabled` его не ставит, а
+    # discovery обходит `$HERMES_HOME/plugins`: запись в конфиге без каталога —
+    # «включено то, чего нет», и именно это (а не флаг рассуждений) держит поток
+    # мёртвым. Диагностика обязана называть установку, а не флаг.
+    body = get_live().json()
+    check("поток: плагин включён, но не установлен -> «не установлен»",
+          "не установлен" in (body.get("reason") or ""), body.get("reason"))
+
+    # Плагин установлен (каталог на месте), файла ещё нет -> модель не вызвана.
+    (store_path.parent / "plugins" / "hermes-logs-viewer").mkdir(parents=True, exist_ok=True)
+    body = get_live().json()
+    check("поток: настроенный профиль без файла -> «не вызывает модель»",
+          "не вызывает модель" in (body.get("reason") or ""), body.get("reason"))
+
+    # Идущий вызов: рассуждение и текст, ещё без end.
+    now = time.time()
+    write_live([
+        {"t": now - 3, "ev": "start", "turn": "turn-1", "iter": 4,
+         "model": "qwen3.8-27b", "provider": "rig", "surface": "kanban"},
+        {"t": now - 2, "ev": "d", "kind": "reasoning", "text": "думаю "},
+        {"t": now - 1.5, "ev": "d", "kind": "reasoning", "text": "про карточку"},
+        {"t": now - 1, "ev": "d", "kind": "text", "text": "Сейчас "},
+        {"t": now - 0.5, "ev": "d", "kind": "text", "text": "посмотрю файлы."},
+    ])
+    body = get_live().json()
+    check("поток: идущий вызов available = True", body.get("available") is True,
+          body.get("available"))
+    check("поток: streaming = True", body.get("streaming") is True, body.get("streaming"))
+    check("поток: рассуждение склеено", body.get("reasoning") == "думаю про карточку",
+          body.get("reasoning"))
+    check("поток: видимый текст склеен", body.get("text") == "Сейчас посмотрю файлы.",
+          body.get("text"))
+    check("поток: номер вызова из start", body.get("iteration") == 4,
+          body.get("iteration"))
+    check("поток: модель из start", body.get("model") == "qwen3.8-27b", body.get("model"))
+    check("поток: рассуждения включены (из config профиля)",
+          body.get("reasoning_enabled") is True, body.get("reasoning_enabled"))
+
+    # Вызов закончился: streaming False, но текст ещё отдаётся.
+    with open(live_file, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"t": time.time(), "ev": "end", "finished": True,
+                             "error": None, "chars": 40}) + "\n")
+    body = get_live().json()
+    check("поток: после end streaming = False", body.get("streaming") is False,
+          body.get("streaming"))
+    check("поток: после end ended = True", body.get("ended") is True, body.get("ended"))
+    check("поток: после end текст на месте", body.get("reasoning") == "думаю про карточку",
+          body.get("reasoning"))
+
+    # Новый вызов перезаписывает блок: показывается ТЕКУЩИЙ, а не история.
+    write_live([
+        {"t": time.time() - 1, "ev": "start", "turn": "turn-1", "iter": 5,
+         "model": "qwen3.8-27b", "provider": "rig", "surface": "kanban"},
+        {"t": time.time(), "ev": "d", "kind": "reasoning", "text": "второй вызов"},
+    ])
+    body = get_live().json()
+    check("поток: новый вызов не тащит прошлый текст",
+          body.get("reasoning") == "второй вызов", body.get("reasoning"))
+    check("поток: номер вызова обновился", body.get("iteration") == 5, body.get("iteration"))
+    check("поток: прошлый текст не прилип", body.get("text") == "", body.get("text"))
+
+    # Обрывок строки (файл пишется параллельно) не должен ломать разбор.
+    with open(live_file, "a", encoding="utf-8") as fh:
+        fh.write('{"t": 0, "ev": "d", "kind": "reason')
+    body = get_live().json()
+    check("поток: обрывок строки пропущен, ответ живой",
+          body.get("available") is True and body.get("reasoning") == "второй вызов",
+          (body.get("available"), body.get("reasoning")))
+
+    # Рассуждения выключены в профиле: видимый текст есть, но флаг честно false.
+    (store_path.parent / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - hermes-logs-viewer\n  stream_reasoning_deltas: false\n",
+        encoding="utf-8")
+    body = get_live().json()
+    check("поток: флаг рассуждений выключен — панель об этом узнает",
+          body.get("reasoning_enabled") is False, body.get("reasoning_enabled"))
+    (store_path.parent / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - hermes-logs-viewer\n  stream_reasoning_deltas: true\n",
+        encoding="utf-8")
+
+    # Карточка без owner-сессии и плохой id — отказы, а не 500.
+    body = get_live("t_old00001").json()
+    check("поток: нет owner-сессии -> available False и причина",
+          body.get("available") is False and "owner-сессии" in (body.get("reason") or ""),
+          body.get("reason"))
+    r_bad_live = client.get("/tasks/не id/live", params={"board": "hypercube"})
+    check("поток: плохой task id -> 400", r_bad_live.status_code == 400, r_bad_live.status_code)
 
     failed = [n for n, ok in RESULTS if not ok]
     print("\n=== %d/%d checks passed ===" % (len(RESULTS) - len(failed), len(RESULTS)))
