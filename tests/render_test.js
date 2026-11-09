@@ -1768,6 +1768,134 @@ const TEST_ASSIGNEE = "default";
     dropNonRepo();
   }
 
+  // --- 7d. model override in the create form (ТЗ) -----------------------
+  // A card's DEFAULT model is its worker profile's model. The form opens on
+  // exactly that pair, so an untouched picker writes nothing; a changed pair
+  // must reach the card as `model_override`/`provider_override` — and the core
+  // must accept it, which only reading the created card back proves.
+  {
+    const mdBoard = bareBoard || boards.boards[0];
+    const roster = (await fetchJSON("/api/plugins/kanban/profiles")).profiles || [];
+    const who = roster.find((p) => p.name === TEST_ASSIGNEE) || roster[0] || null;
+    const catalog = (await fetchJSON("/api/plugins/kanban/model-options")).providers || [];
+
+    await openDialog(mdBoard.slug);
+    const mField = fieldByLabel("Модель");
+    const provSel = mField && mField.querySelector("select.hlv-model-provider");
+    const modSel = mField && mField.querySelector("select.hlv-model-name");
+    check("в форме есть поле «Модель»", !!mField);
+    check("в поле модели есть комбобокс провайдера", !!provSel);
+    check("в поле модели есть комбобокс модели", !!modSel);
+    check("поле модели стоит под комбобоксом профиля", (() => {
+      const fields = $$(".hlv-field");
+      const profIdx = fields.findIndex((f) => {
+        const s = f.querySelector(".hlv-field-label");
+        return s && (s.textContent || "").trim().indexOf("Профиль") === 0;
+      });
+      return profIdx !== -1 && fields.indexOf(mField) > profIdx;
+    })(), "порядок полей");
+
+    if (provSel && modSel && who) {
+      // THE DEFAULT: the worker's own pair, visible without a click.
+      check("по умолчанию выбран провайдер профиля", provSel.value === (who.provider || ""),
+        "value=" + JSON.stringify(provSel.value) + " профиль=" + JSON.stringify(who.provider));
+      check("по умолчанию выбрана модель профиля (дефолт воркера)",
+        modSel.value === (who.model || ""),
+        "value=" + JSON.stringify(modSel.value) + " профиль=" + JSON.stringify(who.model));
+      check("список моделей доступен, пока провайдер выбран", modSel.disabled === false,
+        "disabled=" + modSel.disabled);
+      check("в списке провайдеров — провайдеры каталога",
+        catalog.length > 0 &&
+          catalog.every((p) => Array.from(provSel.options).some((o) => o.value === p.slug)),
+        "каталог: " + catalog.map((p) => p.slug).join(", "));
+
+      // "как в профиле" clears the pair and locks the model list: a model
+      // belongs to a provider, so without one there is nothing to offer.
+      setSelectValue(provSel, "");
+      await sleep(300);
+      check("без провайдера список моделей заблокирован", modSel.disabled === true,
+        "disabled=" + modSel.disabled);
+      check("подсказка называет дефолтную модель профиля",
+        /по умолчанию — модель профиля/.test((fieldByLabel("Модель") || {}).textContent || ""),
+        ((fieldByLabel("Модель") || {}).textContent || "").slice(0, 90));
+
+      // Put the profile's pair back by hand: the check below needs a live
+      // picker, and this also proves provider → model repopulation.
+      setSelectValue(provSel, who.provider || (catalog[0] || {}).slug || "");
+      await sleep(300);
+
+      const other = catalog.find(
+        (p) => p.slug !== who.provider && (p.models || []).length);
+      if (!other) {
+        check("каталог дал провайдера, отличного от профиля", false,
+          "каталог: " + catalog.map((p) => p.slug).join(", "));
+      } else {
+        setSelectValue(provSel, other.slug);
+        await sleep(300);
+        check("смена провайдера перезаполняет список моделей его моделями",
+          Array.from(modSel.options).map((o) => o.value).join("\u0000") ===
+            other.models.join("\u0000"),
+          "опций " + modSel.options.length + " у " + other.slug);
+        check("после смены провайдера выбрана модель этого провайдера",
+          other.models.indexOf(modSel.value) !== -1,
+          "модель=" + modSel.value + " · провайдер=" + other.slug);
+        check("подсказка называет переопределение пары",
+          /переопределение/.test((fieldByLabel("Модель") || {}).textContent || ""),
+          ((fieldByLabel("Модель") || {}).textContent || "").slice(0, 90));
+
+        const ovTitle = "hlv-autotest: модель override " + Date.now();
+        setInputValue(fieldByLabel("Заголовок").querySelector("input"), ovTitle);
+        POSTS.length = 0;
+        click(findButton("создать"));
+        await sleep(2500);
+        const ovPost = POSTS.filter((p) => p.path.indexOf("/tasks?board=") !== -1).pop();
+        const ovBody = ovPost ? ovPost.body : null;
+        check("выбранная модель уходит в payload как model_override",
+          !!ovBody && ovBody.model_override === modSel.value,
+          ovBody ? JSON.stringify({ m: ovBody.model_override, p: ovBody.provider_override }) : "POST не ушёл");
+        check("провайдер уходит в payload как provider_override",
+          !!ovBody && ovBody.provider_override === other.slug,
+          ovBody ? JSON.stringify({ m: ovBody.model_override, p: ovBody.provider_override }) : "нет тела");
+
+        // The payload is the contract; the ROW is the proof that the core
+        // took it (provider without model is refused, unknown kinds too).
+        const bdOv = await fetchJSON(
+          "/api/plugins/kanban/board?include_archived=true&board=" + encodeURIComponent(mdBoard.slug));
+        let ovCard = null;
+        for (const col of (bdOv.columns || [])) {
+          for (const t of (col.tasks || [])) if (t.title === ovTitle) ovCard = t;
+        }
+        let ovFull = ovCard;
+        if (ovCard) {
+          const rr = await fetchJSON(
+            "/api/plugins/kanban/tasks/" + encodeURIComponent(ovCard.id) +
+              "?board=" + encodeURIComponent(mdBoard.slug));
+          if (rr && rr.task) ovFull = rr.task;
+          await noteClaim(ovCard.id, mdBoard.slug);
+          trackCard(ovCard.id, mdBoard.slug);
+          await fetchJSON(
+            "/api/plugins/kanban/tasks/" + encodeURIComponent(ovCard.id) +
+              "?board=" + encodeURIComponent(mdBoard.slug),
+            { method: "DELETE" });
+        }
+        check("карточка создалась с model_override и provider_override",
+          !!ovFull && ovFull.model_override === modSel.value &&
+            ovFull.provider_override === other.slug,
+          ovFull ? JSON.stringify({ m: ovFull.model_override, p: ovFull.provider_override }) : "карточка не найдена");
+      }
+
+      // Untouched picker = the worker default: the card must carry NO
+      // override at all, so a later profile change still reaches it.
+      await openDialog(mdBoard.slug);
+      const dTitle = "hlv-autotest: модель по умолчанию " + Date.now();
+      setInputValue(fieldByLabel("Заголовок").querySelector("input"), dTitle);
+      const dBody = await createOn(mdBoard.slug, dTitle);
+      check("нетронутая модель профиля не пишется в карточку",
+        !!dBody && dBody.model_override === undefined && dBody.provider_override === undefined,
+        dBody ? JSON.stringify({ m: dBody.model_override, p: dBody.provider_override }) : "POST не ушёл");
+    }
+  }
+
   // --- 7. real create round-trip (runtime + initial status) ------------
   // Runs against a throwaway title, then hard-deletes the card so the board is
   // left as found. The dialog is reopened here: the project-payload block above

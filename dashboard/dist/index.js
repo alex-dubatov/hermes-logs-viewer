@@ -826,10 +826,19 @@ function Page() {
     var currentBoard = currentBoardState[0];
     var setCurrentBoard = currentBoardState[1];
 
-    // Installed Hermes profiles — the create form's assignee picker.
+    // Installed Hermes profiles — the create form's assignee picker. Each entry
+    // carries the profile's own `model` + `provider` (the bundled route reads
+    // them off the profile's config.yaml), which is the create form's DEFAULT
+    // model: a card with no override runs on exactly that pair.
     var profilesState = useState([]);
     var profiles = profilesState[0];
     var setProfiles = profilesState[1];
+
+    // Providers + their curated models for the create form's model picker.
+    // `null` = not fetched yet; the list is static enough to keep forever.
+    var modelCatalogState = useState(null);
+    var modelCatalog = modelCatalogState[0];
+    var setModelCatalog = modelCatalogState[1];
 
     // Projects for the create form's project picker, each carrying the board it
     // belongs to. Read from THIS plugin's `/projects`, not the bundled kanban
@@ -852,6 +861,16 @@ function Page() {
     var draftAssigneeState = useState("");
     var draftAssignee = draftAssigneeState[0];
     var setDraftAssignee = draftAssigneeState[1];
+    // The model pair the card will run with. Both start EMPTY (no profile, so
+    // no pair to show); picking a profile fills them from that profile, which
+    // is why an untouched picker means "the worker's own model" and writes
+    // nothing to the card. "" provider = "как в профиле".
+    var draftProviderState = useState("");
+    var draftProvider = draftProviderState[0];
+    var setDraftProvider = draftProviderState[1];
+    var draftModelState = useState("");
+    var draftModel = draftModelState[0];
+    var setDraftModel = draftModelState[1];
     var draftPriorityState = useState("0");
     var draftPriority = draftPriorityState[0];
     var setDraftPriority = draftPriorityState[1];
@@ -1245,6 +1264,21 @@ function Page() {
         clearInterval(h);
       };
     }, []);
+
+    // Providers + curated models for the create form's model picker, from the
+    // bundled kanban plugin's `/model-options` (the same substrate as the
+    // Models page, so the picker cannot offer a pair Hermes rejects). Fetched
+    // lazily when the dialog opens, and only while the catalog is missing: a
+    // failed fetch is retried on the next open instead of being cached empty.
+    useEffect(function () {
+      if (!createOpen || modelCatalog) return;
+      var stop = false;
+      fetchJSON(KANBAN_API + "/model-options").then(function (r) {
+        if (stop || r.__error || !Array.isArray(r.providers)) return;
+        setModelCatalog(r.providers);
+      }).catch(function () {});
+      return function () { stop = true; };
+    }, [createOpen, modelCatalog]);
 
     // A board that vanished (deleted/renamed) must not stay selected, or the
     // list would sit empty with no way back except the reload.
@@ -1829,6 +1863,11 @@ function Page() {
             workspace: (r.task.workspace_kind || "scratch") +
               (r.task.workspace_path ? " · " + r.task.workspace_path : ""),
             runtime: r.task.max_runtime_seconds || 0,
+            // Per-task model override (set on the create form). Empty = the
+            // card runs on its profile's own model, which is the normal case
+            // and therefore shows nothing.
+            model: r.task.model_override || "",
+            model_provider: r.task.provider_override || "",
           });
           // Never overwrite an open editor with a poll result. Read through
           // the ref: the closed-over `descEdit` is the mount-time value.
@@ -2737,6 +2776,64 @@ function Page() {
       return boardKind;
     }
 
+    // --- Model override of a new card (ТЗ: provider first, then its model) ---
+    // The pair the picked profile itself runs with. This is the form's DEFAULT:
+    // an untouched picker means "whatever the worker would use anyway", so the
+    // card is created with `model_override` NULL and keeps following the
+    // profile if its config changes later.
+    function profileModel(name) {
+      var found = profiles.filter(function (p) { return p.name === name; })[0];
+      return {
+        provider: (found && found.provider) || "",
+        model: (found && found.model) || "",
+      };
+    }
+
+    // One provider row from the catalog. A profile may name a provider the
+    // curated catalog does not list (a local endpoint, e.g. `rig`/`kosareva`):
+    // the row is synthesised so the closed select shows the real value instead
+    // of jumping to the first entry — the same rule the assignee combobox
+    // applies to a profile that is no longer installed.
+    function providerRow(slug) {
+      var rows = modelCatalog || [];
+      for (var i = 0; i < rows.length; i++) {
+        if (rows[i].slug === slug) return rows[i];
+      }
+      return { slug: slug, label: slug, models: [] };
+    }
+
+    // Models to offer for a provider, keeping the currently picked one in the
+    // list even when the catalog does not carry it: a profile pinned to a
+    // model outside the curated set must not be silently replaced by the
+    // first entry.
+    function modelChoices(slug) {
+      var models = (providerRow(slug).models || []).slice();
+      if (draftModel && models.indexOf(draftModel) === -1) models.unshift(draftModel);
+      return models;
+    }
+
+    // Picking a profile re-initialises the picker with THAT profile's pair, so
+    // the field opens on the worker's default model rather than empty.
+    function applyProfileModel(name) {
+      var pair = profileModel(name);
+      setDraftProvider(pair.provider);
+      setDraftModel(pair.model);
+    }
+
+    // What the picker asks for, in the shape `create_task` takes. All-empty =
+    // no override: the pair still equals the profile's own model, so nothing
+    // is written and the card stays on the worker default.
+    function modelOverride() {
+      var pair = profileModel(draftAssignee);
+      var provider = (draftProvider || "").trim();
+      var model = (draftModel || "").trim();
+      if (!model) return { provider: "", model: "" };
+      if (model === (pair.model || "") && provider === (pair.provider || "")) {
+        return { provider: "", model: "" };
+      }
+      return { provider: provider, model: model };
+    }
+
     function openCreate() {
       setDraftBoard("");
       applyBoardWorkspace("");
@@ -2746,6 +2843,7 @@ function Page() {
       setDraftTitle("");
       setDraftBody("");
       setDraftAssignee("");
+      applyProfileModel("");
       setDraftPriority("0");
       setDraftRuntime("0");
       setDraftStatus("ready");
@@ -2783,6 +2881,16 @@ function Page() {
       }
       if (draftWsKind === "dir" && !draftWsPath.trim()) {
         setCreateNote({ kind: "err", text: "нужен путь к каталогу" });
+        return;
+      }
+      // The provider only means something together with a model: the core
+      // refuses `provider_override` without `model_override`
+      // (`kanban_db._validate_model_override`) — a bare provider would
+      // re-resolve the profile's model against another backend. The model
+      // select is filled by the provider change, so this is the backstop.
+      var override = modelOverride();
+      if (!(draftModel || "").trim() && (draftProvider || "").trim()) {
+        setCreateNote({ kind: "err", text: "выберите модель для выбранного провайдера" });
         return;
       }
       // A project that vanished from the list (archived mid-form) must not be sent
@@ -2835,6 +2943,15 @@ function Page() {
         // `max_runtime_seconds IS NOT NULL` guard skips the task entirely.
         max_runtime_seconds: runtimeSeconds > 0 ? runtimeSeconds : null,
       };
+      // The model override goes out ONLY when the picker differs from the
+      // profile's own pair (see modelOverride). `provider_override` is sent
+      // with it on purpose: the pair is what the gateway applies as a unit,
+      // and a model without its provider would be resolved against the
+      // profile's backend instead.
+      if (override.model) {
+        payload.model_override = override.model;
+        if (override.provider) payload.provider_override = override.provider;
+      }
       // `triage` and `blocked` are create-time states in the core; `todo` and
       // `scheduled` are reached by the follow-up PATCH below.
       if (draftStatus === "triage") payload.triage = true;
@@ -4243,7 +4360,13 @@ function Page() {
             el("span", { className: statusClass(curStatus) },
               STATUS_LABEL[curStatus] || curStatus),
             desc.assignee ? el("span", null, "@" + desc.assignee) : null,
-            el("span", null, "воркспейс: " + desc.workspace)
+            el("span", null, "воркспейс: " + desc.workspace),
+            desc.model
+              ? el("span", { className: "hlv-desc-model",
+                  title: "модель переопределена для этой задачи (model_override)" },
+                  "модель: " +
+                  (desc.model_provider ? desc.model_provider + " · " : "") + desc.model)
+              : null
           )
         ),
         el("div", { className: "hlv-field-row" },
@@ -4637,7 +4760,15 @@ function Page() {
               title: draftAssignee
                 ? "кто выполнит задачу"
                 : "обязательно выберите профиль: без него задача останется в ready и её никто не выполнит",
-              onChange: function (e) { setDraftAssignee(e.target.value); },
+              onChange: function (e) {
+                var next = e.target.value;
+                setDraftAssignee(next);
+                // The model the card will run with belongs to the profile, so
+                // a different profile means a different default pair. Doing it
+                // here (not in an effect) keeps the pair and the profile from
+                // ever being read one render apart.
+                applyProfileModel(next);
+              },
               onKeyDown: onCreateKeyDown,
             },
             el("option", { value: "" }, "— выберите профиль —"),
@@ -4653,6 +4784,112 @@ function Page() {
             ? el("span", { className: "hlv-modal-hint hlv-required-hint" },
                 "профиль обязателен — задача без него не уйдёт в работу")
             : null
+        ),
+        // --- Model: provider first, then ITS models (ТЗ) ----------------
+        // The pair opens on the selected profile's own model — that IS the
+        // worker's default — so the field answers "what will run this card"
+        // without a click. Changing it writes a per-task override; leaving it
+        // alone writes nothing (the card follows the profile).
+        el("div", { className: "hlv-field" },
+          el("span", { className: "hlv-field-label" }, "Модель"),
+          el("div", { className: "hlv-field-row" },
+            el("label", { className: "hlv-field hlv-field-model-provider" },
+              el("span", { className: "hlv-field-label" }, "провайдер"),
+              el(
+                "select",
+                {
+                  className: "hlv-select hlv-input hlv-model-provider",
+                  value: draftProvider,
+                  // Locked until a profile is picked: the "как в профиле"
+                  // answer has no meaning before there is a profile.
+                  disabled: !draftAssignee,
+                  title: draftAssignee
+                    ? "сначала провайдер, затем его модель; «как в профиле» — override не пишется"
+                    : "сначала выберите профиль — модель берётся из него",
+                  onChange: function (e) {
+                    var next = e.target.value;
+                    setDraftProvider(next);
+                    if (!next) {
+                      // Back to the profile's model: nothing to pick, and the
+                      // model select goes back to being locked.
+                      setDraftModel("");
+                      return;
+                    }
+                    var choices = providerRow(next).models || [];
+                    var pair = profileModel(draftAssignee);
+                    // Prefer the profile's own model when it belongs to this
+                    // provider; otherwise its first model. A provider is
+                    // never left chosen without a model — the core refuses
+                    // that pair.
+                    setDraftModel(
+                      choices.indexOf(pair.model) !== -1 ? pair.model : (choices[0] || "")
+                    );
+                  },
+                  onKeyDown: onCreateKeyDown,
+                },
+                el("option", { value: "" }, "— как в профиле —"),
+                (function () {
+                  var rows = (modelCatalog || []).slice();
+                  var cur = (draftProvider || "").trim();
+                  // A provider the profile names but the curated catalog does
+                  // not list stays selectable, otherwise the closed control
+                  // would show a different provider than the card would use.
+                  if (cur && !rows.some(function (r) { return r.slug === cur; })) {
+                    rows.unshift(providerRow(cur));
+                  }
+                  return rows.map(function (r) {
+                    return el(
+                      "option",
+                      { key: r.slug, value: r.slug },
+                      r.label && r.label !== r.slug ? r.slug + " — " + r.label : r.slug
+                    );
+                  });
+                })()
+              )
+            ),
+            el("label", { className: "hlv-field" },
+              el("span", { className: "hlv-field-label" }, "модель"),
+              el(
+                "select",
+                {
+                  className: "hlv-select hlv-input hlv-model-name",
+                  value: draftModel,
+                  disabled: !draftAssignee || !draftProvider,
+                  title: draftProvider
+                    ? "модели провайдера " + draftProvider
+                    : "сначала выберите провайдера — список моделей принадлежит ему",
+                  onChange: function (e) { setDraftModel(e.target.value); },
+                  onKeyDown: onCreateKeyDown,
+                },
+                !draftModel ? el("option", { value: "" }, "— как в профиле —") : null,
+                modelChoices(draftProvider).map(function (m) {
+                  return el("option", { key: m, value: m }, m);
+                })
+              )
+            )
+          ),
+          (function () {
+            var ov = modelOverride();
+            var pair = profileModel(draftAssignee);
+            if (!draftAssignee) {
+              return el("span", { className: "hlv-modal-hint" },
+                "модель берётся из профиля — сначала выберите профиль");
+            }
+            if (ov.model) {
+              return el("span", { className: "hlv-modal-hint hlv-model-override" },
+                "переопределение: " + (ov.provider ? ov.provider + " · " : "") + ov.model +
+                " — задача запишет model_override" +
+                (pair.model
+                  ? " (у профиля " + (pair.provider ? pair.provider + " · " : "") + pair.model + ")"
+                  : ""));
+            }
+            return el("span", { className: "hlv-modal-hint" },
+              pair.model
+                ? "по умолчанию — модель профиля @" + draftAssignee + ": " +
+                  (pair.provider ? pair.provider + " · " : "") + pair.model +
+                  "; переопределение не пишется"
+                : "у профиля @" + draftAssignee + " модель не задана — воркер возьмёт модель по умолчанию Hermes");
+          })()
         ),
         el("div", { className: "hlv-field-row" },
           el("label", { className: "hlv-field hlv-field-narrow" },

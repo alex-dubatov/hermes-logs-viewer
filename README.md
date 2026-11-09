@@ -428,6 +428,7 @@ The “+ Новая задача” (“+ New task”) button in the header open
 | Title | required, **Enter** — create |
 | Description | the card's body |
 | Profile | a select of installed profiles; **required** |
+| Model | **provider first, then that provider's model**; prefilled with the profile's own model; changing the pair writes a per-task override |
 | Priority | a number, 0 = default; higher — the dispatcher takes it earlier |
 | Time, min | the worker's time limit **in minutes**; **0 = infinite** |
 | State | `ready` (default) / `todo` / `scheduled` / `triage` / `blocked` |
@@ -475,6 +476,22 @@ Nine decisions worth knowing:
 - **Creation goes through the bundled kanban plugin's API**, so the card is
   indistinguishable from one created in the Kanban tab: its own row in the DB, a `created`
   event, resolution of the workspace and of the board's project.
+- **The model is the profile's by default and can be overridden per card.** The “Model”
+  field sits right under the profile combobox and is two selects: **provider first, then
+  that provider's models** (a model belongs to a provider, so it is only offered once the
+  provider is known). The pair opens on **the picked profile's own `model` + `provider`** —
+  that is the worker's default, visible without a click — and an **untouched picker writes
+  nothing**: `model_override`/`provider_override` stay NULL, so the card keeps following
+  the profile if its config changes later. Changing the pair writes both keys
+  (`create_task` refuses a provider without a model, and a model alone would be resolved
+  against the profile's backend instead of the picked one); the gateway applies them on
+  the card's next run (`gateway/session_kanban.py` → the worker policy's `model`/`provider`).
+  “— как в профиле —” in the provider select returns to the default pair and locks the
+  model list. The catalog is the bundled plugin's `/model-options` (the same substrate as
+  the Models page), so the picker cannot offer a pair Hermes rejects; a provider the
+  profile names but the curated catalog does not list stays in the list as a synthesised
+  entry, exactly like a no-longer-installed profile in the assignee combobox. A card that
+  carries an override says so in its meta line (`модель: provider · model`).
 - **`todo`, `scheduled` and `blocked` are not created “out of the box”** — a card first
   appears in `ready` and is then moved by the same `PATCH` the bundled tab uses when a card
   is dragged. If the move does not go through on the first attempt, the plugin tries once
@@ -1000,7 +1017,7 @@ Poll frequencies: the task list 2 s, the log 1.2 s, **the transcript 2 s**, **th
 ## Verification
 
 `tests/render_test.js` is a stand that loads `dist/index.js` into **jsdom**, boots a real
-React and talks to the **live dashboard**, then clicks on the real UI. **276 checks**: the
+React and talks to the **live dashboard**, then clicks on the real UI. **308 checks**: the
 header layout (including that the board label fits the selector and that the selector carries
 a `title`), the badge rules for all 9 statuses, the absence of rounded corners, search (by
 title, by description, **by task id and by its beginning**, an empty result, the clear
@@ -1017,6 +1034,19 @@ untied and “foreign” projects are reachable and really create a card with th
 and above all **the payload that actually went into `POST /tasks`** (`dir` → the project's
 path and that it is not the board's `default_workdir`, `worktree` → no path at all, an empty
 project → `project_id` not sent, `scratch` → the project not sent).
+
+**The model picker is verified the same way — from the click to the stored row.** The stand
+checks that the field sits under the profile combobox, that it opens on the picked profile's
+own `model` + `provider` (the worker default, read from `/profiles`), that the provider list
+is the live `/model-options` catalog, that “— как в профиле —” locks the model list and leaves
+the default pair, that switching the provider repopulates the models **with that provider's**
+list, and that the payload carries `model_override`/`provider_override` **only** when the pair
+differs — the untouched default must not write them. The card is then read back through
+`GET /tasks/{id}`: the core accepted the pair, so the row itself carries it. Geometry is
+measured in real Chromium by `tools/model_picker_layout_check.js` (desktop 1440px and
+420px): the two selects share one line, the provider column is 190px, the model column takes
+the rest, nothing leaves the modal, and a profile whose provider is **not** in the catalog
+(`kosareva`) keeps its real value in both selects instead of jumping to the first entry.
 
 **The “runs” and “files” tabs are verified against the server, not against our own markup.**
 The run history is matched with `GET /tasks/{id}`: the number of rows, `data-run-id` (newest

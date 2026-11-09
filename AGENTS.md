@@ -55,6 +55,7 @@ with no build step; backend: one Python route file (`dashboard/plugin_api.py`).
 | `node tools/runtime_field_check.js` | настоящий Chromium: поле «время выполнения» в «основном» — 7 минут доезжают до доски как 420 секунд |
 | `PLAYWRIGHT_PATH=… CHROME_PATH=… node tests/carousel_test.js` | узкая вёрстка в настоящем Chromium |
 | `PLAYWRIGHT_PATH=… CHROME_PATH=… node tools/pane_layout_check.js` | геометрия вкладки «основное» в настоящем Chromium: стопка, место карандашей, комбобокс исполнителя, высота поля описания |
+| `PLAYWRIGHT_PATH=… CHROME_PATH=… node tools/model_picker_layout_check.js` | настоящий Chromium: строка «провайдер → модель» в форме создания — одна строка, 190px провайдеру, ничего не вылезает за модал (1440px и 420px), провайдер вне каталога сохраняется |
 | `HLV_LIVE_TASK=… PLAYWRIGHT_PATH=… CHROME_PATH=… node tools/runs_files_layout_check.js` | настоящий Chromium: вкладки «запуски» и «файлы» — геометрия, настоящая загрузка файла, скачивание с проверкой байтов, удаление |
 | `node tools/css_probe.js` | та же проверка без браузера: CSS-движок над настоящей таблицей стилей |
 | `python3 tests/test_workers.py` | живой бейдж воркеров на бэкенде: настоящие процессы `/proc`, закрытые run'ы, чужие claim-локи, переиспользованный pid |

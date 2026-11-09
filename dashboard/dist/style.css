@@ -610,6 +610,21 @@
   flex: 0 0 110px;
 }
 
+/* The model picker's two halves: the provider name is long and finite
+   (`opencode-go`, `opencode-zen`), the model list is the wide side. 190px is
+   the widest provider slug plus the select's own padding. */
+.hlv-field-model-provider {
+  flex: 0 1 190px;
+  min-width: 118px;
+}
+
+/* "переопределение: provider · model" — the pair differs from the profile's
+   own, so the card will carry model_override. Warn-coloured so it reads as a
+   deliberate change, not as the default state. */
+.hlv-model-override {
+  color: var(--color-warning);
+}
+
 .hlv-field-label {
   font-size: 0.72rem;
   color: var(--color-muted-foreground);
