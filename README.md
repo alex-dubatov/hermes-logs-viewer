@@ -725,7 +725,10 @@ How the variants differ, and why the boundary is exactly there:
   honest: the card is read in full and the finger knows there is more to the right;
 - in both variants the **meta-line chips wrap** instead of being cut: the status, priority,
   board, profile, comment count and time did not fit one line, and the tail vanished behind
-  `overflow: hidden` with no hint at all.
+  `overflow: hidden` with no hint at all;
+- the card's width is set on the **cell** (`.hlv-row-cell` — the selection checkbox plus the
+  row button), not on the row itself: the checkbox sits inside the card's width, so the cell
+  is the strip's flex item and the row just fills it.
 
 The rule is verified in **real Chromium** at three viewports — 390px (list), 360px
 (carousel) and 1440px (vertical column): `tests/carousel_test.js`.
@@ -743,6 +746,34 @@ Under the card's title sits a meta line: **status, priority, board, profile, com
   `data-priority` is written from, so the badge cannot drift away from the card's position;
 - the stand compares the label with `data-priority` **and** with the live board (`/board`),
   not with a constant from the plugin itself.
+
+### Selecting cards and changing status in bulk
+
+Every row carries a checkbox on its left, and the left panel's own footer — **below the
+scrolling list, not inside it** — runs the selection:
+
+- **“все”** marks exactly the cards that are **visible**: the board filter and the search
+  apply. Marks of cards hidden by the filter are kept, so narrowing the search never
+  silently drops a choice;
+- the counter names the selection (“выбрано: 2 из 2”), and **«снять»** clears it;
+- clicking the row itself still only opens the card — the checkbox is the only thing that
+  marks it. The row is a `<button>`, and a control inside a button is invalid HTML, so the
+  checkbox lives in the cell next to it (`.hlv-row-cell > .hlv-row-check`).
+
+Once at least one card is marked, the same status buttons as the “основное” tab appear in
+the bar, and they apply **to every marked card**:
+
+- the write is one bundled `POST /tasks/bulk` per board — the route is board-scoped, so a
+  selection spanning several boards (“All boards”) is split by board. The route answers per
+  id, so a partial refusal is named instead of guessed at;
+- `done` / `archived` / `blocked` release the worker claim and ask for confirmation, exactly
+  as the single-card switch does;
+- `archived` travels as the `archive` flag, not as a status: bulk has no such status verb
+  and would answer “unknown status”;
+- the bar reports the result (“2 задачи → todo”) or names what was refused
+  (“1 → done; не удалось: t_… (transition to 'scheduled' refused)”);
+- the selection survives the change, so a second status can be applied without marking the
+  cards again.
 
 ### Boards and statuses
 
@@ -1017,7 +1048,7 @@ Poll frequencies: the task list 2 s, the log 1.2 s, **the transcript 2 s**, **th
 ## Verification
 
 `tests/render_test.js` is a stand that loads `dist/index.js` into **jsdom**, boots a real
-React and talks to the **live dashboard**, then clicks on the real UI. **308 checks**: the
+React and talks to the **live dashboard**, then clicks on the real UI. **332 checks**: the
 header layout (including that the board label fits the selector and that the selector carries
 a `title`), the badge rules for all 9 statuses, the absence of rounded corners, search (by
 title, by description, **by task id and by its beginning**, an empty result, the clear
@@ -1110,6 +1141,25 @@ choice and **goes away** after it.
 The `scheduled` state is covered by an end-to-end round trip: the card is created in `ready`,
 the state is set by the same `PATCH` as in the bundled tab, and the card **really ends up in
 `scheduled`** — without a claim and without a run, that is, the dispatcher will not pick it up.
+
+**Selection and the bulk status change are verified on the wire, not on the checkbox.**
+The jsdom stand creates two throwaway cards **without an assignee** (so the dispatcher cannot
+spawn anything for them) and drives the real UI: each row carries a checkbox in its cell, the
+row click still only opens the card, “все” marks every *visible* card (and a second click
+clears them), «снять» empties the selection, and the eight status buttons appear only while
+something is marked. The write is then read **back from the board**: `POST /tasks/bulk` must
+have moved every marked card (`triage → todo → scheduled → triage`), the bar must report
+“2 задачи → …”, and the selection must survive the change. `todo` is promoted to `ready` by
+the core's own `recompute_ready`, so that leg asserts “left `triage`” rather than “is `todo`” —
+the cards have no assignee, so nothing can be spawned. Geometry is measured in real Chromium
+by `tools/pickbar_layout_check.js`: the bar is a child of the left panel, sits **below** the
+list and does not intersect it, the checkbox lies inside the row's cell and left of the row,
+the eight buttons fit the 340px column without clipping, and at 390/360px the strip still
+scrolls along X with the **cell** as the flex item.
+
+```bash
+PLAYWRIGHT_PATH=... CHROME_PATH=... node tools/pickbar_layout_check.js
+```
 The same place checks that the card carries exactly the profile the form forced you to pick.
 
 The cards the stand creates get the profile **`default`** and the state **`triage`**. The

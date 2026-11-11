@@ -61,11 +61,21 @@ function check(name, ok, extra) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Geometry of the list as rendered, plus how many cards are actually on screen.
+//
+// The CARD is the flex item of the strip: since the row grew a selection
+// checkbox, the flex item is `.hlv-row-cell` (checkbox + `<button class=
+// "hlv-row">`), and the width / snap-align live on it. Measuring `.hlv-row`
+// alone reported "scroll-snap-align: none" — the property had moved one level
+// up, and the button inside the cell is only the card's BODY. The row stays as
+// a fallback so the probe still reads an older build.
 const probeList = (page) => page.evaluate(() => {
   const list = document.querySelector(".hlv-list");
   const cs = getComputedStyle(list);
   const lb = list.getBoundingClientRect();
-  const rows = Array.from(list.querySelectorAll(".hlv-row"));
+  const cells = Array.from(list.querySelectorAll(".hlv-row-cell"));
+  const rows = cells.length
+    ? cells
+    : Array.from(list.querySelectorAll(".hlv-row"));
   const rowW = rows.length ? rows[0].getBoundingClientRect().width : 0;
   return {
     flexDirection: cs.flexDirection,

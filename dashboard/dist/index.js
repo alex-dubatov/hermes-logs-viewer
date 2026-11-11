@@ -305,6 +305,12 @@
     return t.board || "default";
   }
 
+  // Ключ выбора карточки в левом списке. Голого id мало: «все доски» показывают
+  // карточки нескольких досок сразу, а id уникален только внутри доски.
+  function taskKey(t) {
+    return boardSlug(t) + "/" + (t.id || "");
+  }
+
   // Display order, mirroring the backend's _sort_key, so a task inserted
   // optimistically after create lands where the next poll would put it
   // instead of jumping to the bottom of the list.
@@ -496,6 +502,54 @@ function Page() {
     var setSelected = selectedState[1];
     var selectedRef = useRef(null);
     selectedRef.current = selected;
+
+    // --- Мультивыбор карточек ---------------------------------------------
+    // Открыть карточку и ВЫБРАТЬ карточку — разные действия: клик по строке
+    // по-прежнему открывает её, галочка слева отмечает для групповой смены
+    // состояния. Ключ — «доска/id»: на «все доски» в списке лежат карточки
+    // нескольких досок, и голого id для уникальности не хватает.
+    var pickedState = useState({});
+    var picked = pickedState[0];
+    var setPicked = pickedState[1];
+    // Групповая запись уходит одним `POST /tasks/bulk` на доску; флаг гасит
+    // повторный клик, пока пачка не доехала.
+    var pickBusyState = useState(false);
+    var pickBusy = pickBusyState[0];
+    var setPickBusy = pickBusyState[1];
+    // Итог последней групповой смены состояния: «N задач → done» или отказ.
+    var pickNoteState = useState({ kind: "", text: "" });
+    var pickNote = pickNoteState[0];
+    var setPickNote = pickNoteState[1];
+
+    // Отмеченные карточки, сверенные с ТЕКУЩИМ списком: ключи карточек, которых
+    // в списке уже нет (доска удалена, карточку убрали), в счёт не идут, и
+    // групповая запись по ним не пойдёт.
+    function pickTargets() {
+      var out = [];
+      for (var i = 0; i < tasks.length; i++) {
+        if (picked[taskKey(tasks[i])]) out.push(tasks[i]);
+      }
+      return out;
+    }
+
+    function togglePick(t) {
+      var key = taskKey(t);
+      setPicked(function (prev) {
+        var next = {};
+        for (var k in prev) {
+          if (Object.prototype.hasOwnProperty.call(prev, k)) next[k] = prev[k];
+        }
+        if (next[key]) delete next[key];
+        else next[key] = true;
+        return next;
+      });
+      setPickNote({ kind: "", text: "" });
+    }
+
+    function clearPicks() {
+      setPicked({});
+      setPickNote({ kind: "", text: "" });
+    }
 
     var logState = useState(emptyLog());
     var log = logState[0];
@@ -3549,8 +3603,29 @@ function Page() {
         : vt.map(function (t) {
             var active = t.id === selected;
             var inp = sortInputs(t);
+            var pickKey = taskKey(t);
+            var on = !!picked[pickKey];
             return el(
-              "button",
+              "div",
+              {
+                key: t.id,
+                // Строка = ячейка галочки + сама кнопка-карточка. Кнопка внутри
+                // кнопки была бы невалидным HTML, поэтому обёртка — div.
+                className: "hlv-row-cell" + (on ? " picked" : ""),
+                "data-pick-key": pickKey,
+              },
+              el("input", {
+                type: "checkbox",
+                className: "hlv-row-check",
+                checked: on,
+                "data-pick-id": t.id,
+                title: on
+                  ? "снять отметку с задачи " + t.id
+                  : "отметить задачу " + t.id + " для групповой смены состояния",
+                "aria-label": "выбрать задачу " + t.id,
+                onChange: function () { togglePick(t); },
+              }),
+              el("button",
               {
                 key: t.id,
                 type: "button",
@@ -3623,6 +3698,7 @@ function Page() {
                   title: t.comment_count + " комментар.",
                 }, "✉ " + t.comment_count) : null,
                 el("span", { className: "hlv-row-time" }, timeAgo(t.last_heartbeat_at || t.started_at || t.created_at))
+              )
               )
             );
           })
@@ -5168,13 +5244,220 @@ function Page() {
       )
     );
 
+    // --- Панель выбора ----------------------------------------------------
+    // Стоит ВНИЗУ левой панели, вне `.hlv-list`: кнопки должны быть на месте,
+    // до какой бы строки список ни долистали, и не уезжать вместе с ним.
+    //
+    // «Все» отмечает ровно те карточки, что сейчас видно, — с учётом доски и
+    // поиска. Отметки карточек, скрытых фильтром, при этом сохраняются: иначе
+    // сужение поиска молча теряло бы уже сделанный выбор.
+    var pickedList = pickTargets();
+    var pickedCount = pickedList.length;
+    var visibleKeys = {};
+    vt.forEach(function (t) { visibleKeys[taskKey(t)] = true; });
+    var allVisiblePicked = vt.length > 0 && vt.every(function (t) {
+      return !!picked[taskKey(t)];
+    });
+    var someVisiblePicked = vt.some(function (t) { return !!picked[taskKey(t)]; });
+
+    function pickAllVisible() {
+      var next = {};
+      var k;
+      if (allVisiblePicked) {
+        for (k in picked) {
+          if (Object.prototype.hasOwnProperty.call(picked, k) && !visibleKeys[k]) next[k] = true;
+        }
+      } else {
+        for (k in picked) {
+          if (Object.prototype.hasOwnProperty.call(picked, k)) next[k] = true;
+        }
+        vt.forEach(function (t) { next[taskKey(t)] = true; });
+      }
+      setPicked(next);
+      setPickNote({ kind: "", text: "" });
+    }
+
+    // Групповая смена состояния через ОДИН маршрут на доску — встроенный
+    // `POST /tasks/bulk`: он применяет патч к каждому id независимо и отвечает
+    // по каждому (`{results: [{id, ok, error}]}`), поэтому частичный отказ
+    // видно, а не угадывать. Маршрут живёт в пределах одной доски, поэтому
+    // выбор на «все доски» делится по доскам.
+    //
+    // `archived` идёт флагом `archive`, а не статусом: такого статуса в bulk
+    // нет (`_STATUS_HANDLERS`), и он вернул бы «unknown status».
+    //
+    // `done` / `archived` / `blocked` отпускают Claim воркера, поэтому пачка
+    // спрашивает подтверждение ровно там, где спрашивает одиночная смена.
+    function bulkSetStatus(status) {
+      var targets = pickTargets();
+      if (!targets.length || pickBusy) return;
+      var destructive = status === "done" || status === "archived" || status === "blocked";
+      if (destructive && !window.confirm(
+        "Перевести " + targets.length + " " +
+        plural(targets.length, "задачу", "задачи", "задач") + " в " + status +
+        "? Действие отпустит Claim воркеров.")) {
+        return;
+      }
+      setPickBusy(true);
+      setPickNote({ kind: "", text: "" });
+
+      var byBoard = {};
+      var order = [];
+      targets.forEach(function (t) {
+        var b = boardSlug(t);
+        if (!byBoard[b]) { byBoard[b] = []; order.push(b); }
+        byBoard[b].push(t);
+      });
+
+      var okKeys = {};
+      var okCount = 0;
+      var fails = [];
+      var idx = 0;
+
+      function finish() {
+        setPickBusy(false);
+        if (okCount) {
+          // Локальная правка, чтобы строки переставились сразу, а не через
+          // 2 секунды до следующего опроса; опрос остаётся источником истины.
+          setTasks(function (prev) {
+            var next = prev.map(function (t) {
+              if (!okKeys[taskKey(t)]) return t;
+              var copy = {};
+              for (var f in t) {
+                if (Object.prototype.hasOwnProperty.call(t, f)) copy[f] = t[f];
+              }
+              copy.status = status;
+              if (status === "done" || status === "archived") {
+                copy.completed_at = copy.completed_at || Math.floor(Date.now() / 1000);
+              }
+              return copy;
+            });
+            return next.sort(compareTasks);
+          });
+          setDescField("status", status);
+        }
+        if (fails.length) {
+          setPickNote({
+            kind: "err",
+            text: okCount + " → " + status + "; не удалось: " +
+              fails.slice(0, 3).join("; ") + (fails.length > 3 ? " …" : ""),
+          });
+        } else {
+          setPickNote({
+            kind: "ok",
+            text: okCount + " " + plural(okCount, "задача", "задачи", "задач") +
+              " → " + status,
+          });
+        }
+      }
+
+      function step() {
+        if (idx >= order.length) { finish(); return; }
+        var b = order[idx++];
+        var payload = { ids: byBoard[b].map(function (t) { return t.id; }) };
+        if (status === "archived") payload.archive = true;
+        else payload.status = status;
+        fetchJSON(
+          KANBAN_API + "/tasks/bulk?board=" + encodeURIComponent(b),
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          }
+        ).then(function (r) {
+          if (r.__error || r.detail || !r.results) {
+            fails.push("доска " + b + ": " +
+              (r.detail || r.error || r.__error || "нет ответа"));
+            step();
+            return;
+          }
+          r.results.forEach(function (e) {
+            if (e && e.ok) {
+              okCount++;
+              okKeys[b + "/" + e.id] = true;
+            } else {
+              fails.push((e && e.id ? e.id : "?") + " (" +
+                ((e && e.error) || "отказ") + ")");
+            }
+          });
+          step();
+        }).catch(function (e) {
+          fails.push("доска " + b + ": " + String((e && e.message) || e));
+          step();
+        });
+      }
+      step();
+    }
+
+    var pickBar = el(
+      "div",
+      { className: "hlv-pickbar", "data-picked": String(pickedCount) },
+      el("label", { className: "hlv-check" },
+        el("input", {
+          type: "checkbox",
+          className: "hlv-pick-all",
+          checked: allVisiblePicked,
+          disabled: pickBusy || !vt.length,
+          // Третье состояние нативного чекбокса ставится только свойством DOM —
+          // атрибутом его не выразить. `someVisiblePicked` читается здесь, чтобы
+          // перерисовка пересчитывала галочку.
+          ref: function (node) {
+            if (node) node.indeterminate = someVisiblePicked && !allVisiblePicked;
+          },
+          title: allVisiblePicked
+            ? "снять отметки с видимых карточек"
+            : "отметить все видимые карточки (" + vt.length + ")",
+          "aria-label": "выбрать все видимые задачи",
+          onChange: pickAllVisible,
+        }),
+        " все"
+      ),
+      el("span", { className: "hlv-pick-count" },
+        pickedCount
+          ? "выбрано: " + pickedCount + " из " + vt.length
+          : "не выбрано"),
+      pickedCount
+        ? el("button", {
+            type: "button",
+            className: "hlv-btn hlv-pick-clear",
+            disabled: pickBusy,
+            title: "снять все отметки",
+            onClick: clearPicks,
+          }, "снять")
+        : null,
+      pickNote.text
+        ? el("span", { className: "hlv-pick-note " + pickNote.kind }, pickNote.text)
+        : null,
+      pickedCount
+        ? el("div", { className: "hlv-pick-status" },
+            el("span", { className: "hlv-pick-status-label" },
+              "состояние для " + pickedCount + " " +
+              plural(pickedCount, "выбранной", "выбранных", "выбранных") + ":"),
+            STATUS_BUTTONS.map(function (b) {
+              return el("button", {
+                key: b.value,
+                type: "button",
+                className: "hlv-btn",
+                disabled: pickBusy,
+                title: b.title + " — для всех выбранных карточек",
+                "data-bulk-status": b.value,
+                onClick: function () { bulkSetStatus(b.value); },
+              }, b.value);
+            }),
+            pickBusy ? el("span", { className: "hlv-pick-busy" }, "…") : null
+          )
+        : null
+    );
+
     // Left column: the search field sits above the scrolling task list and does
-    // not scroll with it.
+    // not scroll with it; the selection bar sits BELOW the list, also outside
+    // the scroller.
     var leftColumn = el(
       "div",
       { className: "hlv-left" },
       searchBox,
-      list
+      list,
+      pickBar
     );
 
     return el(

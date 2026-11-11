@@ -159,6 +159,63 @@
   padding: 4px;
 }
 
+/* Selection bar: BOTTOM of the left panel and outside `.hlv-list`, so it stays
+   put while the list scrolls. Master checkbox + count on the first line; the
+   status buttons for the marked cards only appear once something is marked. */
+.hlv-pickbar {
+  flex-shrink: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  padding: 4px 6px;
+  border: 1px solid var(--color-border);
+  border-radius: 0;
+  background: var(--color-card);
+  font-size: 0.72rem;
+  color: var(--color-muted-foreground);
+}
+
+.hlv-pick-count {
+  white-space: nowrap;
+}
+
+.hlv-pick-clear {
+  padding: 1px 8px;
+  font-size: 0.7rem;
+}
+
+.hlv-pick-note {
+  flex-basis: 100%;
+  font-size: 0.7rem;
+}
+
+.hlv-pick-note.ok {
+  color: var(--color-success);
+}
+
+.hlv-pick-note.err {
+  color: var(--color-warning);
+}
+
+.hlv-pick-status {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+
+.hlv-pick-status-label {
+  flex-basis: 100%;
+  font-size: 0.7rem;
+}
+
+.hlv-pick-status .hlv-btn {
+  padding: 1px 7px;
+  font-size: 0.7rem;
+}
+
 .hlv-row {
   display: flex;
   flex-direction: column;
@@ -180,6 +237,41 @@
 .hlv-row.active {
   background: var(--color-accent);
   border-color: var(--color-border);
+}
+
+/* Cell of the task list: the selection checkbox left of the row. The checkbox
+   cannot live INSIDE the row — the row is a <button>, and a control inside a
+   button is invalid HTML (the click would fight the row's own). So the cell is
+   the flex item and the row stretches inside it. */
+.hlv-row-cell {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  min-width: 0;
+  border: 1px solid transparent;
+}
+
+.hlv-row-cell > .hlv-row {
+  flex: 1;
+  min-width: 0;
+}
+
+/* A card marked for the bulk status change: the cell gets the outline, so the
+   mark is readable even when the row itself is the active one. */
+.hlv-row-cell.picked {
+  border-color: var(--color-ring, var(--color-success));
+}
+
+.hlv-row-check {
+  flex: 0 0 auto;
+  /* `align-self` (not the cell's `stretch`): a checkbox given `height: auto`
+     inside a stretching flex line is laid out at the ROW's height, so the box
+     became a 79px-tall control. It keeps its own size and only moves down to
+     line up with the first line of the title. */
+  align-self: flex-start;
+  margin: 9px 0 0 6px;
+  accent-color: var(--color-ring, var(--color-success));
+  cursor: pointer;
 }
 
 .hlv-row-title {
@@ -1700,6 +1792,9 @@
   }
   /* flex-basis (not width) keeps the basis honest even when the content
      itself is narrower. */
+  .hlv-row-cell {
+    min-width: 0;
+  }
   .hlv-row {
     min-width: 0;
   }
@@ -1730,7 +1825,10 @@
   .hlv-list {
     scroll-snap-type: none;
   }
-  .hlv-row {
+  /* The CELL is the flex item of the horizontal strip, not the row: the
+     checkbox sits inside the cell, so a basis on .hlv-row alone would leave the
+     selection column outside the card's width. */
+  .hlv-row-cell {
     flex: 0 0 clamp(200px, 45%, 320px);
   }
 }
@@ -1742,10 +1840,9 @@
   .hlv-list {
     scroll-snap-type: x mandatory;
   }
-  .hlv-row {
+  .hlv-row-cell {
     flex: 0 0 82%;
     scroll-snap-align: start;
-    justify-content: center;
   }
 }
 

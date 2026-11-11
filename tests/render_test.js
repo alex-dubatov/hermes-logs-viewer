@@ -924,6 +924,202 @@ const TEST_ASSIGNEE = "default";
       $$(".hlv-row").length > 1, $$(".hlv-row").length + " строк");
   }
 
+  // --- 6-bis. выбор карточек и групповая смена состояния ----------------
+  // Живая проверка: две ОДНОРАЗОВЫЕ карточки создаются прямо в `triage` и
+  // удаляются в конце. Они СПЕЦИАЛЬНО без исполнителя: карточку без assignee
+  // диспетчер не берёт (`kanban.default_assignee` здесь не задан), поэтому
+  // пачка не может увести их в работу между кликом и удалением.
+  //
+  // Состояния подобраны по тем же правилам: `scheduled` не читает ни один
+  // lane, `todo`/`triage` — промежуточные шаги, которые стенд проходит и
+  // сразу покидает. `ready` не используется вовсе: это очередь диспетчера.
+  {
+    const curBoard = ($(".hlv-board-select") || {}).value || "";
+    const pickBoard = curBoard ||
+      ((boards0.boards[0] || {}).slug) || "default";
+    const token = "pick" + Date.now();
+    const madeBulk = [];
+    for (const n of [1, 2]) {
+      const r = await fetchJSON(
+        "/api/plugins/kanban/tasks?board=" + encodeURIComponent(pickBoard),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            title: "hlv-autotest: выбор " + token + " #" + n,
+            triage: true,
+          }),
+        }
+      );
+      if (r && r.task) {
+        madeBulk.push(r.task);
+        trackCard(r.task.id, pickBoard);
+      }
+    }
+    check("временные карточки для проверки выбора созданы",
+      madeBulk.length === 2,
+      madeBulk.map((t) => t.id + "(" + t.status + ")").join(", "));
+
+    // Сужаем список до них поиском по уникальному токену: «все» отмечает
+    // ВИДИМЫЕ карточки, и на живой доске это десятки чужих карточек.
+    setInputValue($(".hlv-search-input"), token);
+    let bulkRows = [];
+    for (let w = 0; w < 12; w++) {
+      await sleep(700);
+      bulkRows = $$(".hlv-row");
+      if (bulkRows.length === madeBulk.length) break;
+    }
+    check("обе временные карточки видны в списке",
+      bulkRows.length === madeBulk.length,
+      bulkRows.length + " строк");
+
+    const pickbar = $(".hlv-left > .hlv-pickbar");
+    check("панель выбора есть внизу левой панели", !!pickbar);
+    check("панель выбора стоит ПОСЛЕ списка (под ним)",
+      !!pickbar && !!$(".hlv-list") &&
+        !!($(".hlv-list").compareDocumentPosition(pickbar) &
+           dom.window.Node.DOCUMENT_POSITION_FOLLOWING));
+    check("панель выбора НЕ внутри прокручиваемого списка",
+      !!pickbar && !$(".hlv-list .hlv-pickbar") && !pickbar.closest(".hlv-list"));
+    check("у каждой строки есть галочка выбора",
+      $$(".hlv-row-check").length === bulkRows.length,
+      $$(".hlv-row-check").length + " галочек");
+    check("галочка лежит в ячейке рядом со строкой, а не внутри кнопки",
+      $$(".hlv-row-cell > .hlv-row-check").length === bulkRows.length &&
+        $$(".hlv-row button, .hlv-row input").length === 0,
+      "ячеек: " + $$(".hlv-row-cell").length);
+    check("в начале ничего не выбрано",
+      !!pickbar && pickbar.getAttribute("data-picked") === "0" &&
+        !$(".hlv-pick-status"),
+      pickbar && pickbar.getAttribute("data-picked"));
+
+    // «все» — мастер-чекбокс видимых карточек.
+    const masterCb = $(".hlv-pick-all");
+    check("мастер-чекбокс «все» есть", !!masterCb);
+    if (masterCb) {
+      click(masterCb);
+      await sleep(400);
+      check("«все» отмечает все видимые карточки",
+        $(".hlv-pickbar").getAttribute("data-picked") === String(bulkRows.length) &&
+          $$(".hlv-row-cell.picked").length === bulkRows.length,
+        $(".hlv-pickbar").getAttribute("data-picked") + " из " + bulkRows.length);
+      check("счётчик выбора назван словами",
+        ($(".hlv-pick-count") || {}).textContent ===
+          "выбрано: " + bulkRows.length + " из " + bulkRows.length,
+        ($(".hlv-pick-count") || {}).textContent);
+      check("при выборе появились кнопки состояния",
+        $$(".hlv-pick-status [data-bulk-status]").length === 8,
+        $$(".hlv-pick-status [data-bulk-status]").length + " кнопок");
+
+      // Повторный клик снимает отметки с видимых.
+      click(masterCb);
+      await sleep(400);
+      check("повторный клик по «все» снимает отметки",
+        $(".hlv-pickbar").getAttribute("data-picked") === "0" &&
+          $$(".hlv-row-cell.picked").length === 0 &&
+          !$(".hlv-pick-status"),
+        $(".hlv-pickbar").getAttribute("data-picked"));
+    }
+
+    // Точечный выбор: клик по галочке. Клик по САМОЙ строке по-прежнему
+    // открывает карточку и отметку не меняет.
+    bulkRows.forEach((r) => {
+      const cb = r.parentElement.querySelector(".hlv-row-check");
+      if (cb) click(cb);
+    });
+    await sleep(400);
+    check("точечные галочки дают тот же выбор",
+      $(".hlv-pickbar") && $(".hlv-pickbar").getAttribute("data-picked") === "2",
+      $(".hlv-pickbar") && $(".hlv-pickbar").getAttribute("data-picked"));
+
+    const rowBtn = $(".hlv-row[data-task-id='" + madeBulk[0].id + "']");
+    if (rowBtn) {
+      click(rowBtn);
+      await sleep(600);
+      check("клик по строке открывает карточку",
+        !!$(".hlv-row.active") &&
+          $(".hlv-row.active").getAttribute("data-task-id") === madeBulk[0].id,
+        $(".hlv-row.active") && $(".hlv-row.active").getAttribute("data-task-id"));
+      check("клик по строке выбор не сбрасывает",
+        $(".hlv-pickbar").getAttribute("data-picked") === "2",
+        $(".hlv-pickbar").getAttribute("data-picked"));
+    }
+
+    // Групповая смена состояния: одна пачка — один `POST /tasks/bulk`.
+    const statusOf = async (id) => {
+      const r = await fetchJSON(
+        "/api/plugins/kanban/tasks/" + encodeURIComponent(id) +
+        "?board=" + encodeURIComponent(pickBoard));
+      return r && r.task ? r.task.status : "?";
+    };
+    const bulkBtn = (s) => $(".hlv-pick-status [data-bulk-status='" + s + "']");
+    // Ждём, пока ВСЕ выбранные карточки на сервере получат нужное состояние:
+    // пачка идёт одним запросом, но ответ читается с доски, а не из UI.
+    const applyBulk = async (s) => {
+      const btn = bulkBtn(s);
+      if (!btn) return [];
+      click(btn);
+      let sts = [];
+      for (let w = 0; w < 10; w++) {
+        await sleep(600);
+        sts = [];
+        for (const t of madeBulk) sts.push(await statusOf(t.id));
+        if (sts.every((x) => x === s)) break;
+      }
+      return sts;
+    };
+
+    check("кнопки группового состояния доступны", !!bulkBtn("todo") && !!bulkBtn("scheduled"));
+    const toTodo = await applyBulk("todo");
+    // Ядро поднимает `todo` в `ready` само (`recompute_ready`), поэтому здесь
+    // проверяется то, за что отвечает пачка: состояние УШЛО из triage у ВСЕХ
+    // выбранных карточек. Карточки без исполнителя — спавнить их некому.
+    check("групповая смена состояния применилась ко ВСЕМ выбранным",
+      toTodo.every((s) => s !== "triage"), toTodo.join(", "));
+    const note = $(".hlv-pick-note");
+    check("пачка отчиталась числом применённых карточек",
+      !!note && note.className.indexOf("ok") !== -1 &&
+        (note.textContent || "").indexOf("2 задачи → todo") !== -1,
+      note ? note.textContent : "нет строки итога");
+
+    // Второй и третий прогон по тому же выбору: состояние можно менять
+    // повторно, не выбирая карточки заново. `scheduled` — парковка, которую
+    // не читает ни один lane (в отличие от `ready`).
+    const toSched = await applyBulk("scheduled");
+    check("пачка работает повторно (todo → scheduled)",
+      toSched.every((s) => s === "scheduled"), toSched.join(", "));
+
+    const back = await applyBulk("triage");
+    check("выбор переживает смену состояния (scheduled → triage)",
+      back.every((s) => s === "triage"), back.join(", "));
+    check("после пачки выбор сохранён — карточки не приходится отмечать заново",
+      $(".hlv-pickbar").getAttribute("data-picked") === "2",
+      $(".hlv-pickbar").getAttribute("data-picked"));
+
+    // «снять» очищает выбор и убирает кнопки состояния.
+    const clearBtn = $(".hlv-pick-clear");
+    check("кнопка «снять» есть при непустом выборе", !!clearBtn);
+    if (clearBtn) {
+      click(clearBtn);
+      await sleep(400);
+      check("«снять» очищает выбор",
+        $(".hlv-pickbar").getAttribute("data-picked") === "0" &&
+          !$(".hlv-pick-status") && !$(".hlv-pick-clear"),
+        $(".hlv-pickbar").getAttribute("data-picked"));
+    }
+
+    // Уборка: карточки и фильтр.
+    click($(".hlv-search-clear") || $(".hlv-search-input"));
+    await sleep(500);
+    for (const t of madeBulk) {
+      await noteClaim(t.id, pickBoard);
+      await fetchJSON(
+        "/api/plugins/kanban/tasks/" + encodeURIComponent(t.id) +
+        "?board=" + encodeURIComponent(pickBoard),
+        { method: "DELETE" });
+    }
+  }
+
   // --- 7. new-task dialog ---------------------------------------------
   click(findButton("+ Новая задача"));
   await sleep(600);
@@ -2318,7 +2514,7 @@ const TEST_ASSIGNEE = "default";
       "выше 380px — горизонтальный список, а не карусель",
       /@media\s*\(min-width:\s*381px\)\s*and\s*\(max-width:\s*1023px\)/.test(css) &&
         /scroll-snap-type:\s*none/.test(listMq) &&
-        /\.hlv-row\s*\{[^}]*flex:\s*0\s+0\s*clamp\(/.test(listMq),
+        /\.hlv-row-cell\s*\{[^}]*flex:\s*0\s+0\s*clamp\(/.test(listMq),
       "snap выключен, у карточки своя ширина"
     );
 
