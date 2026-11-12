@@ -2248,6 +2248,43 @@ function Page() {
         "Перевести задачу в " + status + "? Действие отпустит Claim воркера.")) {
         return;
       }
+      // Архив идёт пачкой (`bulk` c `archive: true`) даже для одной карточки:
+      // так же, как в панели выбора, он сначала спрашивает, кого разбудит
+      // ядро, и предлагает забрать в архив и потомков. Одной карточке это
+      // стоит одного лишнего запроса, зато оба пути архива ведут себя
+      // одинаково (см. `archiveCards`).
+      if (status === "archived") {
+        var id = selectedRef.current;
+        if (!id) return;
+        archiveCards([{ id: id, board: boardOf(id) }], {
+          busy: setCardBusy,
+          report: function (res) {
+            if (res.fails.length) {
+              setNote({
+                kind: "err",
+                text: "не удалось: " + res.fails.slice(0, 3).join("; "),
+              });
+              return;
+            }
+            applyLocalStatus(res.okKeys, "archived");
+            setDescField("status", "archived");
+            setNote({
+              kind: "ok",
+              text: res.withChildren && res.woken.length
+                ? "в архиве, вместе с " + res.woken.length + " " +
+                  plural(res.woken.length, "потомком", "потомками", "потомками")
+                : "состояние: archived",
+            });
+            setTimeout(function () {
+              setNote(function (n) {
+                return n.kind === "ok" ? { kind: "", text: "" } : n;
+              });
+            }, 2500);
+            if (detailReloadRef.current) detailReloadRef.current();
+          },
+        });
+        return;
+      }
       patchTask({ status: status }, "состояние: " + status, function (task) {
         setDescField("status", task.status);
       });
@@ -5277,14 +5314,227 @@ function Page() {
       setPickNote({ kind: "", text: "" });
     }
 
+    // --- Архивирование: не оставлять за собой запущенных потомков ---------
+    // `archived` — терминальное состояние родителя для ядра, поэтому архив
+    // карточки-родителя в ТУ ЖЕ секунду снимает гейт с её `todo`-потомков
+    // (`recompute_ready` внутри `kanban_db.archive_task`): они уходят в
+    // `ready`, диспетчер забирает их — и оператор видит, что «отправленные в
+    // архив» карточки пошли в работу. Поэтому перед архивом считаем, кого
+    // пачка разбудит, и предлагаем забрать в архив и их — одной пачкой, где
+    // потомки идут ПЕРВЫМИ (иначе между двумя `archive_task` кто-то успеет
+    // стартовать).
+    //
+    // Считаем в браузере по `links` из ядрового `GET /tasks/{id}`, а не своим
+    // маршрутом плагина: маршрут, добавленный в plugin_api.py, доезжает до
+    // страницы только после перезапуска дашборда, а архив обязан перестать
+    // будить потомков сразу.
+    //
+    // Порядок обхода — волнами от выбранных карточек вниз. Ребёнок попадает в
+    // пачку, только если ВСЕ его родители либо выбраны (и уже уходят в архив),
+    // либо давно завершены (`done`/`archived`): карточка, которая ждёт ещё
+    // один незакрытый родитель, не должна уехать в архив вместе с этим.
+    function archiveImpact(slug, ids) {
+      var known = {};    // id -> {status, title}
+      var edges = {};    // id -> {parents, children}
+      tasks.forEach(function (t) {
+        if (boardSlug(t) === slug) known[t.id] = { status: t.status, title: t.title };
+      });
+
+      function readLinks(tid) {
+        if (edges[tid]) return Promise.resolve(edges[tid]);
+        return fetchJSON(
+          KANBAN_API + "/tasks/" + encodeURIComponent(tid) + "?board=" +
+          encodeURIComponent(slug)
+        ).then(function (r) {
+          var l = (r && r.links) || {};
+          if (r && r.task) {
+            known[tid] = { status: r.task.status, title: r.task.title || tid };
+          }
+          edges[tid] = { parents: l.parents || [], children: l.children || [] };
+          return edges[tid];
+        }).catch(function () {
+          edges[tid] = { parents: [], children: [] };
+          return edges[tid];
+        });
+      }
+
+      function settled(tid) {
+        var s = (known[tid] || {}).status || "";
+        return s === "done" || s === "archived";
+      }
+
+      var archiving = {};
+      var depth = {};
+      var woken = [];
+      ids.forEach(function (id) {
+        archiving[id] = true;
+        depth[id] = 0;
+      });
+
+      function wave(nodes) {
+        if (!nodes.length) return Promise.resolve();
+        return Promise.all(nodes.map(readLinks)).then(function (all) {
+          var candidates = [];
+          all.forEach(function (e) {
+            (e.children || []).forEach(function (cid) {
+              if (candidates.indexOf(cid) === -1) candidates.push(cid);
+            });
+          });
+          return Promise.all(candidates.map(readLinks)).then(function () {
+            var added = candidates.filter(function (cid) {
+              if (archiving[cid]) return false;
+              if ((known[cid] || {}).status !== "todo") return false;
+              var ps = (edges[cid] || {}).parents || [];
+              if (!ps.length) return false;
+              return ps.every(function (p) { return archiving[p] || settled(p); });
+            });
+            added.forEach(function (cid) {
+              archiving[cid] = true;
+              woken.push(cid);
+              var ps = edges[cid].parents;
+              depth[cid] = Math.max.apply(null, ps.map(function (p) {
+                return (depth[p] || 0) + 1;
+              }));
+            });
+            return wave(added);
+          });
+        });
+      }
+
+      return wave(ids.slice()).then(function () {
+        var byDepth = function (a, b) {
+          var d = (depth[b] || 0) - (depth[a] || 0);
+          return d !== 0 ? d : (a < b ? -1 : a > b ? 1 : 0);
+        };
+        return {
+          ids: Object.keys(archiving).sort(byDepth),
+          woken: woken.sort(byDepth).map(function (id) {
+            return {
+              id: id,
+              title: (known[id] || {}).title || id,
+              status: (known[id] || {}).status || "",
+            };
+          }),
+        };
+      });
+    }
+
+    // Одна пачка на доску: `{ids, archive: true}` → встроенный POST /tasks/bulk.
+    // `busy(true/false)` гасит повторный клик, `report` получает итог (включая
+    // список потомков, которых пачка разбудила бы, и решение оператора).
+    function archiveCards(targets, opts) {
+      var byBoard = {};
+      var order = [];
+      targets.forEach(function (t) {
+        var b = t.board || "default";
+        if (!byBoard[b]) { byBoard[b] = []; order.push(b); }
+        byBoard[b].push(t.id);
+      });
+      if (!order.length) return;
+      opts.busy(true);
+      Promise.all(order.map(function (b) {
+        return archiveImpact(b, byBoard[b]);
+      })).then(function (impacts) {
+        var extra = {};
+        var woken = [];
+        order.forEach(function (b, i) {
+          extra[b] = impacts[i].ids;
+          woken = woken.concat(impacts[i].woken);
+        });
+        var withChildren = false;
+        if (woken.length && window.confirm(
+          "Вместе с выбранным в архив " +
+          plural(woken.length, "уйдёт", "уйдут", "уйдут") + " " + woken.length + " " +
+          plural(woken.length, "потомок", "потомка", "потомков") +
+          " — ядро запустило бы их сразу, потому что родитель стал архивным:\n\n" +
+          woken.slice(0, 6).map(function (w) {
+            return "• " + (w.title || w.id);
+          }).join("\n") + (woken.length > 6 ? "\n…" : "") +
+          "\n\nАрхивировать вместе с ними?")) {
+          withChildren = true;
+        }
+        var okKeys = {};
+        var okCount = 0;
+        var fails = [];
+        var idx = 0;
+
+        function done() {
+          opts.busy(false);
+          opts.report({
+            ok: okCount,
+            fails: fails,
+            woken: woken,
+            withChildren: withChildren,
+            okKeys: okKeys,
+          });
+        }
+
+        function step() {
+          if (idx >= order.length) { done(); return; }
+          var b = order[idx++];
+          // With the children: `archiveImpact` already returned the ordered
+          // union (descendants first). Without them the operator keeps the old
+          // behaviour — and `report` says what will now start.
+          var ids = withChildren ? extra[b] : byBoard[b];
+          fetchJSON(
+            KANBAN_API + "/tasks/bulk?board=" + encodeURIComponent(b),
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ ids: ids, archive: true }),
+            }
+          ).then(function (r) {
+            if (r.__error || r.detail || !r.results) {
+              fails.push("доска " + b + ": " +
+                (r.detail || r.error || r.__error || "нет ответа"));
+              step();
+              return;
+            }
+            r.results.forEach(function (e) {
+              if (e && e.ok) {
+                okCount++;
+                okKeys[b + "/" + e.id] = true;
+              } else {
+                fails.push((e && e.id ? e.id : "?") + " (" +
+                  ((e && e.error) || "отказ") + ")");
+              }
+            });
+            step();
+          }).catch(function (e) {
+            fails.push("доска " + b + ": " + String((e && e.message) || e));
+            step();
+          });
+        }
+        step();
+      });
+    }
+
+    // Локальная правка состояния у тех карточек, которые сервер принял: строки
+    // переставляются сразу, а не через 2 секунды до следующего опроса (опрос
+    // остаётся источником истины и всё равно перезапишет список).
+    function applyLocalStatus(okKeys, status) {
+      setTasks(function (prev) {
+        var next = prev.map(function (t) {
+          if (!okKeys[taskKey(t)]) return t;
+          var copy = {};
+          for (var f in t) {
+            if (Object.prototype.hasOwnProperty.call(t, f)) copy[f] = t[f];
+          }
+          copy.status = status;
+          if (status === "done" || status === "archived") {
+            copy.completed_at = copy.completed_at || Math.floor(Date.now() / 1000);
+          }
+          return copy;
+        });
+        return next.sort(compareTasks);
+      });
+    }
+
     // Групповая смена состояния через ОДИН маршрут на доску — встроенный
     // `POST /tasks/bulk`: он применяет патч к каждому id независимо и отвечает
     // по каждому (`{results: [{id, ok, error}]}`), поэтому частичный отказ
     // видно, а не угадывать. Маршрут живёт в пределах одной доски, поэтому
     // выбор на «все доски» делится по доскам.
-    //
-    // `archived` идёт флагом `archive`, а не статусом: такого статуса в bulk
-    // нет (`_STATUS_HANDLERS`), и он вернул бы «unknown status».
     //
     // `done` / `archived` / `blocked` отпускают Claim воркера, поэтому пачка
     // спрашивает подтверждение ровно там, где спрашивает одиночная смена.
@@ -5298,8 +5548,49 @@ function Page() {
         "? Действие отпустит Claim воркеров.")) {
         return;
       }
-      setPickBusy(true);
       setPickNote({ kind: "", text: "" });
+
+      // Архив идёт своим путём: см. `archiveCards` — ядро иначе запустит
+      // потомков выбранных карточек, и оператор увидит их «в работе».
+      if (status === "archived") {
+        archiveCards(targets, {
+          busy: setPickBusy,
+          report: function (res) {
+            if (res.ok) {
+              applyLocalStatus(res.okKeys, "archived");
+              setDescField("status", "archived");
+            }
+            var kids = res.withChildren && res.woken.length
+              ? ", вместе с " + res.woken.length + " " +
+                plural(res.woken.length, "потомком", "потомками", "потомками")
+              : "";
+            if (res.fails.length) {
+              setPickNote({
+                kind: "err",
+                text: res.ok + " → archived" + kids + "; не удалось: " +
+                  res.fails.slice(0, 3).join("; ") + (res.fails.length > 3 ? " …" : ""),
+              });
+            } else if (!res.withChildren && res.woken.length) {
+              // Отказались от потомков: говорим прямо, что они сейчас начнут.
+              setPickNote({
+                kind: "err",
+                text: res.ok + " → archived" + kids + "; " + res.woken.length + " " +
+                  plural(res.woken.length, "потомок остался", "потомка остались",
+                         "потомков остались") + " в очереди и запустятся",
+              });
+            } else {
+              setPickNote({
+                kind: "ok",
+                text: res.ok + " " + plural(res.ok, "задача", "задачи", "задач") +
+                  " → archived" + kids,
+              });
+            }
+          },
+        });
+        return;
+      }
+
+      setPickBusy(true);
 
       var byBoard = {};
       var order = [];
@@ -5317,23 +5608,7 @@ function Page() {
       function finish() {
         setPickBusy(false);
         if (okCount) {
-          // Локальная правка, чтобы строки переставились сразу, а не через
-          // 2 секунды до следующего опроса; опрос остаётся источником истины.
-          setTasks(function (prev) {
-            var next = prev.map(function (t) {
-              if (!okKeys[taskKey(t)]) return t;
-              var copy = {};
-              for (var f in t) {
-                if (Object.prototype.hasOwnProperty.call(t, f)) copy[f] = t[f];
-              }
-              copy.status = status;
-              if (status === "done" || status === "archived") {
-                copy.completed_at = copy.completed_at || Math.floor(Date.now() / 1000);
-              }
-              return copy;
-            });
-            return next.sort(compareTasks);
-          });
+          applyLocalStatus(okKeys, status);
           setDescField("status", status);
         }
         if (fails.length) {
@@ -5355,8 +5630,7 @@ function Page() {
         if (idx >= order.length) { finish(); return; }
         var b = order[idx++];
         var payload = { ids: byBoard[b].map(function (t) { return t.id; }) };
-        if (status === "archived") payload.archive = true;
-        else payload.status = status;
+        payload.status = status;
         fetchJSON(
           KANBAN_API + "/tasks/bulk?board=" + encodeURIComponent(b),
           {

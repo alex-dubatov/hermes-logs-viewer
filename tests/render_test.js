@@ -1108,6 +1108,86 @@ const TEST_ASSIGNEE = "default";
         $(".hlv-pickbar").getAttribute("data-picked"));
     }
 
+    // --- Архив пачкой: ядро не должно разбудить потомков -------------------
+    // `archived` — терминальное состояние родителя для ядра, поэтому архив
+    // карточки-родителя снимает гейт с её `todo`-потомков в том же вызове, и
+    // диспетчер забирает их в работу. Ровно это оператор описал как «отправил
+    // несколько задач в архив из блокеда, а они ушли в инпрогресс» (на живой
+    // доске так и было: два архивных события и через 5 с два claimed). Панель
+    // обязана спросить маршрут плагина и забрать потомков в тот же архив.
+    {
+      const token2 = "archv" + Date.now();
+      const prevConfirm = dom.window.confirm;
+      const mkCard = async (title, extra) => {
+        const r = await fetchJSON(
+          "/api/plugins/kanban/tasks?board=" + encodeURIComponent(pickBoard),
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(Object.assign({ title }, extra || {})),
+          });
+        if (r && r.task) trackCard(r.task.id, pickBoard);
+        return r && r.task;
+      };
+      const parentCard = await mkCard("hlv-autotest: архив-родитель " + token2, { triage: true });
+      const childCard = await mkCard("hlv-autotest: архив-потомок " + token2,
+        { parents: [parentCard.id] });
+      check("карточка-потомок создана gated на родителе",
+        !!childCard && childCard.status === "todo",
+        childCard && childCard.status);
+
+      setInputValue($(".hlv-search-input"), token2);
+      let treeRows = [];
+      for (let w = 0; w < 12; w++) {
+        await sleep(700);
+        treeRows = $$(".hlv-row");
+        if (treeRows.length === 2) break;
+      }
+      check("обе карточки дерева видны в списке", treeRows.length === 2,
+        treeRows.length + " строк");
+
+      // Отмечаем ТОЛЬКО родителя: потомок в выбор не входит.
+      const parentRow = treeRows.find(
+        (r) => r.getAttribute("data-task-id") === parentCard.id);
+      const parentCb = parentRow &&
+        parentRow.parentElement.querySelector(".hlv-row-check");
+      check("у родителя есть галочка выбора", !!parentCb);
+      if (parentCb) {
+        click(parentCb);
+        await sleep(400);
+      }
+
+      const asked = [];
+      dom.window.confirm = (m) => { asked.push(String(m)); return true; };
+      click(bulkBtn("archived"));
+      let parentSt = "";
+      let childSt = "";
+      for (let w = 0; w < 12; w++) {
+        await sleep(700);
+        parentSt = await statusOf(parentCard.id);
+        childSt = await statusOf(childCard.id);
+        if (parentSt === "archived" && childSt === "archived") break;
+      }
+      dom.window.confirm = prevConfirm;
+      check("второй вопрос назвал потомка, которого заберут в архив",
+        asked.length === 2 && asked[1].indexOf("Архивировать вместе с ними") !== -1 &&
+          asked[1].indexOf("архив-потомок ") !== -1,
+        asked.map((s) => s.split("\n")[0].slice(0, 70)).join(" | "));
+      check("архив забрал и потомка — он НЕ пошёл в работу",
+        parentSt === "archived" && childSt === "archived",
+        parentSt + " / " + childSt);
+
+      setInputValue($(".hlv-search-input"), "");
+      await sleep(400);
+      for (const t of [parentCard, childCard]) {
+        await noteClaim(t.id, pickBoard);
+        await fetchJSON(
+          "/api/plugins/kanban/tasks/" + encodeURIComponent(t.id) +
+          "?board=" + encodeURIComponent(pickBoard),
+          { method: "DELETE" });
+      }
+    }
+
     // Уборка: карточки и фильтр.
     click($(".hlv-search-clear") || $(".hlv-search-input"));
     await sleep(500);

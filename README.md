@@ -770,6 +770,18 @@ the bar, and they apply **to every marked card**:
   as the single-card switch does;
 - `archived` travels as the `archive` flag, not as a status: bulk has no such status verb
   and would answer “unknown status”;
+- **archiving asks about the children it would start.** In the kernel `archived` is a
+  *satisfied* parent, so archiving a card releases its gated `todo` children in the same
+  call (`recompute_ready` inside `kanban_db.archive_task`) and the dispatcher claims them a
+  second later — on the live board that read as “я отправил несколько задач в архив из
+  блокеда, а они ушли в работу” (two `archived` events, five seconds later two `claimed`).
+  Before the batch is sent the bar walks the card's `links` (`GET /tasks/{id}`) and, when a
+  child would be released — it is `todo`, and **every** one of its parents is either in the
+  batch or already `done`/`archived` — offers to archive those children too. Agree, and
+  they travel in the same request, **descendants first**, so no child can be claimed
+  between two archive calls; decline, and the bar says how many children are now queued.
+  A card that still waits on another unfinished parent is never taken along. The same rule
+  runs for the single-card “→ archived” button;
 - the bar reports the result (“2 задачи → todo”) or names what was refused
   (“1 → done; не удалось: t_… (transition to 'scheduled' refused)”);
 - the selection survives the change, so a second status can be applied without marking the
@@ -1048,7 +1060,7 @@ Poll frequencies: the task list 2 s, the log 1.2 s, **the transcript 2 s**, **th
 ## Verification
 
 `tests/render_test.js` is a stand that loads `dist/index.js` into **jsdom**, boots a real
-React and talks to the **live dashboard**, then clicks on the real UI. **332 checks**: the
+React and talks to the **live dashboard**, then clicks on the real UI. **337 checks**: the
 header layout (including that the board label fits the selector and that the selector carries
 a `title`), the badge rules for all 9 statuses, the absence of rounded corners, search (by
 title, by description, **by task id and by its beginning**, an empty result, the clear
@@ -1078,6 +1090,17 @@ measured in real Chromium by `tools/model_picker_layout_check.js` (desktop 1440p
 420px): the two selects share one line, the provider column is 190px, the model column takes
 the rest, nothing leaves the modal, and a profile whose provider is **not** in the catalog
 (`kosareva`) keeps its real value in both selects instead of jumping to the first entry.
+
+**Archiving is verified on the kernel, not only in the DOM.** `tools/archive_cascade_probe.py`
+runs the real `kanban_db.archive_task` on throwaway boards in a temporary
+`HERMES_KANBAN_HOME`: it first reproduces the report — archive the parent alone and its gated
+`todo` children come out `ready`, which the dispatcher then claims — and then sends the same
+tree descendants-first, as the panel does once the operator agrees, and checks that at **no
+step** of the batch is anything left `ready`. The panel's own computation of “which children
+would be released” is covered by `tests/render_test.js`: it creates a throwaway parent and a
+card gated on it, marks **only** the parent, stubs `confirm`, clicks “→ archived”, and asserts
+both that the second question names the child and that the child ends up `archived` instead of
+`ready`/`running`.
 
 **The “runs” and “files” tabs are verified against the server, not against our own markup.**
 The run history is matched with `GET /tasks/{id}`: the number of rows, `data-run-id` (newest
