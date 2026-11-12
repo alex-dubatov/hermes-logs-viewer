@@ -204,11 +204,13 @@ sessions are missing, the answer is `source: "none"` with an empty list, not a 5
 
 ![The tab with the description editor — in the screenshot it was still called “дескрипшен”](docs/description.png)
 
-The last tab of the right pane holds the whole card in one place: the title, the header,
-the priority, the state and the body of the task. These things used to be spread over two
-tabs (“дескрипшен” and “прочее”): changing the state meant switching to the neighbouring
-tab, while the body and the title were edited in a third one. Now everything that can be
-changed on a card sits together, and the tab is called **“main”**.
+The **first** tab of the right pane — and the one a card opens on — holds the whole card in
+one place: the title, the header, the priority, the state and the body of the task. These
+things used to be spread over two tabs (“дескрипшен” and “прочее”): changing the state meant
+switching to the neighbouring tab, while the body and the title were edited in a third one.
+Now everything that can be changed on a card sits together, and the tab is called
+**“main”**. It is also the **default** pane: a card is opened to be read and acted on, not to
+watch its log — the log stays one click away and keeps its own polling.
 
 > The screenshot above was taken before the tabs were merged — it still shows the old name
 > “дескрипшен”. It cannot be re-shot without the repository owner's permission (see
@@ -274,6 +276,63 @@ that field when a card is created.
 
 The card header: title, status badge, assignee, workspace and the time limit (`∞` when 0 =
 infinite).
+
+#### «оборвать воркер»: kill the process, not just the claim
+
+The state buttons only **release the claim**. The card leaves `running`, but the worker
+process keeps living: it keeps writing to the profile's `logs/agent.log` and keeps calling
+the model. On 12.11 card `t_6ba39266` sat in `blocked` with no claim while
+`agent.managed_worker` pid 15661 worked for another six minutes and died only from a manual
+`kill -TERM` — the card was visibly “trying to continue”.
+
+The **«оборвать воркер»** button sits in the same row as the state buttons, because it is
+the other half of the same decision, and it is **active only when there is a live worker to
+kill**:
+
+| what the panel knows | button | why |
+| --- | --- | --- |
+| `state=alive` with a pid | active | the process is ours (fingerprint matches the spawn) |
+| no worker at all | inactive, title “у задачи нет живого воркера” | nothing to kill — and it must not read as “killed” |
+| `state=remote` | inactive, title “воркер на другой машине, отсюда не оборвать” | the `claim_lock` belongs to another host; the panel does not pretend |
+| `state=unknown` | inactive, title about a spawn without a fingerprint | a pid alone does not prove it is our worker, so it is never signalled |
+
+A click asks for confirmation — “Оборвать воркер задачи `<id>` (pid N)? Процесс будет убит,
+claim снят, карточка останется в блокировке” — and then calls
+`POST /api/plugins/hermes-logs-viewer/tasks/{id}/kill-worker?board=…`. On success the pane
+shows the route's message and the card and the “live workers” badge are refreshed at once
+(the badge drops the process without waiting for the next poll).
+
+The route kills the **whole process tree**: SIGTERM to the worker and its descendants (node
+MCP servers, a shell supervisor — `managed_worker` spawns several), a pause, then SIGKILL for
+whatever is left, then it waits for the pids to disappear. On a non-Linux host it answers
+“не поддерживается” (501) instead of pretending.
+
+Afterwards the board is brought in line with the OS, not just the process:
+
+- the claim is released (`claim_lock`/`claim_expires`/`worker_pid`/`worker_started_at` are
+  cleared) and the open run is closed with `outcome = killed`;
+- a `reclaimed` event records what was killed;
+- a **sticky** `blocked` event is written — the newest `blocked`/`unblocked` event, which is
+  what `recompute_ready` checks (`kanban_db._has_sticky_block`). Without it the card would be
+  promoted back to `ready` and respawned. A card that was in `review` keeps `review`: forcing
+  `blocked` there would reopen work that was already handed off.
+
+The pid comes from `task_runs`, **not** from `tasks.worker_pid`: the core nulls that column on
+a terminal transition and leaves the pid on the closed run, which is exactly the worker that
+outlived its card. The spawn fingerprint is re-checked immediately before the first signal, so
+a recycled pid is refused (409) instead of killing a stranger.
+
+| answer | when |
+| --- | --- |
+| `200 {killed: [pid…], claim_released, status, message}` | the tree is gone and the board is updated |
+| `409` | no live worker, a recycled pid, an `unverified` spawn, a worker on another host, or a pid that survived SIGKILL — the board is left **untouched** in every case |
+| `403` | the process cannot be signalled (not ours) |
+| `404` | unknown board or card |
+| `501` | not Linux |
+
+**This route needs a dashboard restart** (`systemctl --user restart hermes-dashboard`): our
+`plugin_api.py` is mounted at process start, so an old dashboard answers `404` and the pane
+says exactly that. The rest of the tab is unaffected.
 
 **An open editor is not overwritten by the poll.** The description is refreshed every 5 s,
 and the “do not clobber an open editor” check used to read `descEdit` from the effect's
@@ -947,6 +1006,7 @@ Our own `plugin_api.py` serves exactly what the bundled plugin lacks:
 | `GET/POST /tasks/{id}/comments` | comments: insert into `task_comments` + a `commented` event, like `kanban_db.add_comment`; the GET also reports, per comment, whether the worker has already read it |
 | `DELETE /tasks/{id}/comments/{cid}` | delete one comment (+ its paired `commented` event); `409` when the worker has already seen it, unless `force=1` |
 | `GET /projects[?board=]` | projects with their `board_slug` and `primary_is_repo` — what the bundled plugin lacks (see below) |
+| `POST /tasks/{id}/kill-worker?board=…` | kill the card's worker **process tree** and bring the board in line: claim released, run closed as `killed`, a sticky `blocked` event (see “оборвать воркер”) |
 | `GET /transcript` | the card's live transcript from the owner profile's store (see below) |
 | `GET /tasks/{id}/live` | tokens of the **current** model call: the live reasoning block (see below) |
 
@@ -1060,11 +1120,12 @@ Poll frequencies: the task list 2 s, the log 1.2 s, **the transcript 2 s**, **th
 ## Verification
 
 `tests/render_test.js` is a stand that loads `dist/index.js` into **jsdom**, boots a real
-React and talks to the **live dashboard**, then clicks on the real UI. **337 checks**: the
+React and talks to the **live dashboard**, then clicks on the real UI. **360 checks**: the
 header layout (including that the board label fits the selector and that the selector carries
 a `title`), the badge rules for all 9 statuses, the absence of rounded corners, search (by
 title, by description, **by task id and by its beginning**, an empty result, the clear
-button), the “main” tab with a live round-trip of a description edit and **a check that the
+button), **the tab strip and the «оборвать воркер» button** (see the paragraph below), the
+“main” tab with a live round-trip of a description edit and **a check that the
 poll does not clobber the text being typed** (the stand waits 6.5 s — longer than the 5 s poll
 period — and makes sure the textarea is intact; the edit is cancelled and the card is left
 untouched), the new-task form (an empty board by default, a refusal to create without a board,
@@ -1138,6 +1199,25 @@ with one row per process (a live board cannot be asked to produce a worker that 
 card on demand). The **narrow layout** and the phone-side tap are measured in real Chromium
 by `tests/carousel_test.js`: at 360px only the short form of the label is shown and the badge
 stays inside the viewport, at 1440px the long form sits on the counters' line.
+
+**«оборвать воркер» is verified on the process and on the board, not on the button.**
+`tests/test_kill_worker.py` spawns a real process **with children** (a miniature
+`managed_worker`) and records it in `task_runs` the way the dispatcher does, then calls the
+route: the whole tree must be gone from `/proc`, the card must be `blocked` with no claim, the
+open run closed as `killed`, and the kernel's **own** `recompute_ready` +
+`_has_sticky_block` — imported from the installed `hermes_cli`, not re-implemented — must
+leave the card alone while a plain `todo` card on the same board is promoted (so the check
+cannot pass on a board where nothing promotes). Every refusal is covered against a live
+process that must **still be alive** afterwards: no worker at all, `state=remote`, a recycled
+pid (foreign fingerprint), an `unverified` spawn, a dead pid; and the board must be untouched
+after each. A card in `review` keeps `review`. `tools/kill_worker_live_probe.py` repeats the
+same thing through the **running dashboard**: a throwaway board in the real kanban home, a real
+process tree, one authed HTTP POST, then `/tasks/all` (no worker), the board row (claim gone,
+`blocked`), `ps`, and a second call that must answer 409. The panel's side — the button's four
+states and their titles, the confirmation text, the POST path, the note and the 404
+“перезапустите dashboard” hint — is pinned in `tests/render_test.js` with a canned answer for
+that one request (the real route cannot be clicked there: it would have to kill a real
+process).
 
 ```bash
 HLV_LIVE_TASK=<id of a card with a run and an attachment> \
@@ -1435,8 +1515,13 @@ The screenshots are checked separately — see [“Screenshots”](#screenshots)
 - **the transcript reads someone else's storage**: the owner profile's store. It is opened
   **read-only** (`mode=ro`), and if the card has no `owner_admitted` event (the old scheme),
   the pane does not reach into any store;
-- the plugin's backend exists only for the cross-board task list, the comments and the
-  transcript.
+- **«оборвать воркер» is Linux-only**: the process tree is read from `/proc`, and on any other
+  platform the route answers 501 instead of guessing. It also needs a dashboard restart after
+  the route is added (our `plugin_api.py` is mounted at process start), and it never signals a
+  process it cannot prove is ours — a `remote` worker, a recycled pid or an `unverified` spawn
+  are refused with 409;
+- the plugin's backend exists only for the cross-board task list, the comments, the
+  transcript and the worker kill.
 
 ---
 

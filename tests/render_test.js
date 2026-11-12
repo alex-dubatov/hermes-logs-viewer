@@ -157,6 +157,13 @@ const DELETES = [];
 // outlived its run), so the UI contract for it is pinned by feeding the panel a
 // synthetic answer while every other request keeps going to the live dashboard.
 let WORKERS_OVERRIDE = null;
+// Canned answer for the one «оборвать воркер» request. The real route lives in
+// our own plugin_api.py, which is mounted at process start — an un-restarted
+// dashboard answers 404 for it, so the panel's contract (confirm text, POST
+// path, note, immediate refresh, the 404 hint) is pinned by answering that
+// request here. The route itself is covered by tests/test_kill_worker.py
+// against a real process tree and a real board.
+let KILL_REPLY = null;
 const sdkFetch = function (p, opts) {
   opts = opts || {};
   const verb = (opts.method || "GET").toUpperCase();
@@ -166,6 +173,10 @@ const sdkFetch = function (p, opts) {
     POSTS.push({ path: p, body: parsed });
   } else if (verb === "DELETE") {
     DELETES.push({ path: p });
+  }
+  if (KILL_REPLY && /\/tasks\/[^/]+\/kill-worker(\?|$)/.test(p)) {
+    const reply = KILL_REPLY;
+    return Promise.resolve(reply);
   }
   const pending = fetchJSON(p, opts);
   if (WORKERS_OVERRIDE && /\/tasks\/all(\?|$)/.test(p)) {
@@ -635,6 +646,155 @@ const TEST_ASSIGNEE = "default";
   check("вкладки «дескрипшен» и «прочее» больше нет",
     !tabs.some((t) => t.indexOf("дескрипшен") === 0 || t.indexOf("прочее") === 0),
     JSON.stringify(tabs));
+
+  // --- 5b. «основное» is the FIRST tab and the DEFAULT one --------------
+  // A card is opened to be read and acted on, not to watch its log. The tab
+  // order is the promise; the default pane is what a click on a card lands on.
+  check("«основное» — первая вкладка", tabs.length > 0 && tabs[0].indexOf("основное") === 0,
+    JSON.stringify(tabs));
+  const activeTab = $(".hlv-tab.active");
+  check("карточка открывается на «основном»", !!activeTab &&
+    (textOf(activeTab) || "").indexOf("основное") === 0,
+    activeTab && textOf(activeTab));
+  check("панель «основного» в DOM без клика по вкладке", !!$(".hlv-desc-title"));
+  // ...and the rest of the strip still works: switching away and back is what
+  // the other panes (and their pollers) depend on.
+  const logTabFirst = $$(".hlv-tab").find((t) => (textOf(t) || "").trim().indexOf("лог") === 0);
+  if (logTabFirst) {
+    click(logTabFirst);
+    await sleep(300);
+    check("вкладка «лог» открывается кликом", !$(".hlv-desc-title") && !!$(".hlv-log"));
+    click(findButton("основное"));
+    await sleep(400);
+    check("возврат на «основное»", !!$(".hlv-desc-title"));
+  } else {
+    check("вкладка «лог» на месте", false, JSON.stringify(tabs));
+  }
+
+  // --- 5c. «оборвать воркер» --------------------------------------------
+  // The state buttons release the claim; this one also stops the PROCESS (the
+  // card that left `running` while its worker kept calling the model). What is
+  // pinned here: the button exists next to the state buttons, it is active only
+  // for a live worker, `remote` never pretends, the click asks for confirmation
+  // naming the card and the pid, a refusal sends nothing, an accepted one posts
+  // to the right route and refreshes card + worker badge at once, and a 404
+  // (un-restarted dashboard) says so instead of leaking HTTP plumbing.
+  const selRow = $(".hlv-row.active");
+  const selMeta = selRow && (liveAll.tasks || []).find(
+    (t) => t.id === selRow.getAttribute("data-task-id"));
+  if (!selMeta) {
+    console.log("SKIP «оборвать воркер»: слева нет выбранной карточки");
+  } else {
+    const nowS = Math.floor(Date.now() / 1000);
+    const workerRow = (state, pid) => ({
+      board: selMeta.board, task_id: selMeta.id, title: selMeta.title,
+      task_status: selMeta.status, profile: "executor", run_id: 9,
+      run_status: "running", outcome: "", pid: pid,
+      started_at: nowS - 300, ended_at: null, last_heartbeat_at: nowS - 3,
+      state: state, phase: state === "remote" ? "running" : "running", since_s: 300,
+    });
+    const killBtnNow = () => $(".hlv-btn-kill");
+
+    WORKERS_OVERRIDE = [];
+    await sleep(2600);
+    check("кнопка «оборвать воркер» есть в строке состояния", !!killBtnNow(),
+      killBtnNow() ? killBtnNow().textContent : "нет .hlv-btn-kill");
+    check("без живого воркера кнопка погашена", !!killBtnNow() && killBtnNow().disabled === true,
+      killBtnNow() && killBtnNow().disabled);
+    check("  и тултип говорит «нет живого воркера»",
+      !!killBtnNow() && killBtnNow().title === "у задачи нет живого воркера",
+      killBtnNow() && killBtnNow().title);
+
+    WORKERS_OVERRIDE = [workerRow("remote", 4343)];
+    await sleep(2600);
+    check("на remote кнопка неактивна", !!killBtnNow() && killBtnNow().disabled === true,
+      killBtnNow() && killBtnNow().disabled);
+    check("  тултип про другую машину", !!killBtnNow() && /другой машине/.test(killBtnNow().title),
+      killBtnNow() && killBtnNow().title);
+
+    WORKERS_OVERRIDE = [workerRow("alive", 4242)];
+    await sleep(2600);
+    check("на живом воркере кнопка активна", !!killBtnNow() && killBtnNow().disabled === false,
+      killBtnNow() && killBtnNow().disabled);
+    check("  в тултипе назван pid", !!killBtnNow() && /pid 4242/.test(killBtnNow().title),
+      killBtnNow() && killBtnNow().title);
+    check("  pid проброшен в data-атрибут",
+      !!killBtnNow() && killBtnNow().getAttribute("data-kill-worker-pid") === "4242",
+      killBtnNow() && killBtnNow().getAttribute("data-kill-worker-pid"));
+
+    const asked = [];
+    let answer = false;
+    const realConfirm = dom.window.confirm;
+    dom.window.confirm = (msg) => { asked.push(String(msg)); return answer; };
+    click(killBtnNow());
+    await sleep(150);
+    check("клик спрашивает подтверждение", asked.length === 1, asked.length);
+    check("  в вопросе есть id карточки и pid",
+      asked.length === 1 && asked[0].indexOf(selMeta.id) !== -1 && /pid 4242/.test(asked[0]),
+      asked[0]);
+    check("  и сказано, что карточка останется в блокировке",
+      asked.length === 1 && /блокировк/.test(asked[0]), asked[0]);
+    check("отказ в подтверждении не отправляет запрос",
+      POSTS.filter((x) => /kill-worker/.test(x.path)).length === 0,
+      POSTS.length);
+
+    KILL_REPLY = {
+      ok: true, task_id: selMeta.id, board: selMeta.board, killed: [4242],
+      claim_released: true, status: "blocked",
+      message: "воркер задачи " + selMeta.id + " оборван: pid 4242; claim снят, карточка в blocked",
+    };
+    answer = true;
+    const postsBeforeKill = POSTS.length;
+    // Stop the 2 s poll from resurrecting the synthetic worker while the kill
+    // is in flight: every /tasks/all answer from here on carries no worker,
+    // which is also what the real board looks like after the kill. Set BEFORE
+    // the click (synchronously) so a poll cannot land between the two, yet
+    // after the button has rendered as active.
+    WORKERS_OVERRIDE = [];
+    click(killBtnNow());
+    await sleep(600);
+    const killPost = POSTS.slice(postsBeforeKill).filter((x) => /kill-worker/.test(x.path)).pop();
+    check("подтверждение отправляет POST …/tasks/{id}/kill-worker",
+      !!killPost && killPost.path.indexOf("/tasks/" + selMeta.id + "/kill-worker") !== -1,
+      killPost && killPost.path);
+    check("  с доской карточки в query", !!killPost && /[?&]board=/.test(killPost.path),
+      killPost && killPost.path);
+    const killNote = $(".hlv-desc-note");
+    check("после успеха показано сообщение маршрута",
+      !!killNote && /оборван/.test(textOf(killNote)), killNote && textOf(killNote));
+    // The pane's own refresh: the killed process must stop being offered. The
+    // status badge is NOT asserted here — the pane re-reads the card from the
+    // board right after the write, and this stand's board still says what it
+    // said (the canned reply changes nothing server-side); `status` landing in
+    // the DB is covered by tests/test_kill_worker.py.
+    check("  кнопка погасла — убивать больше некого",
+      !!$(".hlv-btn-kill") && $(".hlv-btn-kill").disabled === true &&
+        $(".hlv-btn-kill").title === "у задачи нет живого воркера",
+      $(".hlv-btn-kill") && ($(".hlv-btn-kill").disabled + " / " + $(".hlv-btn-kill").title));
+    const badgeAfterKill = $(".hlv-header .hlv-workers");
+    check("  бейдж воркеров пересчитан",
+      !!badgeAfterKill && badgeAfterKill.getAttribute("data-workers") === "0",
+      badgeAfterKill && badgeAfterKill.getAttribute("data-workers"));
+
+    // 404 = the dashboard has not been restarted since the route was added.
+    // fetchJSON throws `404: {"detail":"Not Found"}` and api() turns that into
+    // `{__error}`; the pane must translate it into the one actionable line.
+    WORKERS_OVERRIDE = [workerRow("alive", 4242)];
+    await sleep(2600);   // let the poll bring the synthetic worker back
+    KILL_REPLY = { __error: '404: {"detail":"Not Found"}' };
+    answer = true;
+    click($(".hlv-btn-kill"));
+    await sleep(600);
+    const staleNote = $(".hlv-desc-note");
+    check("404 от маршрута превращается в «перезапустите dashboard»",
+      !!staleNote && /перезапустите dashboard/.test(textOf(staleNote)),
+      staleNote && textOf(staleNote));
+
+    dom.window.confirm = realConfirm;
+    KILL_REPLY = null;
+    WORKERS_OVERRIDE = null;
+    await sleep(2600);
+  }
 
   // --- 5a. the "транскрипт" tab exists and opens -------------------------
   // The transcript is the card's LIVE conversation, read from the owner

@@ -60,6 +60,8 @@ with no build step; backend: one Python route file (`dashboard/plugin_api.py`).
 | `HLV_LIVE_TASK=… PLAYWRIGHT_PATH=… CHROME_PATH=… node tools/runs_files_layout_check.js` | настоящий Chromium: вкладки «запуски» и «файлы» — геометрия, настоящая загрузка файла, скачивание с проверкой байтов, удаление |
 | `node tools/css_probe.js` | та же проверка без браузера: CSS-движок над настоящей таблицей стилей |
 | `python3 tests/test_workers.py` | живой бейдж воркеров на бэкенде: настоящие процессы `/proc`, закрытые run'ы, чужие claim-локи, переиспользованный pid |
+| `python3 tests/test_kill_worker.py` | маршрут «оборвать воркер»: дерево процессов целиком, отказы (нет воркера / `remote` / чужой fingerprint / `unverified`) не трогают доску, sticky `blocked` проверяется настоящим `recompute_ready` |
+| `python3 tools/kill_worker_live_probe.py` | тот же маршрут по HTTP в живом дашборде на одноразовой доске: реальный процесс с потомками, `/tasks/all`, доска, повторный 409 (нужен живой дашборд и cookie jar) |
 | `node tools/board_probe.js` / `tools/board_label_fit.js` | пробы селектора досок |
 | `node tools/board_switch_check.js` | живой стенд левого списка: id и дата создания в строке, дубли на «все доски», порядок статус-группами по всем доскам, переключение досок без смешения, кнопки гейтвея |
 | `env -u HERMES_HOME python3 tools/anchor_probe.py ff ff-front` | якорь проекта на стороне ядра |

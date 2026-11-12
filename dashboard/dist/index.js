@@ -132,6 +132,25 @@
     return Math.floor(d / 86400) + "d";
   }
 
+  // The host's ``fetchJSON`` THROWS on non-2xx (`Error("<status>: <body>")`) and
+  // this plugin's own routes answer refusals with `{"error": "..."}` — so a
+  // refusal reaches a pane as `409: {"error":"у задачи нет живого воркера…"}`.
+  // Unwrap it into the sentence the route actually wrote; anything unparseable
+  // is passed through as it came. FastAPI's own `{"detail": "..."}` is read too,
+  // because the bundled routes answer in that shape.
+  function apiErrorText(res, fallback) {
+    var raw = (res && (res.error || res.detail || res.__error)) || fallback || "нет ответа";
+    var m = /^\d{3}:\s*([\s\S]*)$/.exec(String(raw));
+    if (!m) return String(raw);
+    var body = m[1];
+    try {
+      var parsed = JSON.parse(body);
+      if (parsed && typeof parsed.error === "string") return parsed.error;
+      if (parsed && typeof parsed.detail === "string") return parsed.detail;
+    } catch (e) { /* not JSON — fall through to the raw body */ }
+    return body || String(raw);
+  }
+
   // Byte counts, shown next to the лог/комментарии tabs. Exact bytes with a
   // thin-space thousands separator — a log window is only meaningful against
   // the file's true size, and a rounded "1.1 МБ" cannot be compared with a
@@ -985,10 +1004,14 @@ function Page() {
     var atBottom = atBottomState[0];
     var setAtBottom = atBottomState[1];
 
-    // Which pane the right side shows: "log" (live tail), "transcript" (the
-    // card's conversation), "comments" (the thread), "runs" (its attempts),
-    // "files" (its attachments) or "main" (the card itself).
-    var paneState = useState("log");
+    // Which pane the right side shows: "main" (the card itself), "log" (live
+    // tail), "transcript" (the card's conversation), "comments" (the thread),
+    // "runs" (its attempts) or "files" (its attachments).
+    //
+    // "основное" is BOTH the first tab and the default: a card is opened to be
+    // read and acted on (state, priority, «оборвать воркер»), not to watch its
+    // log. The log is one click away and keeps its own scroll/poll behaviour.
+    var paneState = useState("main");
     var pane = paneState[0];
     var setPane = paneState[1];
     // The SAME through a ref: the transcript's watchdog runs on a timer that
@@ -2287,6 +2310,111 @@ function Page() {
       }
       patchTask({ status: status }, "состояние: " + status, function (task) {
         setDescField("status", task.status);
+      });
+    }
+
+    // --- «Оборвать воркер» -------------------------------------------------
+    //
+    // Смена состояния ТОЛЬКО отпускает claim: карточка уезжает из running, а
+    // процесс продолжает жить — писать в лог профиля и ходить в модель
+    // (t_6ba39266, 12.11: blocked, claim снят, pid 15661 работал ещё минуты).
+    // Эта кнопка — явное «останови процесс»: маршрут убивает дерево процессов
+    // и приводит доску в согласованное состояние (claim снят, run закрыт,
+    // карточка в sticky blocked).
+    //
+    // Кнопка живёт там же, где состояние, и включается только тогда, когда
+    // убивать есть кого: запись воркера со state alive. `remote` и `unknown`
+    // не притворяются — у них своя подпись и они неактивны.
+    function liveWorkerFor(taskId, boardSlug) {
+      var list = (workers || []).filter(function (w) {
+        return w.task_id === taskId && w.board === boardSlug;
+      });
+      // У карточки бывает несколько записей (run, переживший переход, плюс
+      // текущий). Для убийства годится только та, где есть живой pid; при
+      // равенстве `alive` важнее `unknown` (его хотя бы можно проверить), а
+      // `remote` — последний: его нельзя оборвать отсюда.
+      var rank = { alive: 0, unknown: 1, remote: 2 };
+      var best = null;
+      list.forEach(function (w) {
+        if (w.state !== "alive" && w.state !== "unknown" && w.state !== "remote") return;
+        if (!best || rank[w.state] < rank[best.state]) best = w;
+      });
+      return best;
+    }
+
+    // Подпись и доступность кнопки: одна функция, чтобы она и тултип не
+    // разошлись в том, что считают «живым воркером».
+    function killButtonState(w) {
+      if (!w) {
+        return { disabled: true, title: "у задачи нет живого воркера" };
+      }
+      if (w.state === "remote") {
+        return { disabled: true, title: "воркер на другой машине, отсюда не оборвать" };
+      }
+      if (w.state === "unknown") {
+        return {
+          disabled: true,
+          title: "процесс заспавнен без fingerprint — нельзя доказать, что это воркер задачи",
+        };
+      }
+      if (!w.pid) {
+        return { disabled: true, title: "у задачи нет живого воркера" };
+      }
+      return {
+        disabled: false,
+        title: "оборвать воркер этой задачи (pid " + w.pid + "): SIGTERM дереву " +
+          "процессов, затем SIGKILL; claim будет снят, карточка останется в блокировке",
+      };
+    }
+
+    function killWorkerOfCard() {
+      var id = selectedRef.current;
+      if (!id || cardBusy) return;
+      var w = liveWorkerFor(id, boardOf(id));
+      var ui = killButtonState(w);
+      if (ui.disabled) {
+        setNote({ kind: "err", text: ui.title });
+        return;
+      }
+      if (!window.confirm(
+        "Оборвать воркер задачи " + id + " (pid " + w.pid + ")? " +
+        "Процесс будет убит, claim снят, карточка останется в блокировке")) {
+        return;
+      }
+      setCardBusy(true);
+      setNote({ kind: "", text: "" });
+      api("/tasks/" + encodeURIComponent(id) + "/kill-worker?board=" +
+          encodeURIComponent(boardOf(id)), { method: "POST" }
+      ).then(function (r) {
+        setCardBusy(false);
+        if (!r || r.__error || r.error || r.ok === false) {
+          var text = apiErrorText(r, "не удалось оборвать воркер");
+          // 404 от этого маршрута — это старый dashboard: новые маршруты
+          // появляются только при перезапуске процесса, а страница берётся с
+          // диска. Единственное, что панель может тут сказать, — перезапустить.
+          if (/^Not Found$/i.test(text)) {
+            text = "маршрут «оборвать воркер» ещё не загружен — перезапустите dashboard";
+          }
+          setNote({ kind: "err", text: text });
+          return;
+        }
+        setDescField("status", r.status || "blocked");
+        setNote({ kind: "ok", text: r.message || "воркер оборван" });
+        // Бейдж «кто работает» должен обновиться сразу, а не через опрос:
+        // процесс убит, и следующий /tasks/all это подтвердит.
+        var b = boardOf(id);
+        setWorkers(function (prev) {
+          if (!Array.isArray(prev)) return prev;
+          return prev.filter(function (x) {
+            return !(x.task_id === id && x.board === b);
+          });
+        });
+        if (detailReloadRef.current) detailReloadRef.current();
+        setTimeout(function () {
+          setNote(function (n) {
+            return n.kind === "ok" ? { kind: "", text: "" } : n;
+          });
+        }, 2500);
       });
     }
 
@@ -4437,6 +4565,11 @@ function Page() {
       mainView = el("div", { className: "hlv-empty" }, "загрузка…");
     } else {
       var curStatus = desc.status;
+      // The worker this card's «оборвать» button would kill, if any. A card in
+      // blocked / review whose process outlived its transition still has one —
+      // that is exactly the case the button exists for.
+      var cardWorker = liveWorkerFor(selected, boardOf(selected));
+      var cardKill = killButtonState(cardWorker);
       // The title row: the title itself, the pencil that edits it, and the
       // meta line (status, assignee, workspace, time limit).
       var titleRow = el(
@@ -4584,7 +4717,20 @@ function Page() {
                 onClick: function () { setStatus(b.value); },
               }, b.label);
             })
-          )
+          ),
+          // «оборвать воркер» sits with the state buttons because it is the
+          // other half of the same decision: the buttons release the claim,
+          // this one also stops the process. Inactive — with the reason in its
+          // title — when there is nothing to kill; `remote` never pretends.
+          el("button", {
+            type: "button",
+            className: "hlv-btn hlv-btn-kill",
+            title: cardKill.title,
+            disabled: cardBusy || cardKill.disabled,
+            "data-kill-worker-pid": cardWorker && cardWorker.pid ? String(cardWorker.pid) : "",
+            "data-kill-worker-state": cardWorker ? String(cardWorker.state) : "",
+            onClick: killWorkerOfCard,
+          }, "оборвать воркер")
         ),
         descEdit
           ? el("textarea", {
@@ -4658,6 +4804,14 @@ function Page() {
         // block sits OUTSIDE it: log size and «развернуть» must stay reachable
         // when the tab strip is scrolled.
         el("div", { className: "hlv-tabs-list" },
+          // "основное" first: it is the default pane, and the tab order should
+          // read the way the card does — the card itself, then its evidence.
+          el("button", {
+            type: "button",
+            className: "hlv-tab" + (pane === "main" ? " active" : ""),
+            onClick: function () { setPane("main"); },
+            title: "карточка задачи: заголовок, описание, приоритет и состояние",
+          }, "основное"),
           el("button", {
             type: "button",
             className: "hlv-tab" + (pane === "log" ? " active" : ""),
@@ -4685,13 +4839,7 @@ function Page() {
             className: "hlv-tab" + (pane === "files" ? " active" : ""),
             onClick: function () { setPane("files"); },
             title: "файлы карточки: загрузить, скачать, удалить",
-          }, "файлы" + (attachments.length ? " · " + attachments.length : "")),
-          el("button", {
-            type: "button",
-            className: "hlv-tab" + (pane === "main" ? " active" : ""),
-            onClick: function () { setPane("main"); },
-            title: "карточка задачи: заголовок, описание, приоритет и состояние",
-          }, "основное")
+          }, "файлы" + (attachments.length ? " · " + attachments.length : ""))
         ),
         el("div", { className: "hlv-tabs-right" },
           sizeInfo,

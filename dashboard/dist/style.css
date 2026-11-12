@@ -1746,6 +1746,19 @@
   cursor: default;
 }
 
+/* «оборвать воркер» — the destructive half of the state row. Tinted with the
+   destructive colour so it never reads as one more status button, and dimmed
+   like `hlv-btn:disabled` when there is no live worker to kill. */
+.hlv-btn-kill {
+  flex: 0 0 auto;
+  color: var(--color-destructive, #d14a4a);
+  border-color: color-mix(in srgb, var(--color-destructive, #d14a4a) 45%, var(--color-border));
+}
+
+.hlv-btn-kill:hover {
+  border-color: var(--color-destructive, #d14a4a);
+}
+
 /* ------------------------------------------------------------------ */
 /* Narrow layout: the task list lies on ONE axis only — horizontally,
    above the detail pane. The shell already reserves the mobile top-bar

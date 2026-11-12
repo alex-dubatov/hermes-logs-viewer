@@ -93,6 +93,33 @@ Endpoints:
      thread uses, in one transaction, and it leaves an ``edited`` event behind
      so the built-in Kanban tab's activity feed shows the change.
 
+  POST /tasks/{task_id}/kill-worker?board=default
+        -> {"ok": true, "task_id", "board", "killed": [pid…],
+            "claim_released": bool, "status": "blocked", "message"}
+     Kill the card's worker PROCESS TREE and bring the board in line with it.
+
+     WHY THIS ROUTE EXISTS: the status buttons only release the claim. The card
+     leaves ``running``, the process keeps running — writing to the profile's
+     agent.log and calling the model for minutes (t_6ba39266, 12.11: blocked,
+     claim gone, ``managed_worker`` pid 15661 alive until a manual SIGTERM).
+     "Оборвать воркер" is the explicit stop for one card.
+
+     The pid is read from ``task_runs`` (``worker_pid`` + ``worker_started_at``),
+     NOT from ``tasks``: the core nulls ``tasks.worker_pid`` on a terminal
+     transition while leaving the process alive. The spawn fingerprint is
+     re-checked immediately before signalling (a recycled pid is refused, 409),
+     and the WHOLE TREE is signalled — SIGTERM to descendants and the worker,
+     a pause, then SIGKILL for the rest — because ``managed_worker`` spawns node
+     MCP servers and a shell supervisor that would otherwise outlive it.
+
+     ``state: remote`` (claim_lock of another host) and ``unverified`` spawns
+     are refused with 409: this route never guesses which process is ours.
+     Refusals leave the board untouched. On success it closes the open run
+     (``outcome='killed'``), releases the claim and writes a sticky ``blocked``
+     event — the NEWEST ``blocked``/``unblocked`` event, otherwise
+     ``recompute_ready`` (``_has_sticky_block``) promotes the card back to
+     ``ready`` and it respawns. Linux only (reads ``/proc``); 501 elsewhere.
+
   GET /transcript?board=default&task_id=t_x&after=<msg_id>&limit=<N>
         -> {"task_id", "board", "session_id", "store", "source", "messages",
             "next_after", "has_more"}
@@ -157,6 +184,7 @@ import asyncio
 import json
 import os
 import re
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -751,6 +779,352 @@ def _worker_rows(board: str) -> List[dict]:
     out.sort(key=lambda w: (order.get(w["phase"], 9), -(w.get("since_s") or 0),
                             w["task_id"]))
     return out
+
+
+# --- Оборвать воркер -------------------------------------------------------
+#
+# Кнопки смены состояния только ОТПУСКАЮТ CLAIM: карточка уезжает из running,
+# а процесс продолжает жить — писать в лог профиля и ходить в модель
+# (t_6ba39266, 12.11: blocked, claim снят, managed_worker pid 15661 работал ещё
+# шесть минут и умер только от ручного kill -TERM). Маршрут ниже — явное
+# «останови этот процесс» для одной карточки: он убивает ДЕРЕВО процессов и
+# приводит доску в согласованное состояние, чтобы карточка не продолжалась.
+
+# Сколько ждать после SIGTERM, прежде чем добивать SIGKILL, и сколько — после
+# SIGKILL, прежде чем признать pid непотопляемым. managed_worker — это python,
+# под ним node-серверы MCP и shell-супервизор; секунды на «собраться» им мало.
+_KILL_TERM_GRACE_S = 3.0
+_KILL_KILL_GRACE_S = 3.0
+_KILL_POLL_S = 0.1
+
+
+def _proc_ppid(pid) -> Optional[int]:
+    """Родитель из ``/proc/<pid>/stat``.
+
+    ``_proc_stat`` отдаёт поля ПОСЛЕ имени, то есть начиная с ``state``
+    (поле 3). Поэтому ppid — это индекс 1, а не 3: та же поправка, что у
+    ``_proc_start_time`` (field 22 -> индекс 19).
+    """
+    fields = _proc_stat(int(pid))
+    if not fields or len(fields) < 2:
+        return None
+    try:
+        return int(fields[1])
+    except (TypeError, ValueError):
+        return None
+
+
+def _process_tree(root_pid, *, max_nodes: int = 4096) -> List[int]:
+    """``root_pid`` и все потомки — сначала самые глубокие, родитель последним.
+
+    Дерево читается из ``/proc`` ОДИН раз, до любого сигнала: убитый воркер
+    отдаёт своих детей init'у, и после этого их уже не найти, а весь смысл
+    маршрута в том, что node-серверы MCP и shell-супервизор умирают вместе с
+    воркером. Только Linux; на прочих платформах пустой список — вызывающий
+    честно ответит «не поддерживается».
+    """
+    root_pid = int(root_pid)
+    if sys.platform != "linux":
+        return []
+    children: dict = {}
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return [root_pid]
+    for name in names:
+        if not name.isdigit():
+            continue
+        ppid = _proc_ppid(name)
+        if ppid is None:
+            continue
+        children.setdefault(ppid, []).append(int(name))
+    tree: List[int] = []
+    stack = [root_pid]
+    while stack and len(tree) < max_nodes:
+        pid = stack.pop()
+        tree.append(pid)
+        stack.extend(children.get(pid, []))
+    tree.reverse()                 # дети умирают раньше родителя
+    return tree
+
+
+def _signal_pids(pids, sig):
+    """``(delivered, refused)`` — сигнал каждому pid, без исключений.
+
+    ``ProcessLookupError`` в отчёт не попадает: процесса уже нет, а это
+    ровно то, чего маршрут добивается. В ``refused`` попадают только pid'ы,
+    до которых не достучались (чужой пользователь / запрет).
+    """
+    delivered, refused = [], []
+    kill = getattr(os, "kill", None)
+    for pid in pids:
+        if kill is None:
+            refused.append(int(pid))
+            continue
+        try:
+            kill(int(pid), sig)
+            delivered.append(int(pid))
+        except ProcessLookupError:
+            continue
+        except (PermissionError, OSError):
+            refused.append(int(pid))
+    return delivered, refused
+
+
+def _wait_pids_gone(pids, timeout_s) -> List[int]:
+    """Опрашивать, пока все pid не исчезнут; вернуть оставшихся в живых.
+
+    Зомби считается мёртвым (``_pid_alive`` это уже учитывает): он работу не
+    делает и в модель не ходит, ждать его переработки родителем бессмысленно.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        alive = [p for p in pids if _pid_alive(p)]
+        if not alive or time.monotonic() >= deadline:
+            return alive
+        time.sleep(_KILL_POLL_S)
+
+
+def _fingerprint_matches(pid, started_at) -> bool:
+    """Тот же fingerprint, что записан при спавне, всё ещё принадлежит ``pid``.
+
+    Правило совпадает с ``_worker_state``: строка без fingerprint — легаси
+    (доказательством было существование pid), ``unverified`` — не наш, а
+    сравнение идёт по boot-witness, когда он есть, и по start-time, когда нет.
+    """
+    if started_at is None or started_at == "":
+        return True
+    if started_at == _UNVERIFIED_FINGERPRINT:
+        return False
+    if isinstance(started_at, str) and "|" in started_at:
+        return _process_fingerprint(pid) == started_at
+    try:
+        return _proc_start_time(pid) == int(started_at)
+    except (TypeError, ValueError):
+        return True
+
+
+def _kill_worker_tree(pid, started_at) -> dict:
+    """SIGTERM дереву, пауза, SIGKILL оставшимся, пауза, отчёт.
+
+    fingerprint сверяется ещё раз НЕПОСРЕДСТВЕННО перед первым сигналом:
+    между выборкой pid из доски и сигналом процесс мог завершиться, а номер —
+    достаться другому, и этот маршрут не имеет права попасть в постороннего.
+    """
+    info: dict = {
+        "tree": [], "killed": [], "survivors": [], "refused": [],
+        "fingerprint_changed": False,
+    }
+    if not _fingerprint_matches(pid, started_at):
+        info["fingerprint_changed"] = True
+        return info
+    tree = _process_tree(pid)
+    info["tree"] = sorted(tree)
+    if not tree:
+        return info
+    _, refused = _signal_pids(tree, signal.SIGTERM)
+    _wait_pids_gone(tree, _KILL_TERM_GRACE_S)
+    left = [p for p in tree if _pid_alive(p)]
+    if left:
+        _, refused_kill = _signal_pids(left, signal.SIGKILL)
+        refused = sorted(set(refused) | set(refused_kill))
+        _wait_pids_gone(left, _KILL_KILL_GRACE_S)
+    info["refused"] = refused
+    info["killed"] = [p for p in tree if not _pid_alive(p)]
+    info["survivors"] = [p for p in tree if _pid_alive(p)]
+    return info
+
+
+def _kill_candidate(con: sqlite3.Connection, task_id: str):
+    """Самый свежий run карточки, в котором ещё назван pid процесса.
+
+    ``task_runs``, а не ``tasks``: при терминальном переходе ядро обнуляет
+    ``tasks.worker_pid`` и оставляет pid с fingerprint'ом в строке run'а —
+    ровно там и живёт воркер, который пережил свой переход (та же причина,
+    что у ``_worker_rows``). Открытый run важнее закрытого, внутри — свежий.
+    """
+    return con.execute(
+        """
+        SELECT id AS run_id, worker_pid, worker_started_at, claim_lock,
+               ended_at, status AS run_status, outcome
+          FROM task_runs
+         WHERE task_id = ? AND worker_pid IS NOT NULL
+         ORDER BY (ended_at IS NULL) DESC, id DESC
+         LIMIT 1
+        """,
+        (task_id,),
+    ).fetchone()
+
+
+def _append_event(con: sqlite3.Connection, task_id: str, kind: str,
+                  payload: Optional[dict], run_id: Optional[int] = None) -> None:
+    """Та же запись, что ``kanban_db._append_event``: внутри чужой транзакции."""
+    con.execute(
+        "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (task_id, run_id, kind,
+         json.dumps(payload, ensure_ascii=False) if payload else None,
+         int(time.time())),
+    )
+
+
+# Статусы, из которых карточку ещё может поднять диспетчер. Только для них
+# «оборвать» ставит sticky `blocked`: закрытую карточку (done/archived) и
+# review это вернуло бы в работу, а recompute_ready их и так не трогает.
+_DISPATCHABLE_STATUSES = ("running", "ready", "todo", "blocked", "scheduled",
+                          "triage")
+
+
+@router.post("/tasks/{task_id}/kill-worker")
+async def kill_worker(task_id: str, board: str = Query(default="default")):
+    """Оборвать воркер одной карточки: убить дерево процессов и снять claim.
+
+    Порядок важен: сначала процесс, потом доска. Снять claim рядом с живым
+    воркером — это ровно тот баг, из-за которого маршрут и появился.
+
+    Ответы: 200 ``{killed, claim_released, status, message, ...}``;
+    409 — живого воркера нет / он на другой машине / fingerprint не наш /
+    после SIGKILL кто-то выжил (тогда доска НЕ тронута);
+    403 — нет прав на сигнал; 501 — не Linux; 404 — нет доски/карточки.
+    """
+    def _run():
+        if not _TASK_ID_RE.match(task_id):
+            return JSONResponse({"error": f"bad task id: {task_id!r}"}, status_code=400)
+        slug, err = _resolve_board_slug(board)
+        if err:
+            return err
+        db_path = _board_db_path(slug)
+        if not db_path.exists():
+            return JSONResponse({"error": f"board '{slug}' not found"}, status_code=404)
+        if sys.platform != "linux":
+            return JSONResponse(
+                {"error": "оборвать воркер можно только на Linux: дерево процессов "
+                          "читается из /proc"},
+                status_code=501)
+        try:
+            con = _rw_connect(db_path)
+        except sqlite3.Error as e:
+            return JSONResponse({"error": f"cannot open {db_path}: {e}"}, status_code=500)
+        try:
+            task = con.execute(
+                "SELECT status, claim_lock FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if task is None:
+                return JSONResponse({"error": f"unknown task {task_id}"}, status_code=404)
+            run = _kill_candidate(con, task_id)
+            if run is None:
+                return JSONResponse(
+                    {"error": f"у задачи {task_id} нет живого воркера: в task_runs "
+                              f"нет записи с pid", "state": "none"},
+                    status_code=409)
+            pid = _to_int(run["worker_pid"])
+            if not pid:
+                return JSONResponse(
+                    {"error": f"у задачи {task_id} нет живого воркера: в task_runs "
+                              f"нет записи с pid", "state": "none"},
+                    status_code=409)
+            started_at = run["worker_started_at"]
+            lock = run["claim_lock"] or task["claim_lock"]
+            state = _worker_state(pid, started_at, lock)
+            if state == "remote":
+                return JSONResponse(
+                    {"error": f"воркер задачи {task_id} на другой машине "
+                              f"(claim_lock {lock}); отсюда его не оборвать",
+                     "state": "remote"}, status_code=409)
+            if state == "dead":
+                return JSONResponse(
+                    {"error": f"у задачи {task_id} нет живого воркера: pid {pid} уже "
+                              f"завершился или принадлежит другому процессу "
+                              f"(fingerprint не совпал)", "state": "dead"},
+                    status_code=409)
+            if state == "unknown":
+                return JSONResponse(
+                    {"error": f"pid {pid} заспавнен без fingerprint — доказать, что "
+                              f"это воркер задачи {task_id}, нельзя; процесс не "
+                              f"тронут", "state": "unknown"}, status_code=409)
+            if pid == os.getpid():
+                return JSONResponse(
+                    {"error": "это процесс самого dashboard — его не убиваем",
+                     "state": "alive"}, status_code=409)
+
+            info = _kill_worker_tree(pid, started_at)
+            if info["fingerprint_changed"]:
+                return JSONResponse(
+                    {"error": f"pid {pid} успел стать другим процессом (fingerprint "
+                              f"изменился) — сигнал не отправлен", "state": "dead"},
+                    status_code=409)
+            if info["refused"]:
+                return JSONResponse(
+                    {"error": "нет прав на сигнал pid " +
+                              ", ".join(str(p) for p in info["refused"]) +
+                              "; доска не тронута", "refused": info["refused"]},
+                    status_code=403)
+            if info["survivors"]:
+                return JSONResponse(
+                    {"error": "процессы живы после SIGKILL: " +
+                              ", ".join(str(p) for p in info["survivors"]) +
+                              "; claim не снят, доска не тронута",
+                     "survivors": info["survivors"]}, status_code=409)
+
+            released = bool(task["claim_lock"])
+            now = int(time.time())
+            reason = (f"оборван воркер задачи {task_id} (pid {pid}) через панель")
+            new_status = ("blocked" if task["status"] in _DISPATCHABLE_STATUSES
+                          else task["status"])
+            with con:                      # одна транзакция
+                con.execute(
+                    "UPDATE task_runs SET status = 'blocked', outcome = 'killed', "
+                    "error = ?, ended_at = ?, claim_expires = NULL "
+                    "WHERE task_id = ? AND ended_at IS NULL",
+                    (f"kill-worker: pid {pid}", now, task_id),
+                )
+                con.execute(
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL, "
+                    "worker_started_at = NULL, current_run_id = NULL WHERE id = ?",
+                    (new_status, task_id),
+                )
+                _append_event(
+                    con, task_id, "reclaimed",
+                    {"manual": True, "reason": "kill-worker",
+                     "prev_lock": lock, "worker_pid": pid,
+                     "killed": info["killed"], "tree": info["tree"]},
+                    run_id=run["run_id"],
+                )
+                # Sticky block: `recompute_ready` смотрит на САМОЕ СВЕЖЕЕ
+                # событие blocked/unblocked (`_has_sticky_block`), поэтому это
+                # событие обязано быть новее любого `unblocked` — иначе
+                # карточка вернётся в ready и перезапустится.
+                _append_event(
+                    con, task_id, "blocked",
+                    {"kind": "needs_input", "reason": reason,
+                     "source": "kill-worker", "worker_pid": pid},
+                )
+        except sqlite3.Error as e:
+            return JSONResponse({"error": f"write failed: {e}"}, status_code=500)
+        finally:
+            con.close()
+
+        killed = info["killed"]
+        extra = ""
+        if len(killed) > 1:
+            extra = f" и {len(killed) - 1} " + (
+                "потомок" if len(killed) == 2 else "потомка"
+                if len(killed) <= 4 else "потомков")
+        claim_text = "claim снят" if released else "claim уже был снят"
+        message = (f"воркер задачи {task_id} оборван: pid {pid}{extra}; "
+                   f"{claim_text}, карточка в {new_status}")
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "board": slug,
+            "killed": killed,
+            "claim_released": released,
+            "status": new_status,
+            "message": message,
+        }
+
+    return await asyncio.to_thread(_run)
 
 
 @router.get("/tasks/all")
