@@ -615,7 +615,7 @@ function Page() {
     var transcriptState = useState({
       messages: [], source: "", session_id: "", store: "",
       next_after: 0, loaded: false, error: "", has_more: false, gen: 0,
-      live: {}, events: [],
+      live: {}, events: [], total: 0, segments: [], profiles: [],
     });
     var transcript = transcriptState[0];
     var setTranscript = transcriptState[1];
@@ -1751,7 +1751,7 @@ function Page() {
         setTranscript({
           task_id: "", messages: [], source: "", session_id: "", store: "",
           next_after: 0, loaded: false, error: "", has_more: false, gen: 0,
-          live: {}, events: [],
+          live: {}, events: [], total: 0, segments: [], profiles: [],
         });
         return;
       }
@@ -1803,6 +1803,14 @@ function Page() {
             has_more: !!r.has_more,
             live: r.live || {},
             events: r.events || [],
+            // The card's WHOLE message count (all sessions of the card) and
+            // the stretches it is made of. The tab's counter reads `total`,
+            // not the rendered slice — the slice is capped at
+            // TRANSCRIPT_MAX_RENDERED, and a counter that stopped at 500 read
+            // as "the card only has 500 messages".
+            total: typeof r.total === "number" ? r.total : messages.length,
+            segments: r.segments || [],
+            profiles: r.profiles || [],
             gen: transcriptGenRef.current,
           });
           // Following the newest message? Keep pinned. (The effect above
@@ -4050,13 +4058,53 @@ function Page() {
       transcriptBody = el("div", { className: "hlv-empty" },
         "транскрипта пока нет — он появится, когда воркер начнёт работу");
     } else {
-      transcriptBody = el(
-        "div",
-        { className: "hlv-transcript-list" },
-        transcriptMessages.map(function (m) {
+      // A card that went through review changed hands: the route returns the
+      // messages of EVERY session that worked it, in claim order, each signed
+      // with its profile. The divider marks where the card passed to the next
+      // profile — the reader sees that the reviewer's stretch began here.
+      var segmentHeads = {};
+      (transcript.segments || []).forEach(function (s) {
+        if (s && typeof s.index === "number") segmentHeads[s.index] = s;
+      });
+      var multiSegment = (transcript.segments || []).length > 1;
+      var transcriptRows = [];
+      var lastSegDrawn = -1;
+      function segmentDivider(seg) {
+        var bits = ["сессия " + (seg.index + 1)];
+        if (seg.profile) bits.push(seg.profile);
+        if (seg.at) bits.push(new Date(seg.at * 1000).toLocaleString());
+        if (typeof seg.count === "number") bits.push("сообщений: " + seg.count);
+        if (seg.error) bits.push("недоступна: " + seg.error);
+        return el("div", { key: "seg-" + seg.index, className: "hlv-transcript-seg" },
+          el("span", { className: "hlv-transcript-seg-text" }, bits.join(" · ")));
+      }
+      transcriptMessages.forEach(function (m) {
           var role = m.role || "";
-          var head = "--- " + role + " #" + m.id;
+          // The row's OWN id in its store — the global id the pane keys and
+          // the cursor use is segment-scoped and would read as a huge number.
+          var head = "--- " + role + " #" +
+            (m.local_id != null ? m.local_id : m.id);
           if (m.tool_name) head += " (" + m.tool_name + ")";
+          // Which PROFILE wrote this message. Messages of several profiles
+          // share one list, so without the label the reader cannot tell whose
+          // step it is. The name comes from the store path the board recorded
+          // (`/profiles/<name>/state.db`), never from the card's assignee —
+          // after a handoff those differ.
+          var profileChip = m.profile
+            ? el("span", {
+                className: "hlv-transcript-profile",
+                title: "профиль, который работал над этим сообщением: " + m.profile +
+                  (m.session_id ? " · сессия " + m.session_id : ""),
+              }, m.profile)
+            : null;
+          if (multiSegment) {
+            var segIdx = typeof m.segment === "number" ? m.segment : 0;
+            var segMeta = segmentHeads[segIdx];
+            if (segMeta && lastSegDrawn !== segIdx) {
+              lastSegDrawn = segIdx;
+              transcriptRows.push(segmentDivider(segMeta));
+            }
+          }
           // The READABLE body: the route unwrapped the tool result's JSON
           // envelope, so the reader sees the tool's own output with real
           // line breaks instead of a brace-wrapped blob whose newlines are
@@ -4111,6 +4159,7 @@ function Page() {
             : el("details", { className: "hlv-transcript-fold" },
                 el("summary", { className: "hlv-transcript-fold-summary" },
                   el("span", { className: "hlv-transcript-role" }, head),
+                  profileChip,
                   m.timestamp
                     ? el("span", { className: "hlv-transcript-time" },
                         new Date(m.timestamp * 1000).toLocaleTimeString())
@@ -4129,12 +4178,21 @@ function Page() {
                     : null,
                   el("span", { className: "hlv-transcript-fold-hint" }, "развернуть")),
                 bodyNode);
-          return el(
+          transcriptRows.push(el(
             "div",
-            { key: String(m.id), className: "hlv-transcript-msg hlv-role-" + role },
+            {
+              key: String(m.id), className: "hlv-transcript-msg hlv-role-" + role,
+              // Which stretch of the card's history this row belongs to, and
+              // whose work it is. Machine-readable on purpose: the browser
+              // stand checks the pane against the route message by message.
+              "data-segment": String(typeof m.segment === "number" ? m.segment : 0),
+              "data-local-id": String(m.local_id != null ? m.local_id : m.id),
+              "data-profile": m.profile || "",
+            },
             isAgentStep
               ? el("div", { className: "hlv-transcript-head" },
                   el("span", { className: "hlv-transcript-role" }, head),
+                  profileChip,
                   m.timestamp
                     ? el("span", { className: "hlv-transcript-time" },
                         new Date(m.timestamp * 1000).toLocaleTimeString())
@@ -4147,22 +4205,67 @@ function Page() {
                     : null)
               : null,
             inner
-          );
-        }).concat(liveBlock ? [liveBlock] : [])
-      );
+          ));
+      });
+      if (liveBlock) transcriptRows.push(liveBlock);
+      transcriptBody = el("div", { className: "hlv-transcript-list" }, transcriptRows);
     }
 
-    // The session the transcript belongs to — which profile's store it was
-    // read from. Shown in the pane's header so a reader knows whose session
-    // they are looking at.
-    var transcriptMeta = transcript.loaded && transcriptIsForSelected &&
-      transcriptSource === "owner_session"
-      ? el("div", { className: "hlv-transcript-meta" },
-          el("span", null, "сессия: " + (transcript.session_id || "?")),
-          transcript.store
-            ? el("span", { className: "hlv-transcript-store" }, transcript.store)
-            : null)
-      : null;
+    // Whose work this transcript is. A card claimed once belongs to one
+    // profile and one session; a card that went through review was worked by
+    // several (executor → reviewer → …), and the header has to say that
+    // instead of naming only the last session as if it were the whole story.
+    var transcriptMeta = null;
+    if (transcript.loaded && transcriptIsForSelected && transcriptSource === "owner_session") {
+      var segmentList = transcript.segments || [];
+      var profileList = transcript.profiles || [];
+      var metaBits = [];
+      if (segmentList.length > 1) {
+        metaBits.push("сессий: " + segmentList.length);
+        if (profileList.length) metaBits.push("профили: " + profileList.join(", "));
+      } else {
+        var onlySegment = segmentList[0] || {};
+        if (onlySegment.profile) metaBits.push("профиль: " + onlySegment.profile);
+        metaBits.push("сессия: " + (transcript.session_id || "?"));
+      }
+      transcriptMeta = el("div", { className: "hlv-transcript-meta" },
+        el("span", null, metaBits.join(" · ")),
+        transcript.store && segmentList.length <= 1
+          ? el("span", { className: "hlv-transcript-store" }, transcript.store)
+          : null,
+        segmentList.length > 1
+          ? el("span", {
+              className: "hlv-transcript-seg-list",
+              title: segmentList.map(function (s) {
+                return "сессия " + (s.index + 1) + ": " + (s.profile || "?") +
+                  " · " + (s.session_id || "?") + (s.error ? " · " + s.error : "");
+              }).join("\n"),
+            }, " · " + segmentList.map(function (s) {
+              return (s.profile || "?") + " (" + (s.count == null ? "?" : s.count) + ")";
+            }).join(" → "))
+          : null);
+    }
+
+    // The pane renders at most TRANSCRIPT_MAX_RENDERED messages (the cursor
+    // still walks over EVERY id, so nothing is skipped). When the card has
+    // more, the pane SAYS so — a silently cut list is what made the tab's
+    // counter read as "the card has only 500 messages".
+    //
+    // While the pane is still walking forward through a long history it does
+    // not hold the LAST messages yet, so it does not pretend to: it says how
+    // many it has read. Only once the walk is done is the window the tail.
+    var transcriptCapNote = null;
+    if (transcript.loaded && transcriptIsForSelected &&
+        transcriptSource === "owner_session" && transcriptMessages.length &&
+        typeof transcript.total === "number" &&
+        transcript.total > transcriptMessages.length) {
+      transcriptCapNote = el("div", { className: "hlv-transcript-cap" },
+        transcript.has_more
+          ? "прочитано " + transcriptMessages.length + " из " +
+            transcript.total + " сообщений — история дочитывается"
+          : "показаны последние " + transcriptMessages.length + " из " +
+            transcript.total + " сообщений");
+    }
 
     // --- The live strip ---------------------------------------------------
     //
@@ -4262,6 +4365,7 @@ function Page() {
       },
       transcriptLiveStrip,
       transcriptMeta,
+      transcriptCapNote,
       liveAbsentNotice,
       transcriptBody,
       selected && transcript.loaded && transcriptMessages.length &&
@@ -4792,8 +4896,16 @@ function Page() {
     // the other.
     // The count on the tab is the number of messages of the SELECTED card —
     // another card's count would be a lie about what is on screen.
+    //
+    // It is the CARD's total (the route's `total`, summed over every session
+    // that worked the card), NOT the length of the rendered slice: the pane
+    // renders at most TRANSCRIPT_MAX_RENDERED messages, and using that length
+    // made the counter freeze at 500 on a long card — which reads as "the
+    // transcript only has 500 messages".
     var transcriptCount = (transcript.task_id === selected)
-      ? (transcript.messages || []).length
+      ? (typeof transcript.total === "number" && transcript.total >= 0
+          ? transcript.total
+          : (transcript.messages || []).length)
       : 0;
     var rightPane = el(
       "div",

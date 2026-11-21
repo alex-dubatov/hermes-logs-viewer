@@ -122,7 +122,7 @@ Endpoints:
 
   GET /transcript?board=default&task_id=t_x&after=<msg_id>&limit=<N>
         -> {"task_id", "board", "session_id", "store", "source", "messages",
-            "next_after", "has_more"}
+            "next_after", "has_more", "total", "segments", "profiles"}
      The LIVE transcript of the selected card — the actual conversation between
      the agent and its tools.
 
@@ -135,16 +135,27 @@ Endpoints:
      session store, and the card's board points at it through the
      ``owner_admitted`` event (payload: ``session_id`` + ``db``).
 
+     A card that went through review has SEVERAL such events (executor →
+     reviewer → executor …), each with its own session, usually in ANOTHER
+     profile's store. ALL of them are read, in claim order: ``messages`` is the
+     card's whole conversation, each message signed with the ``profile`` that
+     wrote it, the ``segment`` it belongs to and its ``local_id`` there
+     (``id`` is a segment-scoped global id, so cursors compare and React keys
+     do not collide). ``segments`` describes the stretches (profile, session,
+     message count, error if its store is gone), ``profiles`` lists the names,
+     and ``total`` is the card's whole message count — what the tab's counter
+     shows, because the pane renders at most a bounded window.
+
      ``source`` says where the answer came from:
-       "owner_session" — the store of the owning profile was read;
+       "owner_session" — the profile stores were read;
        "worker_log"    — no ``owner_admitted`` event: the card was executed by
                          the OLD worker process, whose stdout IS the transcript
                          (the bundled ``/tasks/{id}/log`` route serves it);
-       "none"          — nothing to show (no board, no event, no session).
+       "none"          — nothing to show (no board, no readable store).
 
-     ``after`` is a cursor over the store's monotonic message ``id``: pass the
-     last id you have and only newer messages come back. ``next_after`` is the
-     cursor to use next, ``has_more`` says whether the limit was hit.
+     ``after`` is a cursor over the message ids above: pass the last id you
+     have and only newer messages come back. ``next_after`` is the cursor to
+     use next, ``has_more`` says whether the limit was hit.
 
      ``live`` is what the agent is doing RIGHT NOW: the owner session's
      activity stamp ("receiving stream response"), its call counters and
@@ -1964,6 +1975,22 @@ _TRANSCRIPT_PREVIEW_LIMIT = 240
 # renders anyway.
 _TRANSCRIPT_REASONING_LIMIT = None
 
+# One card can be claimed MORE THAN ONCE: review sends it back, the assignee
+# is changed, a run dies and the card is picked up again. Every claim is its
+# own ``owner_admitted`` event with its OWN session and its OWN store — and
+# often in ANOTHER profile's store (executor → reviewer → executor again).
+# The transcript of the card is that whole chain, not only the last claim, so
+# the pane reads every segment and labels each message with the profile that
+# wrote it.
+#
+# The cursor stays one integer: a message id in the answer is
+# ``segment_index * _TRANSCRIPT_SEGMENT_STRIDE + <store's message id>``.
+# 10^9 is far above any store's id (the largest real store here is ~10^5) and
+# the product stays well inside a JS number, so the browser never sees a
+# float. Segment 0 keeps the plain store ids — the cursor of a single-session
+# card is exactly what it used to be.
+_TRANSCRIPT_SEGMENT_STRIDE = 1_000_000_000
+
 
 def _owner_admitted(board: str, task_id: str):
     """``(session_id, store_path, error)`` for the card's owner session.
@@ -2008,6 +2035,78 @@ def _owner_admitted(board: str, task_id: str):
     if not session_id:
         return None, None, "owner_admitted payload has no session_id"
     return session_id, (store or None), None
+
+
+def _profile_of_store(store: Optional[str]) -> str:
+    """The profile a session store belongs to — the label on every message.
+
+    ``<hermes home>/profiles/<name>/state.db`` → ``<name>``; the root home's
+    own store is the ``default`` profile (its directory is ``.hermes``, which
+    would read as a path fragment instead of a name). The store path is taken
+    from the event as-is: guessing a profile by the card's assignee would be
+    a guess, and a review cycle makes the assignee and the writer differ.
+    """
+    if not store:
+        return ""
+    name = Path(str(store)).expanduser().parent.name
+    return name if name and not name.startswith(".") else "default"
+
+
+def _owner_segments(board: str, task_id: str):
+    """``(segments, error)`` — EVERY owner session that worked the card.
+
+    Oldest first: one entry per distinct ``(session_id, store)`` in the order
+    the gateway took the card in. A review cycle writes several
+    ``owner_admitted`` events, usually into DIFFERENT profile stores; the
+    transcript has to show all of them, or the reviewer's work would make the
+    executor's messages vanish from the pane.
+
+    Entry: ``{"index", "session_id", "store", "profile", "at"}``.
+    """
+    db_path = _board_db_path(board)
+    if not db_path.exists():
+        return [], f"board '{board}' not found (no {db_path})"
+    try:
+        con = _ro_connect(db_path)
+    except sqlite3.Error as e:
+        return [], f"cannot open {db_path}: {e}"
+    try:
+        rows = con.execute(
+            "SELECT payload, created_at FROM task_events "
+            "WHERE task_id = ? AND kind = 'owner_admitted' ORDER BY id ASC",
+            (task_id,),
+        ).fetchall()
+    except sqlite3.Error as e:
+        return [], f"query failed: {e}"
+    finally:
+        con.close()
+    segments = []
+    seen = set()
+    for row in rows:
+        if not row["payload"]:
+            continue
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        session_id = str(payload.get("session_id") or "").strip()
+        if not session_id:
+            continue
+        store = str(payload.get("db") or "").strip() or None
+        key = (session_id, store)
+        if key in seen:
+            continue
+        seen.add(key)
+        segments.append({
+            "index": len(segments),
+            "session_id": session_id,
+            "store": store,
+            "profile": _profile_of_store(store),
+            "at": row["created_at"],
+        })
+    return segments, None
 
 
 def _clip(text: Optional[str], limit: Optional[int]) -> tuple[str, bool]:
@@ -2429,77 +2528,168 @@ def _summarize_event(logger: str, text: str):
     return None, ""
 
 
-def _transcript_messages(store: str, session_id: str, after: int, limit: int):
-    """``(messages, next_after, has_more, error)`` from the profile store.
+def _message_select(cols: set) -> Optional[list]:
+    """The SELECT list for a store's ``messages`` table, or None without it.
+
+    The table grew over releases (``tool_calls``, ``reasoning``, …), so the
+    SELECT is built from what is there instead of assuming a fixed schema —
+    a store from an older Hermes would otherwise fail the whole query.
+    """
+    if not cols:
+        return None
+    wanted = ["id", "role", "content", "tool_name", "tool_call_id", "timestamp"]
+    optional = ["tool_calls", "reasoning", "reasoning_content"]
+    select = []
+    for name in wanted + optional:
+        if name in cols:
+            select.append(name)
+        elif name in wanted:
+            # A column the route cannot do without is read as NULL rather
+            # than failing the query.
+            select.append(f"NULL AS {name}")
+    return select
+
+
+def _segment_read(store: str, session_id: str, after_local: int, take: int):
+    """``(rows, count, error)`` for ONE owner session's store.
+
+    ``count`` is the session's WHOLE message count — the tab's counter has to
+    say how many messages the card has, not how many the pane renders (the
+    operator saw the counter stop at the pane's render cap of 500 and read it
+    as lost messages). ``take`` > 0 also fetches up to that many rows with
+    ``id > after_local``; ``take`` 0 fetches none (the cursor is already past
+    this segment) but still counts.
 
     Read-only: the store is a live WAL database of the owner gateway, so it
     is opened with ``mode=ro`` and never written to.
     """
-    store_path = Path(store).expanduser()
+    store_path = Path(str(store)).expanduser()
     if not store_path.is_absolute():
-        return [], after, False, f"store path is not absolute: {store}"
+        return [], 0, f"store path is not absolute: {store}"
     if not store_path.exists():
-        return [], after, False, f"no session store at {store_path}"
+        return [], 0, f"no session store at {store_path}"
     try:
         con = _ro_connect(store_path)
     except sqlite3.Error as e:
-        return [], after, False, f"cannot open {store_path}: {e}"
+        return [], 0, f"cannot open {store_path}: {e}"
     try:
-        cols = _message_columns(con)
-        if not cols:
-            return [], after, False, "store has no messages table"
-        wanted = ["id", "role", "content", "tool_name", "tool_call_id", "timestamp"]
-        optional = ["tool_calls", "reasoning", "reasoning_content"]
-        select = []
-        for name in wanted + optional:
-            if name in cols:
-                select.append(name)
-            elif name in wanted:
-                # A column the route cannot do without is read as NULL rather
-                # than failing the query.
-                select.append(f"NULL AS {name}")
-        rows = con.execute(
-            "SELECT " + ", ".join(select) + " FROM messages "
-            "WHERE session_id = ? AND id > ? ORDER BY id ASC LIMIT ?",
-            (session_id, after, limit + 1),
-        ).fetchall()
+        select = _message_select(_message_columns(con))
+        if select is None:
+            return [], 0, "store has no messages table"
+        count = con.execute(
+            "SELECT COUNT(*) AS n FROM messages WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()["n"]
+        rows = []
+        if take > 0:
+            rows = con.execute(
+                "SELECT " + ", ".join(select) + " FROM messages "
+                "WHERE session_id = ? AND id > ? ORDER BY id ASC LIMIT ?",
+                (session_id, after_local, take),
+            ).fetchall()
     except sqlite3.Error as e:
-        return [], after, False, f"query failed: {e}"
+        return [], 0, f"query failed: {e}"
     finally:
         con.close()
+    return rows, int(count or 0), None
 
-    has_more = len(rows) > limit
-    rows = rows[:limit]
-    messages = []
-    for r in rows:
-        raw = r["content"] or ""
-        text, truncated = _clip(raw, _TRANSCRIPT_CONTENT_LIMIT)
-        readable, readable_cut = _clip(_readable_text(raw), _TRANSCRIPT_CONTENT_LIMIT)
-        preview, _ = _clip(_message_preview(r), _TRANSCRIPT_PREVIEW_LIMIT)
-        # The agent's REASONING is what the old worker log showed as it
-        # streamed; in the new scheme it is a column of the assistant's row.
-        reasoning = r["reasoning"] if "reasoning" in r.keys() else None
-        if not reasoning and "reasoning_content" in r.keys():
-            reasoning = r["reasoning_content"]
-        reasoning, reasoning_cut = _clip(reasoning or "", _TRANSCRIPT_REASONING_LIMIT)
-        messages.append({
-            "id": r["id"],
-            "role": r["role"] or "",
-            "content": text,
-            "text": readable,
-            "tool_name": r["tool_name"],
-            "tool_call_id": r["tool_call_id"],
-            "timestamp": r["timestamp"],
-            "preview": preview,
-            "truncated": truncated or readable_cut,
-            "reasoning": reasoning,
-            "reasoning_truncated": reasoning_cut,
-            "tool_calls": _tool_call_summary(
-                r["tool_calls"] if "tool_calls" in r.keys() else None
-            ),
-        })
-    next_after = messages[-1]["id"] if messages else after
-    return messages, next_after, has_more, None
+
+def _message_payload(row, segment: dict) -> dict:
+    """One message as the pane reads it, signed with the profile that wrote it."""
+    raw = row["content"] or ""
+    text, truncated = _clip(raw, _TRANSCRIPT_CONTENT_LIMIT)
+    readable, readable_cut = _clip(_readable_text(raw), _TRANSCRIPT_CONTENT_LIMIT)
+    preview, _ = _clip(_message_preview(row), _TRANSCRIPT_PREVIEW_LIMIT)
+    # The agent's REASONING is what the old worker log showed as it
+    # streamed; in the new scheme it is a column of the assistant's row.
+    reasoning = row["reasoning"] if "reasoning" in row.keys() else None
+    if not reasoning and "reasoning_content" in row.keys():
+        reasoning = row["reasoning_content"]
+    reasoning, reasoning_cut = _clip(reasoning or "", _TRANSCRIPT_REASONING_LIMIT)
+    local_id = int(row["id"])
+    return {
+        # The GLOBAL id: segment-scoped so two sessions' rows cannot collide
+        # (React keys and the cursor both use it).
+        "id": segment["index"] * _TRANSCRIPT_SEGMENT_STRIDE + local_id,
+        # The row's own id in its store, and the segment it came from — what
+        # a person actually wants to see next to the role.
+        "local_id": local_id,
+        "segment": segment["index"],
+        "profile": segment.get("profile") or "",
+        "session_id": segment.get("session_id") or "",
+        "role": row["role"] or "",
+        "content": text,
+        "text": readable,
+        "tool_name": row["tool_name"],
+        "tool_call_id": row["tool_call_id"],
+        "timestamp": row["timestamp"],
+        "preview": preview,
+        "truncated": truncated or readable_cut,
+        "reasoning": reasoning,
+        "reasoning_truncated": reasoning_cut,
+        "tool_calls": _tool_call_summary(
+            row["tool_calls"] if "tool_calls" in row.keys() else None
+        ),
+    }
+
+
+def _transcript_merged(segments: list, cursor: int, limit: int):
+    """``(messages, next_after, has_more, total, meta)`` over ALL segments.
+
+    Segments are concatenated in claim order; the cursor is a global id (see
+    ``_TRANSCRIPT_SEGMENT_STRIDE``), so a poll that has walked through segment
+    0 continues in segment 1 exactly where the reader is, and the pane only
+    ever appends.
+
+    ``total`` is the number of messages the card has across every segment —
+    the honest number for the tab's counter. ``meta`` carries the per-segment
+    profile/session/count so the pane can draw the boundaries and say whose
+    window each stretch of the transcript is.
+    """
+    cursor = max(0, int(cursor or 0))
+    start_index = cursor // _TRANSCRIPT_SEGMENT_STRIDE
+    start_local = cursor % _TRANSCRIPT_SEGMENT_STRIDE
+    messages: List[dict] = []
+    total = 0
+    has_more = False
+    meta: List[dict] = []
+
+    for seg in segments:
+        idx = seg["index"]
+        # Rows still needed for this answer (+1 to learn whether MORE exist).
+        remaining = limit - len(messages)
+        take = 0
+        if idx >= start_index and remaining > 0:
+            take = remaining + 1
+        after_local = start_local if idx == start_index else 0
+        rows, count, err = _segment_read(seg["store"], seg["session_id"], after_local, take)
+        total += count
+        entry = dict(seg)
+        entry["count"] = count
+        if err:
+            entry["error"] = err
+        meta.append(entry)
+        if not rows:
+            continue
+        fresh = [_message_payload(r, seg) for r in rows]
+        # One row beyond what fits means this segment has more where that came
+        # from; anything less means the segment is exhausted.
+        if len(fresh) > remaining:
+            messages.extend(fresh[:remaining])
+            has_more = True
+        else:
+            messages.extend(fresh)
+
+    # The limit may have filled up exactly at a segment boundary: the next
+    # segment's own count then says whether anything is left to read.
+    if not has_more and len(messages) >= limit:
+        for entry in meta:
+            if entry["index"] > (messages[-1]["segment"] if messages else -1) and entry["count"]:
+                has_more = True
+                break
+
+    next_after = messages[-1]["id"] if messages else cursor
+    return messages, next_after, has_more, total, meta
 
 
 @router.get("/transcript")
@@ -2509,14 +2699,21 @@ async def get_transcript(
     after: int = Query(default=0),
     limit: int = Query(default=_TRANSCRIPT_DEFAULT_LIMIT),
 ):
-    """The live transcript of a card, read from the owner profile's store.
+    """The live transcript of a card — every session that worked it.
 
     ``source`` tells the UI where the answer came from:
-      "owner_session" — the owner profile's store was read;
+      "owner_session" — the profile stores were read;
       "worker_log"    — the card was executed by the OLD worker process, whose
                         stdout IS the transcript (the bundled
                         ``/tasks/{id}/log`` route serves it);
       "none"          — nothing to show.
+
+    A card that went through review has SEVERAL owner sessions, usually in
+    different profiles' stores. All of them are read, in claim order, and
+    every message carries the profile that wrote it (``profile``),
+    the segment it belongs to (``segment``) and the row's own id there
+    (``local_id``). ``segments`` describes those stretches, and ``total`` is
+    the card's whole message count — what the tab's counter shows.
 
     Nothing here raises: a missing board, an unreadable store or a card with
     no owner session all answer 200 with an empty list, because the pane must
@@ -2532,51 +2729,57 @@ async def get_transcript(
         cursor = max(0, _to_int(after))
         count = max(1, min(_TRANSCRIPT_MAX_LIMIT, _to_int(limit) or _TRANSCRIPT_DEFAULT_LIMIT))
 
-        session_id, store, err = _owner_admitted(slug, task_id)
+        segments, err = _owner_segments(slug, task_id)
         if err:
             # The board itself is unreadable — there is nothing to read and no
             # owner session to point at.
             return {
                 "task_id": task_id, "board": slug, "session_id": None,
                 "store": None, "source": "none", "messages": [],
-                "next_after": cursor, "has_more": False, "error": err,
+                "next_after": cursor, "has_more": False, "total": 0,
+                "segments": [], "error": err,
             }
-        if not session_id:
+        if not segments:
             # No owner_admitted event: the OLD scheme — the worker process ran
             # the card and its stdout was written to the card's log file. The
             # transcript is there, not here.
             return {
                 "task_id": task_id, "board": slug, "session_id": None,
                 "store": None, "source": "worker_log", "messages": [],
-                "next_after": cursor, "has_more": False,
+                "next_after": cursor, "has_more": False, "total": 0,
+                "segments": [],
             }
-        if not store:
-            return {
-                "task_id": task_id, "board": slug, "session_id": session_id,
-                "store": None, "source": "none", "messages": [],
-                "next_after": cursor, "has_more": False,
-                "error": "owner_admitted payload has no store path",
-            }
-        messages, next_after, has_more, err = _transcript_messages(
-            store, session_id, cursor, count
+        messages, next_after, has_more, total, meta = _transcript_merged(
+            segments, cursor, count
         )
-        if err:
+        readable = [m for m in meta if not m.get("error")]
+        latest = meta[-1]
+        if not readable:
+            # Every store of the card is gone/unreadable — say so once, with
+            # the first reason, instead of pretending the card was silent.
             return {
-                "task_id": task_id, "board": slug, "session_id": session_id,
-                "store": store, "source": "none", "messages": [],
-                "next_after": cursor, "has_more": False, "error": err,
+                "task_id": task_id, "board": slug,
+                "session_id": latest["session_id"], "store": latest["store"],
+                "source": "none", "messages": [], "next_after": cursor,
+                "has_more": False, "total": 0, "segments": meta,
+                "error": meta[0].get("error") or "no readable session store",
             }
         # The LIVE layer on top of the history: what the agent is doing
         # RIGHT NOW (the session's activity stamp and call counters) and the
         # run's own trail of model calls and tools (the owner profile's log).
-        # Neither is required — a store without a ``sessions`` table or a
-        # profile without a log simply answers with an empty live block.
-        live, live_err = _session_live(store, session_id)
-        events, log_err = _log_events(_owner_log_path(store), session_id)
+        # Both belong to the LATEST claim — the one running now. Neither is
+        # required — a store without a ``sessions`` table or a profile without
+        # a log simply answers with an empty live block.
+        live, live_err = _session_live(latest["store"], latest["session_id"])
+        events, log_err = _log_events(_owner_log_path(latest["store"]), latest["session_id"])
         payload = {
-            "task_id": task_id, "board": slug, "session_id": session_id,
-            "store": store, "source": "owner_session", "messages": messages,
+            "task_id": task_id, "board": slug,
+            "session_id": latest["session_id"], "store": latest["store"],
+            "source": "owner_session", "messages": messages,
             "next_after": next_after, "has_more": has_more,
+            "total": total,
+            "segments": meta,
+            "profiles": sorted({s["profile"] for s in readable if s.get("profile")}),
             "content_limit": _TRANSCRIPT_CONTENT_LIMIT,
             "live": live or {},
             "events": events,

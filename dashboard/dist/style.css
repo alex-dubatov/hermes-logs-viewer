@@ -823,6 +823,56 @@
   word-break: break-all;
 }
 
+/* Which PROFILE wrote a message, and where one profile handed the card to the
+   next. A card that went through review carries messages of several profiles
+   in one list: the chip repeats the name on every row (a row read in the
+   middle of the list is still signed), the divider marks the handoff, and the
+   header summarises the chain. */
+.hlv-transcript-profile {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 0.66rem;
+  color: var(--color-muted-foreground);
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  padding: 0 6px;
+  white-space: nowrap;
+}
+
+.hlv-transcript-seg {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.66rem;
+  color: var(--color-muted-foreground);
+  font-variant-numeric: tabular-nums;
+}
+
+.hlv-transcript-seg::before,
+.hlv-transcript-seg::after {
+  content: "";
+  flex: 1 1 auto;
+  border-top: 1px dashed var(--color-border);
+}
+
+.hlv-transcript-seg-text {
+  flex: 0 0 auto;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+}
+
+/* "показаны последние N из M" — the pane renders a bounded window, and it
+   says so instead of letting the tab's counter look like the whole truth. */
+.hlv-transcript-cap {
+  border-top: 1px dashed var(--color-border);
+  padding-top: 4px;
+  font-size: 0.68rem;
+  color: var(--color-muted-foreground);
+  font-variant-numeric: tabular-nums;
+}
+
+.hlv-transcript-seg-list {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+}
+
 .hlv-transcript-list {
   display: flex;
   flex-direction: column;

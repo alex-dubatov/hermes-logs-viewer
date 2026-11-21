@@ -780,6 +780,143 @@ def main() -> int:
     r_bad_live = client.get("/tasks/не id/live", params={"board": "hypercube"})
     check("поток: плохой task id -> 400", r_bad_live.status_code == 400, r_bad_live.status_code)
 
+    # --- 14. a card that went through review: SEVERAL sessions/profiles ----
+    # The operator saw the pane show one session's messages and asked whether
+    # every profile's messages are there. They are not in the OLD scheme (only
+    # the newest claim was read) — so this pins the whole chain: executor's
+    # three messages, then the reviewer's two, each signed with its profile.
+    exec_store = tmp / "profiles" / "executor" / "state.db"
+    exec_store.parent.mkdir(parents=True, exist_ok=True)
+    rev_store = tmp / "profiles" / "reviewer" / "state.db"
+    rev_store.parent.mkdir(parents=True, exist_ok=True)
+    make_store(exec_store, "local-exec", [
+        ("user", "сделай", None, None, None),
+        ("assistant", "делаю", None, None, None),
+        ("tool", json.dumps({"output": "ок"}), "terminal", None, None),
+    ])
+    make_store(rev_store, "local-rev", [
+        ("user", "проверь", None, None, None),
+        ("assistant", "проверил", None, None, None),
+    ])
+    add_board_event(board_db, "t_review01", "owner_admitted", json.dumps({
+        "db": str(exec_store), "session_id": "local-exec", "pid": 50,
+    }))
+    add_board_event(board_db, "t_review01", "owner_admitted", json.dumps({
+        "db": str(rev_store), "session_id": "local-rev", "pid": 51,
+    }))
+    b_rev = get({"board": "hypercube", "task_id": "t_review01"}).json()
+    rev_msgs = b_rev.get("messages") or []
+    check("ревью: сообщения ВСЕХ сессий на месте", len(rev_msgs) == 5, len(rev_msgs))
+    check("ревью: порядок — сессии по очереди прихода", 
+          [m.get("session_id") for m in rev_msgs] ==
+          ["local-exec"] * 3 + ["local-rev"] * 2,
+          [m.get("session_id") for m in rev_msgs])
+    check("ревью: у каждого сообщения подписан профиль",
+          [m.get("profile") for m in rev_msgs] ==
+          ["executor"] * 3 + ["reviewer"] * 2,
+          [m.get("profile") for m in rev_msgs])
+    check("ревью: профили перечислены в ответе",
+          b_rev.get("profiles") == ["executor", "reviewer"], b_rev.get("profiles"))
+    check("ревью: id монотонны через границу сессий",
+          [m["id"] for m in rev_msgs] == sorted(m["id"] for m in rev_msgs),
+          [m["id"] for m in rev_msgs])
+    check("ревью: id сессии 2 не совпадает с id сессии 1",
+          len({m["id"] for m in rev_msgs}) == 5, [m["id"] for m in rev_msgs])
+    check("ревью: local_id — id строки в своём сторе",
+          [m.get("local_id") for m in rev_msgs] == [1, 2, 3, 1, 2],
+          [m.get("local_id") for m in rev_msgs])
+    check("ревью: segment называет отрезок",
+          [m.get("segment") for m in rev_msgs] == [0, 0, 0, 1, 1],
+          [m.get("segment") for m in rev_msgs])
+    check("ревью: total = все сообщения карточки", b_rev.get("total") == 5,
+          b_rev.get("total"))
+    check("ревью: сегменты описаны (профиль/сессия/счётчик)",
+          [(s.get("profile"), s.get("session_id"), s.get("count"))
+           for s in (b_rev.get("segments") or [])] ==
+          [("executor", "local-exec", 3), ("reviewer", "local-rev", 2)],
+          b_rev.get("segments"))
+
+    # The cursor walks ACROSS the boundary: after the last executor id the
+    # reviewer's messages come back, not the executor's again.
+    last_exec = rev_msgs[2]["id"]
+    b_cross = get({"board": "hypercube", "task_id": "t_review01",
+                   "after": last_exec}).json()
+    cross = b_cross.get("messages") or []
+    check("ревью: курсор переходит в следующую сессию",
+          [m.get("profile") for m in cross] == ["reviewer", "reviewer"],
+          [m.get("profile") for m in cross])
+    check("ревью: total не зависит от курсора", b_cross.get("total") == 5,
+          b_cross.get("total"))
+
+    # A limit that lands in the MIDDLE of the first session keeps the rest for
+    # the next poll, and a limit that straddles the boundary splits correctly.
+    b_lim = get({"board": "hypercube", "task_id": "t_review01", "limit": 4}).json()
+    lim = b_lim.get("messages") or []
+    check("ревью: limit режет общий список",
+          [m.get("profile") for m in lim] == ["executor"] * 3 + ["reviewer"],
+          [m.get("profile") for m in lim])
+    check("ревью: has_more на границе сессий", b_lim.get("has_more") is True,
+          b_lim.get("has_more"))
+    b_rest = get({"board": "hypercube", "task_id": "t_review01",
+                  "after": lim[-1]["id"]}).json()
+    check("ревью: остаток дочитывается следующим опросом",
+          [m.get("local_id") for m in (b_rest.get("messages") or [])] == [2],
+          [m.get("local_id") for m in (b_rest.get("messages") or [])])
+    check("ревью: дочитанный ответ полный", b_rest.get("has_more") is False,
+          b_rest.get("has_more"))
+
+    # --- 15. total is the CARD's count, not the pane's render cap ---------
+    # The operator: «счётчик сообщений максимум — 500». 500 is the pane's
+    # render cap; the counter has to say how many messages the card really
+    # has, or a long card reads as truncated at 500.
+    many_store = tmp / "profiles" / "executor-cloud" / "state.db"
+    many_store.parent.mkdir(parents=True, exist_ok=True)
+    make_store(many_store, "local-many",
+               [("assistant", "шаг %d" % i, None, None, None) for i in range(620)])
+    add_board_event(board_db, "t_many0001", "owner_admitted", json.dumps({
+        "db": str(many_store), "session_id": "local-many", "pid": 52,
+    }))
+    b_many = get({"board": "hypercube", "task_id": "t_many0001"}).json()
+    check("счётчик: total = 620, а не 500 и не 200", b_many.get("total") == 620,
+          b_many.get("total"))
+    check("счётчик: за один опрос приходит не больше limit",
+          len(b_many.get("messages") or []) == 200,
+          len(b_many.get("messages") or []))
+    check("счётчик: has_more честно говорит, что есть ещё",
+          b_many.get("has_more") is True, b_many.get("has_more"))
+    # Walking the cursor to the end must reach the 620th message.
+    walked, cursor = 0, 0
+    for _ in range(20):
+        b_walk = get({"board": "hypercube", "task_id": "t_many0001",
+                      "after": cursor, "limit": 500}).json()
+        got = b_walk.get("messages") or []
+        walked += len(got)
+        cursor = b_walk.get("next_after") or cursor
+        if not b_walk.get("has_more"):
+            break
+    check("счётчик: курсор доходит до последнего сообщения (620)", walked == 620, walked)
+
+    # --- 16. a card whose store is gone among readable ones --------------
+    # One dead segment must not blank the live one: the transcript shows what
+    # can be read, and the dead segment carries its own error.
+    add_board_event(board_db, "t_partial1", "owner_admitted", json.dumps({
+        "db": str(tmp / "no-such-store.db"), "session_id": "local-dead",
+    }))
+    add_board_event(board_db, "t_partial1", "owner_admitted", json.dumps({
+        "db": str(rev_store), "session_id": "local-rev",
+    }))
+    b_part = get({"board": "hypercube", "task_id": "t_partial1"}).json()
+    check("мёртвый сегмент: живой всё равно отдан",
+          len(b_part.get("messages") or []) == 2,
+          len(b_part.get("messages") or []))
+    check("мёртвый сегмент: source = owner_session",
+          b_part.get("source") == "owner_session", b_part.get("source"))
+    seg_errors = [s.get("error") for s in (b_part.get("segments") or [])]
+    check("мёртвый сегмент: ошибка названа в его записи",
+          bool(seg_errors and seg_errors[0]), seg_errors)
+    check("мёртвый сегмент: total считает только прочитанное",
+          b_part.get("total") == 2, b_part.get("total"))
+
     failed = [n for n, ok in RESULTS if not ok]
     print("\n=== %d/%d checks passed ===" % (len(RESULTS) - len(failed), len(RESULTS)))
     if failed:

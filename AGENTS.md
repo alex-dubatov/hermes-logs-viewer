@@ -51,6 +51,7 @@ with no build step; backend: one Python route file (`dashboard/plugin_api.py`).
 | `node tests/render_test.js /путь/dist/index.js` | то же против указанной (например, задеплоенной) копии |
 | `python3 tests/test_comments.py` | лента комментариев и их удаление: доставка воркеру (стартовый контекст / заметка в ходе работы), `pending` / `own` / `unknown`, 409 без `force`, снятие парного события |
 | `node tools/transcript_fold_check.js` | настоящий Chromium: все блоки рассуждений раскрыты, все не-assistant шаги свёрнуты, свёрнутое раскрывается по клику |
+| `PLAYWRIGHT_PATH=… CHROME_PATH=… node tools/transcript_profiles_check.js [доска]` | настоящий Chromium: счётчик вкладки = полное число сообщений карточки (не 500), подпись профиля на каждом блоке сверена с маршрутом, разделители сессий, шапка «сессий: N · профили: …» |
 | `HLV_LIVE_TASK_TITLE=… node tools/live_stream_check.js` | настоящий Chromium: живой блок рассуждений растёт в потоке и стоит последним, верхняя полоса сворачивается и помнит выбор (нужна работающая прямо сейчас карточка) |
 | `node tools/runtime_field_check.js` | настоящий Chromium: поле «время выполнения» в «основном» — 7 минут доезжают до доски как 420 секунд |
 | `PLAYWRIGHT_PATH=… CHROME_PATH=… node tests/carousel_test.js` | узкая вёрстка в настоящем Chromium |

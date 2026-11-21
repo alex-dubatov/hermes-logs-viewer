@@ -190,11 +190,33 @@ store**, and the card points at it with the `owner_admitted` event (its payload 
   mode is **per card**: scrolling up on one card does not push the next one down — it
   opens at its own tail and follows it. The pane re-pins to the tail every 0.5 s, so it
   also catches content growth that adds no messages;
+- **a card worked by SEVERAL profiles is one transcript** — a review cycle gives
+  the card a new owner session, and usually in a different profile's store
+  (`executor → reviewer → executor …`). The pane reads **every** `owner_admitted`
+  session of the card, in claim order, so the reviewer's work no longer makes the
+  executor's messages disappear from the pane;
+- **every message is signed with its profile** — a chip in the message header
+  (`--- assistant #63846 · executor-cloud`) names the profile that wrote it, and a
+  divider (`сессия 2 · reviewer · … · сообщений: 131`) marks the handoff. The name
+  comes from the store path the board recorded (`/profiles/<name>/state.db`), never
+  from the card's assignee — after a handoff those differ. On a single-session card
+  there are no dividers: there is nothing to divide;
+- **the counter on the tab is the card's whole transcript** — the number after
+  `транскрипт ·` is the card's message count across every session (`total` from the
+  route). It used to be the length of the rendered slice, so on a long card it froze
+  at `500` and read as “the transcript only has 500 messages”;
 - the DOM holds at most the **last 500 messages**: the cursor still walks **all** ids, so
-  nothing is skipped — old messages simply leave the view;
+  nothing is skipped — old messages simply leave the view. When the card has more, the
+  pane says so above the list (`показаны последние 500 из 2407 сообщений`), and while it
+  is still walking up to the tail it says that instead of pretending
+  (`прочитано 500 из 1148 сообщений — история дочитывается`) — no silent cutting either
+  way;
 - tool message bodies are truncated at **4000 characters**, and the truncation is marked
   in the message header — there is no silent cutting;
-- the pane header carries the session id and the store path that was read.
+- the pane header names **whose work it is**: `профиль: executor-cloud · сессия:
+  local-…` and the store path on a single-session card, `сессий: 6 · профили:
+  executor-homm3, reviewer` plus the chain `executor-homm3 (297) → reviewer (105) → …`
+  on a card that changed hands.
 
 The route `GET /api/plugins/hermes-logs-viewer/transcript?board=…&task_id=…&after=…&limit=…`
 **only** reads (`mode=ro`) and never writes to the DB. If the board, the events or the
@@ -1017,19 +1039,31 @@ event, and the board and the store are different databases. The route reads the 
 of the profile), and opens the **store in `mode=ro`**: the gateway's live WAL store can be
 read from another process, but it must not be written to.
 
-The `/transcript` answer carries three parts:
+The `/transcript` answer carries these parts:
 
 | field | what it is |
 | --- | --- |
-| `messages` | the dialogue history: store rows by `session_id`, starting at the `after` cursor |
+| `messages` | the dialogue history of **every** owner session of the card, in claim order, starting at the `after` cursor. Each message carries `role`, the readable `text`, `reasoning`, `tool_calls`, `profile`, `session_id`, `segment` and `local_id` (its row id in that store); `id` is the segment-scoped global id the cursor uses |
+| `segments` | the stretches the card is made of, in order: `{index, session_id, store, profile, at, count}`, plus `error` on a store that cannot be read |
+| `profiles` | the distinct profile names among the readable segments |
+| `total` | the card's **whole** message count across every session — what the tab's counter shows (the pane itself renders at most 500) |
+| `next_after` / `has_more` | the cursor for the next poll and whether the limit was hit |
 | `live` | what the agent is doing **right now**: `last_activity_description`, `last_activity_at`, `activity_age`, the `api_call_count`/`tool_call_count`/`input_tokens`/`output_tokens` counters, `model`, `ended_at`/`end_reason`, `running` |
 | `events` | the run trail: the owner profile's log lines (`<profile>/logs/agent.log`) for this session — `{"time", "level", "kind", "short", "text"}`, where `kind` ∈ `start`/`api`/`tool`/`error`/`warn`/`compress`/`turn`, and `short` is a short summary to display |
 
-`live` and `events` are **not mandatory**: a store without a `sessions` table (an old
-Hermes) or a profile without a journal yields empty parts instead of an error. The journal is
-read **by tail** (128 KB, the last 40 lines for the session): the file grows to megabytes and
-rotates, while the live pane only needs the newest lines. A rotated `agent.log.1` is read
-only if the current file has nothing for the session.
+**Why the cursor is a synthetic id.** Message ids are per-store, so two sessions would
+collide on them (the pane keys blocks by id). The route returns
+`segment_index × 10^9 + <the store's own id>`: segment 0 keeps the plain store ids (a
+single-session card's cursor is exactly what it always was), and 10^9 is far above any
+real store's id. A dead segment (its store is gone) does not blank the others: the
+readable stretches are still returned and the dead one carries its `error`.
+
+`live` and `events` describe the **latest** claim — the session running now — and are
+**not mandatory**: a store without a `sessions` table (an old Hermes) or a profile without
+a journal yields empty parts instead of an error. The journal is read **by tail** (128 KB,
+the last 40 lines for the session): the file grows to megabytes and rotates, while the
+live pane only needs the newest lines. A rotated `agent.log.1` is read only if the current
+file has nothing for the session.
 
 ### Live model stream: why it needs an agent hook
 
@@ -1407,7 +1441,28 @@ and a store of the **old scheme** (without the `tool_calls`/`reasoning` columns)
 is. The stand is self-contained: it needs neither a live dashboard nor `hermes_cli`.
 
 ```bash
-python3 tests/test_transcript.py      # 116/116 checks passed
+python3 tests/test_transcript.py      # 141/141 checks passed
+```
+
+**The card worked by several profiles** is pinned at both levels. The route (in the same
+stand) answers with the messages of **every** `owner_admitted` session in claim order, each
+signed with the profile derived from its store path, with `total` being the card's whole
+count; the cursor walks **across** the boundary between sessions, a limit straddling it
+splits correctly, a card with 620 messages reports `total: 620` (not the render cap of
+500), and a dead segment among readable ones does not blank the rest.
+
+`tools/transcript_profiles_check.js` — **the pane in real Chromium**, against the live
+board: the tab's counter equals the route's `total` (a card of 1068 messages shows
+`транскрипт · 1068`, not `500`), the pane says how much of it it is rendering, **every**
+block's profile chip matches the route's message with the same segment and row id, the
+dividers mark the handoffs, the header lists the sessions/profiles instead of passing the
+last session off as the whole card, and a single-session card gets **no** dividers. The
+cards are picked at run time (the one with the most owner sessions, and a long
+single-session one), so the check does not rot.
+
+```bash
+PLAYWRIGHT_PATH=<path to playwright> CHROME_PATH=<path to chrome> \
+  node tools/transcript_profiles_check.js homm3   # 14/14 checks passed
 ```
 
 The same file checks the **live model stream** (`GET /tasks/{id}/live`): the stream file is
