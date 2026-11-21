@@ -147,8 +147,12 @@ function check(name, ok, extra) {
     check("в сообщении есть текст",
       pane.msgs.some((m) => m.text && m.text.length > 0),
       (pane.msgs[0] || {}).text);
+    // Whose work it is: one session (`сессия: local-…`) on a card claimed once,
+    // and a summary of the chain on a card that went through review
+    // (`сессий: 6 · профили: …`) — the pane must never present the last claim
+    // as the whole card.
     check("панель показывает, из какой сессии читают",
-      /сессия:\s*local-/.test(pane.meta), pane.meta.slice(0, 80));
+      /сессия:\s*local-|сессий:\s*\d+/.test(pane.meta), pane.meta.slice(0, 110));
     // The pane scrolls on its own, and its children stack (the "основное"
     // pane's bug was the children landing side by side in one line).
     check("панель прокручивается по вертикали", pane.overflowY === "auto",
