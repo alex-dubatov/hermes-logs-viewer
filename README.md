@@ -201,6 +201,15 @@ store**, and the card points at it with the `owner_admitted` event (its payload 
   comes from the store path the board recorded (`/profiles/<name>/state.db`), never
   from the card's assignee — after a handoff those differ. On a single-session card
   there are no dividers: there is nothing to divide;
+- **every message names the model its call was made on**, when the store knows it:
+  `--- assistant #63846 · executor-cloud · deepseek-v4.1-flash`. The store has no model
+  column on a message row — the model lives on the SESSION row, so a normal turn inherits
+  the session's model (the whole claim runs through one model). A **failed** turn records
+  the model it was attempted on in `display_metadata.error_surface`, and that per-call
+  value wins over the session's. `model_source` says which of the two answered, and the
+  tooltip says it in words. A store that does not name a model (an older Hermes) shows no
+  model at all instead of a guess. In a multi-session card the divider names the model of
+  each stretch too (`сессия 2 · reviewer · модель: … · сообщений: 131`);
 - **the counter on the tab is the card's whole transcript** — the number after
   `транскрипт ·` is the card's message count across every session (`total` from the
   route). It used to be the length of the rendered slice, so on a long card it froze
@@ -261,7 +270,16 @@ that field when a card is created.
   write is the same bundled `PATCH` (`assignee`, an empty string clears it). If the card's
   current executor is a profile that is no longer installed, it is kept as an option
   marked “(не установлен)” so the closed control shows the real value instead of the first
-  entry of the list. **Enter** saves, **Esc** cancels;
+  entry of the list. **Enter** saves, **Esc** cancels. **Under the executor the card
+  names the model it will run on** (see below);
+- **the model under the executor** — the card shows which model the assigned profile runs
+  on (`модель: opencode-go · deepseek-v4.1-flash`), read from the profile's `config.yaml`
+  by the bundled `/profiles` route. A per-task `model_override` wins over it and is shown
+  in the card's own colour with a tooltip saying it is an override; a card with no
+  executor says `модель: не назначена`, and a profile that is gone (or names no model)
+  says `модель: не известна` instead of inventing a pair. While the combobox is open the
+  line follows the **draft** profile, so picking another executor shows that profile's
+  model before the write;
 - **The pencil sits to the RIGHT of the value it edits** — next to the priority number,
   the title, the runtime and the executor, on the same line. That is how it reads as
   “this pencil edits this value” instead of as an unrelated button nearby;
@@ -1463,6 +1481,22 @@ single-session one), so the check does not rot.
 ```bash
 PLAYWRIGHT_PATH=<path to playwright> CHROME_PATH=<path to chrome> \
   node tools/transcript_profiles_check.js homm3   # 14/14 checks passed
+```
+
+**The MODEL labels are pinned the same way.** `tools/model_labels_check.js` drives the live
+pane in real Chromium and compares it with the route that feeds it, message by message:
+under the executor, `модель: <provider> · <model>` sits **below** the profile value (a
+geometry check, not just a text one) and equals the pair `/profiles` names for that profile;
+in the transcript, **every** rendered message's `data-model` equals the route's model for the
+same `local_id`, every message with a model carries a chip with exactly that text, and a
+message whose store names no model carries **no** chip (nothing is invented). A failed turn —
+the one case where the row records its own model — is checked to show that per-call model
+rather than the session's. The card is picked at run time: the one with the most distinct
+session models and with a per-call model, so the check does not rot.
+
+```bash
+PLAYWRIGHT_PATH=<path to playwright> CHROME_PATH=<path to chrome> \
+  node tools/model_labels_check.js hypercube   # 17/17 checks passed
 ```
 
 The same file checks the **live model stream** (`GET /tasks/{id}/live`): the stream file is

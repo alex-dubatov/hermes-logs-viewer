@@ -367,6 +367,58 @@ def main() -> int:
           len(b_legacy.get("messages") or []))
     check("старый store: вызовов нет", (b_legacy["messages"][0].get("tool_calls") or []) == [],
           b_legacy["messages"][0].get("tool_calls"))
+    check("старый store: модель не выдумана (нет таблицы sessions)",
+          b_legacy["messages"][0].get("model") == "",
+          b_legacy["messages"][0].get("model"))
+
+    # --- 4e. the model each call was made on ------------------------------
+    # The store has no model column on a message row: the model lives on the
+    # SESSION row, so a normal turn inherits it. A FAILED turn is the one case
+    # that names its own model (`display_metadata.error_surface`), and that
+    # per-call value must win over the session's.
+    model_store = tmp / "profile-model" / "state.db"
+    model_store.parent.mkdir(parents=True)
+    make_store(model_store, session_id, [
+        ("user", "сделай", None, None, None),
+        ("assistant", "сделал", None, None, None),
+        ("assistant", "", None, None, None),
+    ], session_row=(
+        session_id, 1700000100.0, "idle", 3, 0, 100, 20, None, None,
+        "qwen3.8-27b-q6kl-262k",
+    ))
+    con = sqlite3.connect(str(model_store))
+    con.execute("ALTER TABLE messages ADD COLUMN display_metadata TEXT")
+    con.execute(
+        "UPDATE messages SET display_metadata = ? WHERE id = 3",
+        (json.dumps({"error": "HTTP 502", "error_surface": {
+            "layer": "billing", "provider": "opencode-go",
+            "model": "minimax-m3.1-flash-free"}}),),
+    )
+    con.commit()
+    con.close()
+    add_board_event(board_db, "t_model001", "owner_admitted", json.dumps({
+        "db": str(model_store), "session_id": session_id,
+    }))
+    b_model = get({"board": "hypercube", "task_id": "t_model001"}).json()
+    m_msgs = b_model.get("messages") or []
+    check("модель: сообщения вернулись", len(m_msgs) == 3, len(m_msgs))
+    check("модель: обычный ход наследует модель сессии",
+          all(m.get("model") == "qwen3.8-27b-q6kl-262k" for m in m_msgs[:2]),
+          [m.get("model") for m in m_msgs])
+    check("модель: источник = сессия у обычного хода",
+          all(m.get("model_source") == "session" for m in m_msgs[:2]),
+          [m.get("model_source") for m in m_msgs])
+    check("модель: упавший ход называет СВОЮ модель",
+          m_msgs[2].get("model") == "minimax-m3.1-flash-free",
+          m_msgs[2].get("model"))
+    check("модель: провайдер упавшего хода из строки",
+          m_msgs[2].get("model_provider") == "opencode-go",
+          m_msgs[2].get("model_provider"))
+    check("модель: источник = вызов у упавшего хода",
+          m_msgs[2].get("model_source") == "call", m_msgs[2].get("model_source"))
+    check("модель: сегмент тоже называет модель",
+          (b_model.get("segments") or [{}])[0].get("model") == "qwen3.8-27b-q6kl-262k",
+          (b_model.get("segments") or [{}])[0].get("model"))
 
     # --- 5. the old scheme: no owner_admitted -> worker_log, no 500 ------
     r4 = get({"board": "hypercube", "task_id": "t_old00001"})

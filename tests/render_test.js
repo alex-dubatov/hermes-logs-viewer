@@ -838,6 +838,23 @@ const TEST_ASSIGNEE = "default";
         (s) => s.indexOf("\\n") !== -1 && s.indexOf("\n") === -1).length;
       check("нет текста, целиком экранированного в \\n", fullyEscaped === 0,
         "tool-сообщений без настоящих переводов строки: " + fullyEscaped);
+      // Which MODEL each step ran on: the route puts it on every message the
+      // store can speak for (the session's model, or the row's own record for
+      // a failed turn), and the pane signs the row with it. A message without
+      // a model must show NO chip — an invented model name is worse than none.
+      const withModel = trMsgs.filter((m) => m.getAttribute("data-model"));
+      const chipMismatch = withModel.filter((m) => {
+        const chip = m.querySelector(".hlv-transcript-model");
+        return !chip || (chip.textContent || "").trim() !== m.getAttribute("data-model");
+      });
+      check("у сообщения с моделью есть подпись модели", chipMismatch.length === 0,
+        withModel.length + " сообщений с моделью, " + $$(".hlv-transcript-model").length +
+          " подписей" +
+          (chipMismatch.length ? "; расходится: " + chipMismatch.length : ""));
+      const chipsOutOfNowhere = trMsgs.filter((m) => !m.getAttribute("data-model") &&
+        m.querySelector(".hlv-transcript-model"));
+      check("без модели в базе подписи не выдумано", chipsOutOfNowhere.length === 0,
+        chipsOutOfNowhere.length ? "лишних подписей: " + chipsOutOfNowhere.length : "совпадает");
       check("у сообщения-ассистента видны рассуждения или вызовы",
         $$(".hlv-transcript-reasoning").length + $$(".hlv-transcript-call").length > 0,
         "рассуждений: " + $$(".hlv-transcript-reasoning").length +
@@ -3115,6 +3132,35 @@ const TEST_ASSIGNEE = "default";
       check("карандаш у исполнителя есть", !!whoPencil,
         whoPencil ? "найден" : "нет .hlv-pencil рядом с «исполнитель»");
       const profs = (await fetchJSON("/api/plugins/kanban/profiles")).profiles || [];
+      // Under the executor the card must name the MODEL it will run on: the
+      // pair belongs to the profile (or to the task's override), and before
+      // this line it was visible only in the create form — a reader of a live
+      // card had to guess it.
+      const whoModel = $(".hlv-assignee-model");
+      check("под исполнителем написана модель", !!whoModel,
+        whoModel ? (whoModel.textContent || "").trim() : "нет .hlv-assignee-model");
+      if (whoModel && whoValue) {
+        const whoName = (whoValue.textContent || "").trim().replace(/^@/, "");
+        const modelText = (whoModel.textContent || "").trim();
+        const whoPair = profs.find((p) => p.name === whoName) || null;
+        if (whoPair) {
+          check("модель под исполнителем совпадает с парой профиля",
+            modelText.indexOf(whoPair.model || "\u0000") !== -1 &&
+              (!whoPair.provider || modelText.indexOf(whoPair.provider) !== -1),
+            "профиль " + whoPair.provider + " · " + whoPair.model +
+              " / панель «" + modelText + "»");
+        } else {
+          // The stand's card is usually UNASSIGNED (a card with a live
+          // profile could be picked up by the dispatcher), so the honest
+          // answer here is "no model" — and the line must say exactly that.
+          check("у карточки без исполнителя модель названа «не назначена»",
+            /не назначена/.test(modelText), "панель «" + modelText + "»");
+        }
+        check("подсказка модели объясняет её источник",
+          /профиля|override|не известна|не назначена|не выбран/.test(
+            whoModel.getAttribute("title") || ""),
+          whoModel.getAttribute("title"));
+      }
       const WANT_WHO = (profs[0] || {}).name;
       check("есть установленный профиль для проверки", !!WANT_WHO,
         WANT_WHO || "маршрут /profiles отдал пустой список");
@@ -3175,6 +3221,12 @@ const TEST_ASSIGNEE = "default";
               afterWho2 && !afterWho2.assignee,
               afterWho2 ? "на доске assignee=" + JSON.stringify(afterWho2.assignee)
                         : "нет задачи");
+            // With no executor there is no model to name — the line says so
+            // instead of keeping the previous profile's pair.
+            const modelAfter = $(".hlv-assignee-model");
+            check("без исполнителя модель названа «не назначена»",
+              !!modelAfter && /не назначена/.test(modelAfter.textContent || ""),
+              modelAfter ? (modelAfter.textContent || "").trim() : "нет .hlv-assignee-model");
           }
         }
       }

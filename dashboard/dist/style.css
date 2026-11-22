@@ -828,14 +828,30 @@
    in one list: the chip repeats the name on every row (a row read in the
    middle of the list is still signed), the divider marks the handoff, and the
    header summarises the chain. */
+/* The profile chip: no rounding — the dashboard's style is square, and the
+   stand fails on any non-zero border-radius. */
 .hlv-transcript-profile {
   font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
   font-size: 0.66rem;
   color: var(--color-muted-foreground);
   border: 1px solid var(--color-border);
-  border-radius: 999px;
+  border-radius: 0;
   padding: 0 6px;
   white-space: nowrap;
+}
+
+/* The model a step ran on, from the store (session row, or the row's own
+   record for a failed turn). Plain muted text, not a second chip: the
+   profile owns the box, the model is the annotation under it. */
+.hlv-transcript-model {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 0.66rem;
+  color: var(--color-muted-foreground);
+  opacity: 0.85;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 320px;
 }
 
 .hlv-transcript-seg {
@@ -1776,6 +1792,26 @@
   width: 280px;
   max-width: 100%;
   flex: 0 1 280px;
+}
+
+/* The model the card runs on, directly under the executor. `flex-basis:
+   100%` is what puts it on its OWN line: without it the line would squeeze
+   between the combobox and the hint, and "under the executor" is the point.
+   The left offset is the label column (92px) plus the row gap (8px), so the
+   text starts under the profile name, not under the label. */
+.hlv-assignee-model {
+  flex: 1 1 100%;
+  margin-left: 100px;
+  min-width: 0;
+  font-size: 0.72rem;
+  color: var(--color-muted-foreground);
+  overflow-wrap: anywhere;
+}
+
+/* A per-task override is not the profile's model, and the reader must see
+   that at a glance — the same distinction the meta line makes. */
+.hlv-assignee-model-override {
+  color: var(--color-card-foreground, var(--foreground));
 }
 
 /* The status buttons wrap as a group; `flex-basis` is what makes them break

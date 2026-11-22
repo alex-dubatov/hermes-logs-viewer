@@ -2522,6 +2522,37 @@ function Page() {
       return name ? "@" + name : "не назначен";
     }
 
+    // The model the card will ACTUALLY run on, shown under the executor: the
+    // per-task override when the card has one, otherwise the model of the
+    // assigned profile (the bundled `/profiles` route reads it off the
+    // profile's config.yaml). A profile pinned to a model the route cannot
+    // read, or one that is no longer installed, yields no pair — the line then
+    // says so instead of showing a model nobody assigned.
+    function executorModel(name) {
+      if (!name) return { text: "модель: не назначена", title: "исполнитель не выбран — карточку некому запускать", override: false };
+      if (desc && desc.model && name === (desc.assignee || "")) {
+        return {
+          text: "модель: " + (desc.model_provider ? desc.model_provider + " · " : "") + desc.model,
+          title: "модель переопределена для этой задачи (model_override)",
+          override: true,
+        };
+      }
+      var pair = profileModel(name);
+      if (!pair.model) {
+        return {
+          text: "модель: не известна",
+          title: "профиль @" + name + " не установлен или не называет модель в config.yaml — " +
+            "воркер возьмёт модель из своего окружения",
+          override: false,
+        };
+      }
+      return {
+        text: "модель: " + (pair.provider ? pair.provider + " · " : "") + pair.model,
+        title: "модель профиля @" + name + " (config.yaml); model_override у задачи нет",
+        override: false,
+      };
+    }
+
     function startAssigneeEdit() {
       if (!desc) return;
       setAssigneeDraft(desc.assignee || "");
@@ -4072,6 +4103,7 @@ function Page() {
       function segmentDivider(seg) {
         var bits = ["сессия " + (seg.index + 1)];
         if (seg.profile) bits.push(seg.profile);
+        if (seg.model) bits.push("модель: " + seg.model);
         if (seg.at) bits.push(new Date(seg.at * 1000).toLocaleString());
         if (typeof seg.count === "number") bits.push("сообщений: " + seg.count);
         if (seg.error) bits.push("недоступна: " + seg.error);
@@ -4096,6 +4128,22 @@ function Page() {
                 title: "профиль, который работал над этим сообщением: " + m.profile +
                   (m.session_id ? " · сессия " + m.session_id : ""),
               }, m.profile)
+            : null;
+          // Which MODEL the call was made on, when the store says it. The
+          // route takes it from the session row (every turn of a claim runs
+          // on that model) or, for a failed turn, from the row's own record —
+          // `model_source` tells which, and the title says it in words. No
+          // model in the store means no chip: an invented model name would be
+          // worse than the silence.
+          var modelChip = m.model
+            ? el("span", {
+                className: "hlv-transcript-model",
+                title: "модель вызова: " + m.model +
+                  (m.model_provider ? " · " + m.model_provider : "") +
+                  (m.model_source === "call"
+                    ? " (записана в самой строке — так была сделана эта попытка)"
+                    : " (модель сессии)"),
+              }, m.model)
             : null;
           if (multiSegment) {
             var segIdx = typeof m.segment === "number" ? m.segment : 0;
@@ -4160,6 +4208,7 @@ function Page() {
                 el("summary", { className: "hlv-transcript-fold-summary" },
                   el("span", { className: "hlv-transcript-role" }, head),
                   profileChip,
+                  modelChip,
                   m.timestamp
                     ? el("span", { className: "hlv-transcript-time" },
                         new Date(m.timestamp * 1000).toLocaleTimeString())
@@ -4188,11 +4237,14 @@ function Page() {
               "data-segment": String(typeof m.segment === "number" ? m.segment : 0),
               "data-local-id": String(m.local_id != null ? m.local_id : m.id),
               "data-profile": m.profile || "",
+              // The model of the call, machine-readable for the browser stand.
+              "data-model": m.model || "",
             },
             isAgentStep
               ? el("div", { className: "hlv-transcript-head" },
                   el("span", { className: "hlv-transcript-role" }, head),
                   profileChip,
+                  modelChip,
                   m.timestamp
                     ? el("span", { className: "hlv-transcript-time" },
                         new Date(m.timestamp * 1000).toLocaleTimeString())
@@ -4698,6 +4750,11 @@ function Page() {
           "править заголовок задачи"
         )
       );
+      // The model the card runs on, shown under the executor. While the
+      // combobox is open it follows the DRAFT profile, so picking another
+      // executor immediately shows what that profile would run — the saved
+      // card is untouched until the pencil's check is pressed.
+      var execModel = executorModel(assigneeEdit ? assigneeDraft : desc.assignee);
       mainView = el(
         "div",
         // `hlv-card`, not `hlv-main`: the layout wrapper owns `.hlv-main`, and
@@ -4805,6 +4862,14 @@ function Page() {
             cancelAssigneeEdit,
             "править исполнителя"
           ),
+          // Under the executor, on its own line: which model the card will
+          // run on. The model belongs to the profile (or to the task's
+          // override), and until now it was visible only in the create form —
+          // the reader of a live card had to guess it.
+          el("span", {
+            className: "hlv-assignee-model" + (execModel.override ? " hlv-assignee-model-override" : ""),
+            title: execModel.title,
+          }, execModel.text),
           el("span", { className: "hlv-field-hint" },
             "профиль Hermes, который возьмёт задачу из очереди; без исполнителя карточка не уходит в работу")
         ),

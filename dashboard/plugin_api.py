@@ -142,9 +142,16 @@ Endpoints:
      wrote it, the ``segment`` it belongs to and its ``local_id`` there
      (``id`` is a segment-scoped global id, so cursors compare and React keys
      do not collide). ``segments`` describes the stretches (profile, session,
-     message count, error if its store is gone), ``profiles`` lists the names,
-     and ``total`` is the card's whole message count — what the tab's counter
-     shows, because the pane renders at most a bounded window.
+     model, message count, error if its store is gone), ``profiles`` lists the
+     names, and ``total`` is the card's whole message count — what the tab's
+     counter shows, because the pane renders at most a bounded window.
+
+     ``model`` / ``model_provider`` on a message is the model its call was
+     made on. The store keeps it on the SESSION row, so a normal turn inherits
+     the session's model (``model_source`` = "session"); a failed turn records
+     the model it was attempted on in ``display_metadata.error_surface``, and
+     that per-call value wins (``model_source`` = "call"). An empty model means
+     the store did not say — the pane then shows no model rather than guessing.
 
      ``source`` says where the answer came from:
        "owner_session" — the profile stores were read;
@@ -2538,7 +2545,7 @@ def _message_select(cols: set) -> Optional[list]:
     if not cols:
         return None
     wanted = ["id", "role", "content", "tool_name", "tool_call_id", "timestamp"]
-    optional = ["tool_calls", "reasoning", "reasoning_content"]
+    optional = ["tool_calls", "reasoning", "reasoning_content", "display_metadata"]
     select = []
     for name in wanted + optional:
         if name in cols:
@@ -2550,8 +2557,68 @@ def _message_select(cols: set) -> Optional[list]:
     return select
 
 
+def _session_model(con: sqlite3.Connection, session_id: str) -> dict:
+    """``{"model", "provider"}`` the session's calls were made on.
+
+    The store keeps the model on the SESSION row (``sessions.model``, plus
+    ``billing_provider`` when the release writes it); a message row carries no
+    model of its own in a normal turn. That is the honest per-message answer
+    then: the model the session runs — the whole conversation of one claim
+    goes through one model unless the operator switched it mid-session.
+
+    Read as optional columns: a store without a ``sessions`` table (an older
+    Hermes) or without ``billing_provider`` answers empty strings instead of
+    failing the pane.
+    """
+    try:
+        cols = {r["name"] for r in con.execute("PRAGMA table_info(sessions)")}
+    except sqlite3.Error:
+        return {"model": "", "provider": ""}
+    if not cols or "model" not in cols:
+        return {"model": "", "provider": ""}
+    picked = ["model"] + (["billing_provider"] if "billing_provider" in cols else [])
+    try:
+        row = con.execute(
+            "SELECT " + ", ".join(picked) + " FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        return {"model": "", "provider": ""}
+    if row is None:
+        return {"model": "", "provider": ""}
+    provider = row["billing_provider"] if "billing_provider" in row.keys() else ""
+    return {"model": str(row["model"] or ""), "provider": str(provider or "")}
+
+
+def _row_call_model(row) -> dict:
+    """``{"model", "provider"}`` of THE call that wrote this row, if recorded.
+
+    A normal message row has no model column, but a FAILED turn records the
+    model it was attempted on — ``display_metadata.error_surface.model`` /
+    ``.provider``. That is a real per-call model, and it is the one case where
+    the row and the session can differ (the gateway fell back to another
+    backend and the turn died). Empty when the row says nothing.
+    """
+    if "display_metadata" not in row.keys():
+        return {"model": "", "provider": ""}
+    raw = row["display_metadata"]
+    if not raw:
+        return {"model": "", "provider": ""}
+    try:
+        meta = json.loads(raw)
+    except (TypeError, ValueError):
+        return {"model": "", "provider": ""}
+    surface = meta.get("error_surface") if isinstance(meta, dict) else None
+    if not isinstance(surface, dict):
+        return {"model": "", "provider": ""}
+    return {
+        "model": str(surface.get("model") or ""),
+        "provider": str(surface.get("provider") or ""),
+    }
+
+
 def _segment_read(store: str, session_id: str, after_local: int, take: int):
-    """``(rows, count, error)`` for ONE owner session's store.
+    """``(rows, count, session_model, error)`` for ONE owner session's store.
 
     ``count`` is the session's WHOLE message count — the tab's counter has to
     say how many messages the card has, not how many the pane renders (the
@@ -2560,26 +2627,31 @@ def _segment_read(store: str, session_id: str, after_local: int, take: int):
     ``id > after_local``; ``take`` 0 fetches none (the cursor is already past
     this segment) but still counts.
 
+    ``session_model`` is ``{"model", "provider"}`` of the session — the model
+    its calls were made on, which every message of the segment inherits
+    unless its own row names a more specific one (see ``_row_call_model``).
+
     Read-only: the store is a live WAL database of the owner gateway, so it
     is opened with ``mode=ro`` and never written to.
     """
     store_path = Path(str(store)).expanduser()
     if not store_path.is_absolute():
-        return [], 0, f"store path is not absolute: {store}"
+        return [], 0, {"model": "", "provider": ""}, f"store path is not absolute: {store}"
     if not store_path.exists():
-        return [], 0, f"no session store at {store_path}"
+        return [], 0, {"model": "", "provider": ""}, f"no session store at {store_path}"
     try:
         con = _ro_connect(store_path)
     except sqlite3.Error as e:
-        return [], 0, f"cannot open {store_path}: {e}"
+        return [], 0, {"model": "", "provider": ""}, f"cannot open {store_path}: {e}"
     try:
         select = _message_select(_message_columns(con))
         if select is None:
-            return [], 0, "store has no messages table"
+            return [], 0, {"model": "", "provider": ""}, "store has no messages table"
         count = con.execute(
             "SELECT COUNT(*) AS n FROM messages WHERE session_id = ?",
             (session_id,),
         ).fetchone()["n"]
+        session_model = _session_model(con, session_id)
         rows = []
         if take > 0:
             rows = con.execute(
@@ -2588,13 +2660,13 @@ def _segment_read(store: str, session_id: str, after_local: int, take: int):
                 (session_id, after_local, take),
             ).fetchall()
     except sqlite3.Error as e:
-        return [], 0, f"query failed: {e}"
+        return [], 0, {"model": "", "provider": ""}, f"query failed: {e}"
     finally:
         con.close()
-    return rows, int(count or 0), None
+    return rows, int(count or 0), session_model, None
 
 
-def _message_payload(row, segment: dict) -> dict:
+def _message_payload(row, segment: dict, session_model: Optional[dict] = None) -> dict:
     """One message as the pane reads it, signed with the profile that wrote it."""
     raw = row["content"] or ""
     text, truncated = _clip(raw, _TRANSCRIPT_CONTENT_LIMIT)
@@ -2606,6 +2678,18 @@ def _message_payload(row, segment: dict) -> dict:
     if not reasoning and "reasoning_content" in row.keys():
         reasoning = row["reasoning_content"]
     reasoning, reasoning_cut = _clip(reasoning or "", _TRANSCRIPT_REASONING_LIMIT)
+    # The model the call was made on. The row's own record (a failed turn
+    # names the model it was attempted on) wins over the session's model,
+    # because the row is the more specific statement. ``model_source`` says
+    # which of the two answered, so the pane can explain a blank.
+    call_model = _row_call_model(row)
+    fallback = session_model or {}
+    if call_model["model"]:
+        model, provider, model_source = call_model["model"], call_model["provider"], "call"
+    elif fallback.get("model"):
+        model, provider, model_source = fallback["model"], fallback.get("provider") or "", "session"
+    else:
+        model, provider, model_source = "", "", ""
     local_id = int(row["id"])
     return {
         # The GLOBAL id: segment-scoped so two sessions' rows cannot collide
@@ -2627,6 +2711,11 @@ def _message_payload(row, segment: dict) -> dict:
         "truncated": truncated or readable_cut,
         "reasoning": reasoning,
         "reasoning_truncated": reasoning_cut,
+        # Which model this step ran on ("call" = the row's own record,
+        # "session" = the session's model, "" = the store does not say).
+        "model": model,
+        "model_provider": provider,
+        "model_source": model_source,
         "tool_calls": _tool_call_summary(
             row["tool_calls"] if "tool_calls" in row.keys() else None
         ),
@@ -2662,16 +2751,22 @@ def _transcript_merged(segments: list, cursor: int, limit: int):
         if idx >= start_index and remaining > 0:
             take = remaining + 1
         after_local = start_local if idx == start_index else 0
-        rows, count, err = _segment_read(seg["store"], seg["session_id"], after_local, take)
+        rows, count, session_model, err = _segment_read(
+            seg["store"], seg["session_id"], after_local, take
+        )
         total += count
         entry = dict(seg)
         entry["count"] = count
+        # The model this stretch of the conversation ran on — the divider
+        # names it, and every message of the segment inherits it.
+        entry["model"] = session_model.get("model") or ""
+        entry["model_provider"] = session_model.get("provider") or ""
         if err:
             entry["error"] = err
         meta.append(entry)
         if not rows:
             continue
-        fresh = [_message_payload(r, seg) for r in rows]
+        fresh = [_message_payload(r, seg, session_model) for r in rows]
         # One row beyond what fits means this segment has more where that came
         # from; anything less means the segment is exhausted.
         if len(fresh) > remaining:
@@ -2711,9 +2806,12 @@ async def get_transcript(
     A card that went through review has SEVERAL owner sessions, usually in
     different profiles' stores. All of them are read, in claim order, and
     every message carries the profile that wrote it (``profile``),
-    the segment it belongs to (``segment``) and the row's own id there
-    (``local_id``). ``segments`` describes those stretches, and ``total`` is
-    the card's whole message count — what the tab's counter shows.
+    the segment it belongs to (``segment``), the row's own id there
+    (``local_id``) and the model its call was made on (``model`` /
+    ``model_provider`` / ``model_source``, taken from the session row or, for
+    a failed turn, from the row's own record). ``segments`` describes those
+    stretches, and ``total`` is the card's whole message count — what the
+    tab's counter shows.
 
     Nothing here raises: a missing board, an unreadable store or a card with
     no owner session all answer 200 with an empty list, because the pane must
