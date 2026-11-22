@@ -1172,7 +1172,7 @@ Poll frequencies: the task list 2 s, the log 1.2 s, **the transcript 2 s**, **th
 ## Verification
 
 `tests/render_test.js` is a stand that loads `dist/index.js` into **jsdom**, boots a real
-React and talks to the **live dashboard**, then clicks on the real UI. **360 checks**: the
+React and talks to the **live dashboard**, then clicks on the real UI. **371 checks**: the
 header layout (including that the board label fits the selector and that the selector carries
 a `title`), the badge rules for all 9 statuses, the absence of rounded corners, search (by
 title, by description, **by task id and by its beginning**, an empty result, the clear
@@ -1459,7 +1459,7 @@ and a store of the **old scheme** (without the `tool_calls`/`reasoning` columns)
 is. The stand is self-contained: it needs neither a live dashboard nor `hermes_cli`.
 
 ```bash
-python3 tests/test_transcript.py      # 141/141 checks passed
+python3 tests/test_transcript.py      # 149/149 checks passed
 ```
 
 **The card worked by several profiles** is pinned at both levels. The route (in the same

@@ -2867,10 +2867,15 @@ const TEST_ASSIGNEE = "default";
     setInputValue($(".hlv-search-input"), id);
     await sleep(400);
     const idHits = $$(".hlv-row").map((r) => r.getAttribute("data-task-id"));
+    // The target must be THERE and the list must really narrow down. A second
+    // hit is legitimate: the search reads bodies too, and a review card's body
+    // cites the card it reviews by id ("Карточка `t_…` меняла …"), which is
+    // exactly how the operator finds a review by the id it names.
     check(
-      "поиск по id задачи находит ровно эту карточку",
-      !!id && idHits.length === 1 && idHits[0] === id,
-      "запрос «" + id + "» → " + idHits.length + " из " + beforeId
+      "поиск по id задачи находит эту карточку",
+      !!id && idHits.indexOf(id) !== -1 && idHits.length <= 3 && idHits.length < beforeId,
+      "запрос «" + id + "» → " + idHits.length + " из " + beforeId +
+        (idHits.indexOf(id) === -1 ? " (целевой карточки нет!)" : "")
     );
     // A partial id works too — an id is typed from memory, not pasted whole.
     if (id && id.length > 4) {
